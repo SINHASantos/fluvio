@@ -3,19 +3,20 @@ use std::fmt::Debug;
 use std::collections::{HashMap, hash_map::Entry};
 use std::ops::{Deref, DerefMut};
 
+use fluvio_controlplane::replica::Replica;
 use tracing::{debug, warn, instrument};
-use async_rwlock::{RwLock};
+use async_lock::RwLock;
+use anyhow::Result;
 
-use fluvio_protocol::record::BatchRecords;
+use fluvio_protocol::record::{BatchRecords, ReplicaKey};
 use fluvio_storage::config::ReplicaConfig;
-use fluvio_controlplane_metadata::partition::{Replica, ReplicaKey};
 use fluvio_protocol::record::RecordSet;
 use fluvio_protocol::record::Offset;
-use fluvio_storage::{FileReplica, StorageError, ReplicaStorage, ReplicaStorageConfig};
+use fluvio_storage::{FileReplica, ReplicaStorage, ReplicaStorageConfig};
 use fluvio_types::SpuId;
 
 use crate::replication::leader::ReplicaOffsetRequest;
-use crate::core::{FileGlobalContext};
+use crate::core::FileGlobalContext;
 use crate::storage::SharableReplicaStorage;
 
 use super::controller::FollowerGroups;
@@ -77,7 +78,7 @@ impl FollowersState<FileReplica> {
         self: Arc<Self>,
         ctx: &FileGlobalContext,
         replica: Replica,
-    ) -> Result<Option<FollowerReplicaState<FileReplica>>, StorageError> {
+    ) -> Result<Option<FollowerReplicaState<FileReplica>>> {
         let leader = replica.leader;
 
         let mut writer = self.write().await;
@@ -180,7 +181,7 @@ where
         leader: SpuId,
         replica_key: ReplicaKey,
         config: S::ReplicaConfig,
-    ) -> Result<Self, StorageError>
+    ) -> Result<Self>
     where
         S::ReplicaConfig: Display,
     {
@@ -208,7 +209,7 @@ where
         &self,
         records: &mut RecordSet<R>,
         leader_hw: Offset,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<bool> {
         let mut changes = false;
 
         if records.total_records() > 0 {
@@ -244,10 +245,7 @@ where
 
     /// try to write records
     /// ensure records has correct baseoffset
-    async fn write_recordsets<R: BatchRecords>(
-        &self,
-        records: &mut RecordSet<R>,
-    ) -> Result<bool, StorageError> {
+    async fn write_recordsets<R: BatchRecords>(&self, records: &mut RecordSet<R>) -> Result<bool> {
         let storage_leo = self.leo();
         if records.base_offset() != storage_leo {
             // this could happened if records were sent from leader before hw was sync

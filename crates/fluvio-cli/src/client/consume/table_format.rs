@@ -14,10 +14,9 @@ use tui::{
     Frame, Terminal,
 };
 use crossterm::event::{Event, KeyCode, MouseEventKind};
+use anyhow::Result;
 
 use fluvio::metadata::tableformat::{TableFormatColumnConfig, TableFormatSpec, DataFormat};
-
-use crate::Result;
 
 #[derive(Debug, Default, Clone)]
 pub struct TableModel {
@@ -399,7 +398,7 @@ impl TableModel {
         // render rows based on header order
         let mut rows = vec![];
 
-        for (_index, row_data) in self.data.iter().enumerate() {
+        for row_data in self.data.iter() {
             let mut cells = vec![];
             for col in &self.columns {
                 let key_path = col.key_path.as_str();

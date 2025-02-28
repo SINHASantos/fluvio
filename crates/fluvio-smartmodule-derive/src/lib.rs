@@ -1,21 +1,22 @@
-use proc_macro::TokenStream;
-use syn::{AttributeArgs, DeriveInput, ItemFn, parse_macro_input};
-use crate::ast::{SmartModuleConfig, SmartModuleFn, SmartModuleKind};
 mod ast;
 mod util;
 mod generator;
+
+use proc_macro::TokenStream;
+use syn::{DeriveInput, ItemFn, parse_macro_input};
+
+use crate::ast::{SmartModuleConfig, SmartModuleFn, SmartModuleKind};
 
 #[proc_macro_attribute]
 pub fn smartmodule(args: TokenStream, input: TokenStream) -> TokenStream {
     use crate::generator::generate_smartmodule;
 
-    let args = parse_macro_input!(args as AttributeArgs);
+    let mut config = SmartModuleConfig::default();
+    let config_parser = syn::meta::parser(|meta| config.parse(meta));
+    parse_macro_input!(args with config_parser);
+
     let func = parse_macro_input!(input as ItemFn);
 
-    let config = match SmartModuleConfig::from_ast(&args) {
-        Ok(config) => config,
-        Err(e) => return e.into_compile_error().into(),
-    };
     let func = match SmartModuleFn::from_ast(&func) {
         Ok(func) => func,
         Err(e) => return e.into_compile_error().into(),

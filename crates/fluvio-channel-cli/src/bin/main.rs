@@ -1,23 +1,23 @@
 use std::env;
 use std::str::FromStr;
-use color_eyre::eyre::{Result, eyre};
-use colored::Colorize;
-use clap::{Parser, CommandFactory};
-
-use fluvio_future::task::run_block_on;
 use std::env::current_exe;
 use std::ffi::OsString;
-use tracing::debug;
 use std::process::Stdio;
-use fluvio_channel::{
-    FluvioChannelConfig, FluvioChannelInfo, FluvioBinVersion, DEV_CHANNEL_NAME, STABLE_CHANNEL_NAME,
-};
-use fluvio_channel::ImageTagStrategy;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::prelude::CommandExt;
 #[cfg(target_os = "windows")]
 use std::io::{self, Write};
+
+use clap::{Parser, CommandFactory};
+use tracing::debug;
 use cfg_if::cfg_if;
+use anyhow::{anyhow, Result};
+
+use fluvio_future::task::run_block_on;
+use fluvio_channel::{
+    FluvioChannelConfig, FluvioChannelInfo, FluvioBinVersion, DEV_CHANNEL_NAME, STABLE_CHANNEL_NAME,
+};
+use fluvio_channel::ImageTagStrategy;
 use fluvio_cli_common::{FLUVIO_RELEASE_CHANNEL, FLUVIO_EXTENSIONS_DIR, FLUVIO_IMAGE_TAG_STRATEGY};
 
 use fluvio_channel_cli::cli::create::CreateOpt;
@@ -32,12 +32,12 @@ const FLUVIO_FRONTEND: &str = "FLUVIO_FRONTEND";
 
 #[derive(Debug, PartialEq, Parser, Default)]
 struct RootOpt {
-    #[clap(long)]
+    #[arg(long)]
     skip_channel_check: bool,
 }
 
 #[derive(Debug, PartialEq, Parser, Default)]
-#[clap(disable_help_subcommand = true, disable_help_flag = true)]
+#[command(disable_help_subcommand = true, disable_help_flag = true)]
 struct Root {
     #[clap(flatten)]
     opt: RootOpt,
@@ -55,7 +55,7 @@ impl Root {
 struct ChannelOpt {
     #[clap(subcommand)]
     cmd: Option<ChannelCmd>,
-    #[clap(long, short)]
+    #[arg(long, short)]
     help: bool,
 }
 
@@ -83,7 +83,7 @@ impl ChannelCmd {
 }
 
 #[derive(Debug, PartialEq, Parser)]
-#[clap(
+#[command(
     max_term_width = 100,
     disable_version_flag = true,
     // VersionlessSubcommands is now default behaviour. See https://github.com/clap-rs/clap/pull/2831
@@ -91,12 +91,12 @@ impl ChannelCmd {
 )]
 enum RootCmd {
     /// Prints help information
-    #[clap(hide = true)]
+    #[command(hide = true)]
     Help,
     Version(ChannelOpt),
 
     // This should be the fluvio binary's subcommand
-    #[clap(external_subcommand)]
+    #[command(external_subcommand)]
     Other(Vec<String>),
 }
 
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 channel[0], channel[1]
             );
         } else {
-            eprintln!("Couldn't find Fluvio channel binary (Unexpected error formatting (raw output): {})", channel_info_str);
+            eprintln!("Couldn't find Fluvio channel binary (Unexpected error formatting (raw output): {channel_info_str})");
         }
         panic!("Exec loop detected");
     }
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
                     std::process::exit(0);
                 } else if let Some(subcmd) = &channel_opt.cmd {
                     if let Err(e) = run_block_on(subcmd.process()) {
-                        println!("{}", e);
+                        println!("{e}");
                         std::process::exit(1);
                     }
 
@@ -238,7 +238,7 @@ fn main() -> Result<()> {
                 .config()
                 .channel()
                 .get(&channel)
-                .ok_or_else(|| eyre!("Channel info not found"))?
+                .ok_or_else(|| anyhow!("Channel info not found"))?
                 .to_owned();
 
             (channel, channel_info)
@@ -292,11 +292,7 @@ fn main() -> Result<()> {
         if args.contains(&"update".to_string())
             && fluvio_channel::is_pinned_version_channel(channel_name.as_str())
         {
-            println!(
-                    "{}\n{}\n",
-                    "Unsupported Feature: The `fluvio update` command is not supported when using a pinned version channel. To use a different version run:".yellow(),
-                    "  fluvio version create X.Y.Z\n  fluvio version switch X.Y.Z".italic().yellow()
-                );
+            println!("Unsupported Feature: The `fluvio update` command is not supported use fvm");
             std::process::exit(1);
         }
     }

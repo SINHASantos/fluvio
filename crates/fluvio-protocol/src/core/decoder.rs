@@ -4,6 +4,7 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use bytes::Buf;
 use bytes::BufMut;
@@ -18,7 +19,6 @@ pub trait Decoder: Sized + Default {
     fn decode_from<T>(src: &mut T, version: Version) -> Result<Self, Error>
     where
         T: Buf,
-        Self: Default,
     {
         let mut decoder = Self::default();
         decoder.decode(src, version)?;
@@ -38,7 +38,7 @@ pub trait DecoderVarInt {
 
 impl<M> Decoder for Vec<M>
 where
-    M: Default + Decoder,
+    M: Decoder,
 {
     fn decode<T>(&mut self, src: &mut T, version: Version) -> Result<(), Error>
     where
@@ -76,7 +76,7 @@ where
 
 impl<M> Decoder for Option<M>
 where
-    M: Default + Decoder,
+    M: Decoder,
 {
     fn decode<T>(&mut self, src: &mut T, version: Version) -> Result<(), Error>
     where
@@ -95,10 +95,7 @@ where
     }
 }
 
-impl<M> Decoder for PhantomData<M>
-where
-    M: Default + Decoder,
-{
+impl<M> Decoder for PhantomData<M> {
     fn decode<T>(&mut self, _src: &mut T, _version: Version) -> Result<(), Error>
     where
         T: Buf,
@@ -250,6 +247,20 @@ impl Decoder for u32 {
     }
 }
 
+impl Decoder for f32 {
+    fn decode<T>(&mut self, src: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: Buf,
+    {
+        if src.remaining() < 4 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "can't read f32"));
+        }
+        let value = src.get_f32();
+        *self = value;
+        Ok(())
+    }
+}
+
 impl Decoder for u64 {
     fn decode<T>(&mut self, src: &mut T, _version: Version) -> Result<(), Error>
     where
@@ -276,6 +287,41 @@ impl Decoder for i64 {
         let value = src.get_i64();
         trace!("i64: {:#x} => {}", &value, &value);
         *self = value;
+        Ok(())
+    }
+}
+
+impl Decoder for f64 {
+    fn decode<T>(&mut self, src: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: Buf,
+    {
+        if src.remaining() < 8 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "can't read f64"));
+        }
+        let value = src.get_f64();
+        *self = value;
+        Ok(())
+    }
+}
+
+impl Decoder for Duration {
+    fn decode<T>(&mut self, src: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: Buf,
+    {
+        if src.remaining() < 12 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "can't read u64+u32 as parts of Duration",
+            ));
+        }
+        let secs = src.get_u64();
+        trace!("u64: {:#x} => {}", &secs, &secs);
+        let nanos = src.get_u32();
+        trace!("u32: {:#x} => {}", &nanos, &nanos);
+
+        *self = Self::new(secs, nanos);
         Ok(())
     }
 }
@@ -630,6 +676,33 @@ mod test {
         assert_eq!(value, 32);
     }
 
+    #[test]
+    fn test_f32_encode_and_decode() {
+        use crate::Encoder;
+        let f_in: f32 = 103.19105;
+        let mut out: Vec<u8> = vec![];
+        f_in.encode(&mut out, 0).expect("failed to encode");
+        assert_eq!(out.len(), 4);
+        let mut f_out: f32 = 0.0;
+        f_out
+            .decode(&mut Cursor::new(&out), 0)
+            .expect("failed to decode");
+        assert_eq!(f_in, f_out);
+    }
+
+    #[test]
+    fn test_f64_encode_and_decode() {
+        use crate::Encoder;
+        let f_in: f64 = 123.456789101112;
+        let mut out: Vec<u8> = vec![];
+        f_in.encode(&mut out, 0).expect("failed to encode");
+        assert_eq!(out.len(), 8);
+        let mut f_out: f64 = 0.0;
+        f_out
+            .decode(&mut Cursor::new(&out), 0)
+            .expect("failed to decode");
+        assert_eq!(f_in, f_out);
+    }
     #[test]
     fn test_decode_invalid_string_not_len() {
         let data = [0x11]; // doesn't have right bytes

@@ -2,29 +2,38 @@ use std::sync::Arc;
 
 use clap::ValueEnum;
 use clap::Parser;
+use common::installation::InstallationType;
+use fluvio::config::ConfigFile;
 use semver::Version;
 use tracing::debug;
 
 mod group;
 mod spu;
 mod start;
+mod resume;
 mod delete;
 mod util;
 mod check;
 mod error;
 mod diagnostics;
 mod status;
+mod shutdown;
+mod upgrade;
 
 use start::StartOpt;
-use start::UpgradeOpt;
+use resume::ResumeOpt;
 use delete::DeleteOpt;
 use check::CheckOpt;
 use group::SpuGroupCmd;
 use spu::SpuCmd;
 use diagnostics::DiagnosticsOpt;
 use status::StatusOpt;
+use shutdown::ShutdownOpt;
+use upgrade::UpgradeOpt;
 
 pub use self::error::ClusterCliError;
+
+use anyhow::Result;
 
 use fluvio_extension_common as common;
 use common::target::ClusterTarget;
@@ -37,24 +46,26 @@ pub(crate) const VERSION: &str = include_str!("../../../../VERSION");
 #[derive(Debug, Parser)]
 pub enum ClusterCmd {
     /// Install Fluvio cluster
-    #[clap(name = "start")]
+    #[command(name = "start")]
     Start(Box<StartOpt>),
 
+    /// Resume Fluvio cluster
+    #[command(name = "resume")]
+    Resume(ResumeOpt),
+
     /// Upgrades an already-started Fluvio cluster
-    #[clap(name = "upgrade")]
+    #[command(name = "upgrade")]
     Upgrade(Box<UpgradeOpt>),
 
     /// Uninstall a Fluvio cluster
-    #[clap(name = "delete")]
+    #[command(name = "delete")]
     Delete(DeleteOpt),
 
     /// Check that all requirements for cluster startup are met.
     ///
     /// This command is useful to check if user has all the required dependencies and permissions to run
-    /// fluvio on the current Kubernetes context.
-    ///
-    /// It is not intended to be used in scenarios where user does not have access to Kubernetes resources (eg. Cloud)
-    #[clap(name = "check")]
+    /// fluvio cluster.
+    #[command(name = "check")]
     Check(CheckOpt),
 
     /// Manage and view Streaming Processing Units (SPUs)
@@ -63,22 +74,26 @@ pub enum ClusterCmd {
     /// of receiving messages from producers, storing those messages,
     /// and relaying them to consumers. This command lets you see
     /// the status of SPUs in your cluster.
-    #[clap(subcommand, name = "spu")]
+    #[command(subcommand, name = "spu")]
     SPU(SpuCmd),
 
     /// Manage and view SPU Groups (SPGs)
     ///
     /// SPGs are groups of SPUs in a cluster which are managed together.
-    #[clap(subcommand, name = "spg")]
+    #[command(subcommand, name = "spg")]
     SPUGroup(SpuGroupCmd),
 
     /// Collect anonymous diagnostic information to help with debugging
-    #[clap(name = "diagnostics")]
+    #[command(name = "diagnostics")]
     Diagnostics(DiagnosticsOpt),
 
     /// Check the status of a Fluvio cluster
-    #[clap(name = "status")]
+    #[command(name = "status")]
     Status(StatusOpt),
+
+    /// Shutdown cluster processes without deleting data
+    #[command(name = "shutdown")]
+    Shutdown(ShutdownOpt),
 }
 
 impl ClusterCmd {
@@ -88,7 +103,7 @@ impl ClusterCmd {
         out: Arc<O>,
         platform_version: Version,
         target: ClusterTarget,
-    ) -> Result<(), ClusterCliError> {
+    ) -> Result<()> {
         match self {
             Self::Start(mut start) => {
                 if let Ok(tag_strategy_value) = std::env::var(FLUVIO_IMAGE_TAG_STRATEGY) {
@@ -111,6 +126,9 @@ impl ClusterCmd {
                 };
 
                 start.process(platform_version, false).await?;
+            }
+            Self::Resume(opt) => {
+                opt.process(platform_version).await?;
             }
             Self::Upgrade(mut upgrade) => {
                 if let Ok(tag_strategy_value) = std::env::var(FLUVIO_IMAGE_TAG_STRATEGY) {
@@ -148,8 +166,18 @@ impl ClusterCmd {
             Self::Status(status) => {
                 status.process(target).await?;
             }
+            Self::Shutdown(opt) => {
+                opt.process().await?;
+            }
         }
 
         Ok(())
     }
+}
+
+pub(crate) fn get_installation_type() -> Result<(InstallationType, ConfigFile)> {
+    let config = ConfigFile::load_default_or_new()?;
+    let fc = config.config().current_cluster()?;
+    let itype = InstallationType::load(fc);
+    Ok((itype, config))
 }

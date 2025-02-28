@@ -1,19 +1,21 @@
-use std::path::{PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::env::temp_dir;
 
-use fluvio_controlplane::UpdateReplicaRequest;
-use fluvio_storage::FileReplica;
+use fluvio_controlplane::replica::Replica;
+use fluvio_controlplane::spu_api::update_replica::UpdateReplicaRequest;
+use fluvio_types::event::offsets::OffsetPublisher;
 use tracing::debug;
 use derive_builder::Builder;
 use once_cell::sync::Lazy;
 
+use fluvio_storage::FileReplica;
 use fluvio_future::timer::sleep;
 use flv_util::fixture::ensure_clean_dir;
 use fluvio_types::SpuId;
-use fluvio_controlplane_metadata::partition::{Replica};
 use fluvio_controlplane_metadata::spu::{IngressAddr, IngressPort, SpuSpec};
-use fluvio_protocol::fixture::{create_recordset};
+use fluvio_protocol::fixture::create_raw_recordset;
 
 use crate::core::{DefaultSharedGlobalContext, GlobalContext};
 use crate::config::SpuConfig;
@@ -63,7 +65,7 @@ impl TestConfig {
 
     pub fn leader_config(&self) -> SpuConfig {
         let mut config = SpuConfig::default();
-        config.log.base_dir = self.base_dir.clone();
+        config.log.base_dir.clone_from(&self.base_dir);
         config.id = self.base_id;
         config.private_endpoint = format!("{}:{}", HOST, self.base_port);
         config
@@ -72,7 +74,7 @@ impl TestConfig {
     pub fn follower_config(&self, follower_index: u16) -> SpuConfig {
         assert!(follower_index < self.followers);
         let mut config = SpuConfig::default();
-        config.log.base_dir = self.base_dir.clone();
+        config.log.base_dir.clone_from(&self.base_dir);
         config.replication.min_in_sync_replicas = self.in_sync_replica;
         config.id = self.follower_id(follower_index);
         config
@@ -230,7 +232,10 @@ async fn test_just_leader() {
 
     // write records
     leader_replica
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -259,7 +264,10 @@ async fn test_replication2_existing() {
 
     // write records
     leader_replica
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -344,7 +352,10 @@ async fn test_replication2_new_records() {
 
     // write records
     leader_replica
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -393,7 +404,10 @@ async fn test_replication3_existing() {
 
     // write records
     leader_replica
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -482,7 +496,10 @@ async fn test_replication3_new_records() {
 
     // write records
     leader_replica
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -606,7 +623,10 @@ async fn test_replication_dispatch_in_sequence() {
     assert_eq!(leader.hw(), 0);
 
     leader
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -697,7 +717,10 @@ async fn test_replication_dispatch_out_of_sequence() {
     assert_eq!(leader.hw(), 0);
 
     leader
-        .write_record_set(&mut create_recordset(2), leader_gctx.follower_notifier())
+        .write_record_set(
+            &mut create_raw_recordset(2),
+            leader_gctx.follower_notifier(),
+        )
         .await
         .expect("write");
 
@@ -712,4 +735,39 @@ async fn test_replication_dispatch_out_of_sequence() {
     sleep(Duration::from_millis(WAIT_TERMINATE)).await;
 
     spu_server.notify();
+}
+
+#[fluvio_future::test()]
+async fn test_replica_state_cleans_up_offset_producers() {
+    let builder = TestConfig::builder()
+        .base_port(13000_u16)
+        .generate("just_leader");
+
+    let (_leader_gctx, leader_replica) = builder.leader_replica().await;
+
+    //leader_replica.register_offset_publisher(offset_publisher)
+    let shared_publishers = leader_replica.consumer_offset_publishers();
+
+    {
+        let publishers = shared_publishers.lock().await;
+        assert!(publishers.len() == 0);
+    }
+
+    // Add 10 publishers and let them drop, should correspond to replica_state::CLEANUP_FREQUENCY
+    for i in 1..11 {
+        let new_publisher = Arc::new(OffsetPublisher::new(0));
+        leader_replica
+            .register_offset_publisher(&new_publisher)
+            .await;
+        let publishers = shared_publishers.lock().await;
+        assert!(publishers.len() == i);
+    }
+
+    // Add one final publisher and ensure dropped publishers are cleaned up
+    let new_publisher = Arc::new(OffsetPublisher::new(0));
+    leader_replica
+        .register_offset_publisher(&new_publisher)
+        .await;
+    let publishers = shared_publishers.lock().await;
+    assert!(publishers.len() == 1);
 }

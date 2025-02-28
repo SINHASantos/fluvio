@@ -9,7 +9,7 @@ concurrency:
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */2 * * *"
   # pull_request:
   #   branches: [master]
   workflow_dispatch:
@@ -39,14 +39,13 @@ jobs:
       RELEASE_NAME: release
       RELEASE: true
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Install Rust ${{ matrix.rust }}
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust ${{ matrix.rust }} Toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
+
       - name: Install zig
         run: ./actions/zig-install.sh ${{ matrix.os }}
       - uses: Swatinem/rust-cache@v2
@@ -67,7 +66,7 @@ jobs:
 
       # Upload artifacts
       - name: Upload artifact - ${{ matrix.binary }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary }}-${{ matrix.rust-target }}
           path: ${{ env.RUST_BIN_DIR }}/${{ matrix.binary }}
@@ -96,11 +95,12 @@ jobs:
         topic: [1, 10]
         topic_segment_bytes: [500000] # 500KB
         topic_retention: [15s]
+        cluster_type: [local,k8]
     env:
       TEST_BINARY: fluvio-test-x86_64-unknown-linux-musl
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Login GH CLI
         #      if: ${{ false }}
@@ -118,7 +118,7 @@ jobs:
 
       - name: Download build artifact - fluvio-test
         if: ${{ false }}
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-test-${{ matrix.rust-target }}
           path: ~/bin
@@ -145,18 +145,21 @@ jobs:
       # If they don't match, then let's run the test
 
       - name: Setup K3d
+        if: ${{ matrix.cluster_type == 'k8' }}
         run: curl -s https://raw.githubusercontent.com/rancher/k3d/main/install.sh | TAG=${{ env.K3D_VERSION }} bash
       - name: Create K3d cluster
+        if: ${{ matrix.cluster_type == 'k8' }}
         run: |
           ./k8-util/cluster/reset-k3d.sh
-      - name: Install Fluvio CLI and start cluster
-        run: |
-          curl -fsS https://packages.fluvio.io/v1/install.sh | VERSION=latest bash
-          echo "$HOME/.fluvio/bin" >> $GITHUB_PATH
+      - name: Setup Fluvio
+        uses: infinyon/fluvio/.github/actions/setup-fluvio@master
+        with:
+          version: latest
       - name: Start Fluvio Cluster
+        # --image-version is only used in the k8 cluster_type
         run: |
           fluvio version
-          fluvio cluster start
+          fluvio cluster start --${{ matrix.cluster_type}} --image-version latest
 
       # Disabled for now bc data load is unstable in CI
       #- name: Look for longevity data
@@ -212,7 +215,7 @@ jobs:
       #    tar -xvf longevity-data.tar
 
       ## TODO: Add a shorter cache time
-      #- uses: actions/upload-artifact@v3
+      #- uses: actions/upload-artifact@v4
       #  with:
       #    name: 'longevity-data'
       #    path: longevity-data.tar
@@ -220,9 +223,9 @@ jobs:
       - name: Run diagnostics
         if: failure()
         timeout-minutes: 5
-        run: fluvio cluster diagnostics --k8
+        run: fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: failure()
         with:

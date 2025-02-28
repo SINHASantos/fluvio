@@ -4,94 +4,103 @@
 //! All processing engines are hooked-up here. Channels are created and split between sencders
 //! and receivers.
 //!
+use std::sync::Arc;
 
-use k8_metadata_client::SharedClient;
-use k8_metadata_client::MetadataClient;
+use fluvio_sc_schema::mirror::MirrorSpec;
+use fluvio_stream_dispatcher::metadata::{SharedClient, MetadataClient};
+use fluvio_stream_model::core::MetadataItem;
 
+use crate::controllers::mirroring::controller::RemoteMirrorController;
 use crate::core::Context;
 use crate::core::SharedContext;
-use crate::controllers::spus::SpuController;
-use crate::controllers::topics::TopicController;
 use crate::controllers::partitions::PartitionController;
-use crate::controllers::derivedstreams::DerivedStreamController;
-use crate::config::{ScConfig};
+use crate::controllers::spus::SpuController;
+use crate::controllers::topics::controller::{TopicController, SystemTopicController};
+use crate::config::ScConfig;
 use crate::services::start_internal_server;
-use crate::dispatcher::dispatcher::K8ClusterStateDispatcher;
+use crate::dispatcher::dispatcher::MetadataDispatcher;
 use crate::services::auth::basic::BasicRbacPolicy;
 
-/// start the main loop
-pub async fn start_main_loop<C>(
+pub async fn start_main_loop<C, M>(
     sc_config_policy: (ScConfig, Option<BasicRbacPolicy>),
     metadata_client: SharedClient<C>,
-) -> SharedContext
+) -> crate::core::SharedContext<M>
 where
-    C: MetadataClient + 'static,
+    C: MetadataClient<M> + 'static,
+    M: MetadataItem,
+    M::UId: Send + Sync,
 {
     use crate::stores::spu::SpuSpec;
     use crate::stores::topic::TopicSpec;
     use crate::stores::partition::PartitionSpec;
     use crate::stores::spg::SpuGroupSpec;
-    use crate::stores::connector::ManagedConnectorSpec;
     use crate::stores::tableformat::TableFormatSpec;
     use crate::stores::smartmodule::SmartModuleSpec;
-    use crate::stores::derivedstream::DerivedStreamSpec;
 
     let (sc_config, auth_policy) = sc_config_policy;
 
     let namespace = sc_config.namespace.clone();
     let ctx = Context::shared_metadata(sc_config);
-    let config = ctx.config();
 
-    K8ClusterStateDispatcher::<SpuSpec, C>::start(
+    MetadataDispatcher::<SpuSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.spus().clone(),
     );
 
-    K8ClusterStateDispatcher::<TopicSpec, C>::start(
+    MetadataDispatcher::<TopicSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.topics().clone(),
     );
 
-    K8ClusterStateDispatcher::<PartitionSpec, C>::start(
+    MetadataDispatcher::<PartitionSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.partitions().clone(),
     );
 
-    K8ClusterStateDispatcher::<SpuGroupSpec, C>::start(
+    MetadataDispatcher::<SpuGroupSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.spgs().clone(),
     );
 
-    K8ClusterStateDispatcher::<ManagedConnectorSpec, C>::start(
-        namespace.clone(),
-        metadata_client.clone(),
-        ctx.managed_connectors().clone(),
-    );
-
-    K8ClusterStateDispatcher::<TableFormatSpec, C>::start(
+    MetadataDispatcher::<TableFormatSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.tableformats().clone(),
     );
 
-    K8ClusterStateDispatcher::<SmartModuleSpec, C>::start(
+    MetadataDispatcher::<SmartModuleSpec, C, M>::start(
         namespace.clone(),
         metadata_client.clone(),
         ctx.smartmodules().clone(),
     );
 
-    K8ClusterStateDispatcher::<DerivedStreamSpec, C>::start(
-        namespace,
-        metadata_client,
-        ctx.derivedstreams().clone(),
+    MetadataDispatcher::<MirrorSpec, C, M>::start(
+        namespace.clone(),
+        metadata_client.clone(),
+        ctx.mirrors().clone(),
     );
+
+    start_main_loop_services(ctx, auth_policy).await
+}
+
+/// start the main loop
+async fn start_main_loop_services<C>(
+    ctx: Arc<Context<C>>,
+    auth_policy: Option<BasicRbacPolicy>,
+) -> SharedContext<C>
+where
+    C: MetadataItem + 'static,
+    C::UId: Send + Sync,
+{
+    let config = ctx.config();
 
     whitelist!(config, "spu", SpuController::start(ctx.clone()));
     whitelist!(config, "topic", TopicController::start(ctx.clone()));
+    whitelist!(config, "topic", SystemTopicController::start(ctx.clone()));
     whitelist!(
         config,
         "partition",
@@ -104,30 +113,42 @@ where
         "public",
         pub_server::start(ctx.clone(), auth_policy)
     );
-
-    DerivedStreamController::start(
-        ctx.derivedstreams().clone(),
-        ctx.topics().clone(),
-        ctx.smartmodules().clone(),
+    whitelist!(
+        config,
+        "mirroring",
+        RemoteMirrorController::start(ctx.clone())
     );
 
     mod pub_server {
 
         use std::sync::Arc;
+        use fluvio_auth::root::RootAuthorization;
         use tracing::info;
 
         use crate::services::start_public_server;
         use crate::core::SharedContext;
 
-        use crate::services::auth::{AuthGlobalContext, RootAuthorization};
+        use fluvio_controlplane_metadata::core::MetadataItem;
+        use crate::services::auth::{AuthGlobalContext, ReadOnlyAuthorization};
         use crate::services::auth::basic::{BasicAuthorization, BasicRbacPolicy};
 
-        pub fn start(ctx: SharedContext, auth_policy_option: Option<BasicRbacPolicy>) {
+        pub fn start<C>(ctx: SharedContext<C>, auth_policy_option: Option<BasicRbacPolicy>)
+        where
+            C: MetadataItem + 'static,
+            C::UId: Send + Sync,
+        {
             if let Some(policy) = auth_policy_option {
                 info!("using basic authorization");
                 start_public_server(AuthGlobalContext::new(
                     ctx,
                     Arc::new(BasicAuthorization::new(policy)),
+                ));
+            } else if ctx.config().read_only_metadata {
+                info!("using read-only authorization");
+
+                start_public_server(AuthGlobalContext::new(
+                    ctx,
+                    Arc::new(ReadOnlyAuthorization::new()),
                 ));
             } else {
                 info!("using root authorization");

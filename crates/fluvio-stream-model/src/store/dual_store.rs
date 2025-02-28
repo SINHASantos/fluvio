@@ -7,9 +7,9 @@ use std::hash::Hash;
 
 use tracing::trace;
 use tracing::{debug, error};
-use async_rwlock::RwLock;
-use async_rwlock::RwLockReadGuard;
-use async_rwlock::RwLockWriteGuard;
+use async_lock::RwLock;
+use async_lock::RwLockReadGuard;
+use async_lock::RwLockWriteGuard;
 
 use crate::core::{MetadataItem, Spec};
 
@@ -55,10 +55,7 @@ where
     C: MetadataItem,
 {
     /// initialize local stores with list of metadata objects
-    pub fn bulk_new<N>(objects: Vec<N>) -> Self
-    where
-        N: Into<MetadataStoreObject<S, C>>,
-    {
+    pub fn bulk_new(objects: Vec<impl Into<MetadataStoreObject<S, C>>>) -> Self {
         let obj: Vec<MetadataStoreObject<S, C>> = objects.into_iter().map(|s| s.into()).collect();
         let mut map = HashMap::new();
         for obj in obj {
@@ -77,7 +74,7 @@ where
 
     /// Read guard
     #[inline(always)]
-    pub async fn read<'a>(
+    pub async fn read(
         &'_ self,
     ) -> RwLockReadGuard<'_, DualEpochMap<S::IndexKey, MetadataStoreObject<S, C>>> {
         self.store.read().await
@@ -85,7 +82,7 @@ where
 
     /// write guard, this is private, use sync API to make changes
     #[inline(always)]
-    async fn write<'a>(
+    async fn write(
         &'_ self,
     ) -> RwLockWriteGuard<'_, DualEpochMap<S::IndexKey, MetadataStoreObject<S, C>>> {
         self.store.write().await
@@ -103,22 +100,19 @@ where
     }
 
     /// copy of the value
-    pub async fn value<K: ?Sized>(
-        &self,
-        key: &K,
-    ) -> Option<DualEpochCounter<MetadataStoreObject<S, C>>>
+    pub async fn value<K>(&self, key: &K) -> Option<DualEpochCounter<MetadataStoreObject<S, C>>>
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.get(key).cloned()
     }
 
     /// copy spec
-    pub async fn spec<K: ?Sized>(&self, key: &K) -> Option<S>
+    pub async fn spec<K>(&self, key: &K) -> Option<S>
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.get(key).map(|value| value.spec.clone())
     }
@@ -138,10 +132,10 @@ where
         }
     }
 
-    pub async fn contains_key<K: ?Sized>(&self, key: &K) -> bool
+    pub async fn contains_key<K>(&self, key: &K) -> bool
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.contains_key(key)
     }
@@ -212,10 +206,8 @@ impl SyncStatus {
 
 impl<S, C> LocalStore<S, C>
 where
-    S: Spec + PartialEq,
-    S::Status: PartialEq,
-    S::IndexKey: Display,
-    C: MetadataItem + PartialEq,
+    S: Spec,
+    C: MetadataItem,
 {
     /// sync with incoming changes as source of truth.
     /// any objects not in incoming list will be deleted
@@ -326,6 +318,7 @@ where
             match change {
                 LSUpdate::Mod(new_kv_value) => {
                     let key = new_kv_value.key_owned();
+
                     if let Some(diff) = write_guard.update(key, new_kv_value) {
                         if diff.spec {
                             update_spec += 1;
@@ -336,7 +329,7 @@ where
                         if diff.meta {
                             update_meta += 1;
                         }
-                        trace!(update_spec, update_status, update_meta);
+                        trace!(update_spec, update_status, update_meta, "update metrics");
                     } else {
                         trace!("new");
                         // there was no existing, so this is new
@@ -560,6 +553,7 @@ mod listener {
 }
 
 #[cfg(test)]
+#[cfg(feature = "fixtures")]
 mod test {
 
     use crate::store::actions::LSUpdate;
@@ -662,6 +656,7 @@ mod test {
 }
 
 #[cfg(test)]
+#[cfg(feature = "fixture")]
 mod test_notify {
 
     use std::sync::Arc;
@@ -669,11 +664,11 @@ mod test_notify {
     use std::sync::atomic::{AtomicI64, AtomicBool};
     use std::sync::atomic::Ordering::SeqCst;
 
-    use async_std::task::JoinHandle;
     use tokio::select;
     use tracing::debug;
 
     use fluvio_future::task::spawn;
+    use fluvio_future::task::JoinHandle;
     use fluvio_future::timer::sleep;
 
     use crate::core::{Spec, MetadataItem};
@@ -753,7 +748,7 @@ mod test_notify {
 
         for i in 0..10u16 {
             sleep(Duration::from_millis(2)).await;
-            let topic_name = format!("topic{}", i);
+            let topic_name = format!("topic{i}");
             debug!("creating topic: {}", topic_name);
             let topic = DefaultTest::with_spec(topic_name, TestSpec::default()).with_context(3);
             let _ = topic_store.apply_changes(vec![LSUpdate::Mod(topic)]).await;

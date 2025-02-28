@@ -5,72 +5,64 @@ use std::io::Error as IoError;
 use clap::Parser;
 use serde::Serialize;
 use duct::cmd;
-use sysinfo::{System, SystemExt, NetworkExt, ProcessExt, DiskExt, PidExt};
+use sysinfo::{System, Networks, Disks};
 use which::which;
+use anyhow::Result;
 
-use fluvio::config::ConfigFile;
 use fluvio::metadata::{topic::TopicSpec, partition::PartitionSpec, spg::SpuGroupSpec, spu::SpuSpec};
 use fluvio_sc_schema::objects::Metadata;
 
+use crate::{InstallationType, cli::get_installation_type};
 use crate::cli::ClusterCliError;
-use crate::cli::start::get_log_directory;
-use crate::start::local::DEFAULT_DATA_DIR as DEFAULT_LOCAL_DIR;
+use crate::cli::start::default_log_directory;
+use crate::start::local::{DEFAULT_DATA_DIR as DEFAULT_LOCAL_DIR, DEFAULT_METADATA_SUB_DIR};
 
-type Result<T, E = ClusterCliError> = core::result::Result<T, E>;
-
-#[derive(Debug)]
-enum ProfileType {
-    K8,
-    Local,
-    Cloud,
-}
+const FLUVIO_PROCESS_NAME: &str = "fluvio";
 
 #[derive(Parser, Debug)]
 pub struct DiagnosticsOpt {
-    #[clap(long)]
+    #[arg(long)]
     quiet: bool,
-
-    #[clap(long)]
-    k8: bool,
-
-    #[clap(long)]
-    local: bool,
-
-    #[clap(long)]
-    cloud: bool,
 }
 
 impl DiagnosticsOpt {
     pub async fn process(self) -> Result<()> {
-        let profile_ty = self.get_profile_ty()?;
-        println!("Using profile type: {:#?}", profile_ty);
-        let temp_dir = tempdir::TempDir::new("fluvio-diagnostics")?;
+        let (installation_ty, config) = get_installation_type()?;
+        let profile = config.config().current_profile_name().unwrap_or("none");
+        println!("Installation type: {installation_ty:#?}\nProfile: {profile}");
+        let temp_dir = tempfile::Builder::new()
+            .prefix("fluvio-diagnostics")
+            .tempdir()?;
         let temp_path = temp_dir.path();
 
         let spu_specs = match self.copy_fluvio_specs(temp_path).await {
             Ok(specs) => specs,
             Err(err) => {
-                eprintln!("error copying fluivo specs: {:#?}", err);
+                eprintln!("error copying fluvio specs: {err:#?}");
                 vec![]
             }
         };
 
         // write internal fluvio cluster internal state
-        match profile_ty {
+        match installation_ty {
             // Local cluster
-            ProfileType::Local => {
+            InstallationType::Local | InstallationType::ReadOnly => {
+                self.copy_local_logs(temp_path)?;
+                self.copy_local_metadata(temp_path)?;
+                for spu in spu_specs {
+                    self.spu_disk_usage(None, temp_path, &spu.spec)?;
+                }
+            }
+            // Local cluster with k8 metadata
+            InstallationType::LocalK8 => {
                 self.write_helm(temp_path)?;
                 self.copy_local_logs(temp_path)?;
                 for spu in spu_specs {
                     self.spu_disk_usage(None, temp_path, &spu.spec)?;
                 }
             }
-            // Cloud cluster
-            ProfileType::Cloud => {
-                println!("Cannot collect logs from Cloud, skipping");
-            }
-            // Guess Kubernetes cluster
-            ProfileType::K8 => {
+            // Kubernetes cluster
+            InstallationType::K8 => {
                 let kubectl = match which("kubectl") {
                     Ok(kubectl) => kubectl,
                     Err(_) => {
@@ -95,40 +87,22 @@ impl DiagnosticsOpt {
                     self.spu_disk_usage(Some(&kubectl), temp_path, &spu.spec)?;
                 }
             }
+            _other => {}
         }
 
         self.write_system_info(temp_path)?;
 
         let time = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
-        let diagnostic_path = std::env::current_dir()?.join(format!("diagnostics-{}.tar.gz", time));
+        let diagnostic_path = std::env::current_dir()?.join(format!("diagnostics-{time}.tar.gz"));
         let mut diagnostic_file = std::fs::File::create(&diagnostic_path)?;
         self.zip_files(temp_path, &mut diagnostic_file)
-            .map_err(|e| ClusterCliError::Other(format!("failed to zip diagnostics: {}", e)))?;
+            .map_err(|e| ClusterCliError::Other(format!("failed to zip diagnostics: {e}")))?;
 
         println!("Wrote diagnostics to {}", diagnostic_path.display());
         Ok(())
     }
 
-    // get type of profile
-    fn get_profile_ty(&self) -> Result<ProfileType> {
-        if self.k8 {
-            Ok(ProfileType::K8)
-        } else if self.local {
-            Ok(ProfileType::Local)
-        } else if self.cloud {
-            Ok(ProfileType::Cloud)
-        } else {
-            let config = ConfigFile::load_default_or_new()?;
-            match config.config().current_profile_name() {
-                Some("local") => Ok(ProfileType::Local),
-                // Cloud cluster
-                Some(other) if other.contains("cloud") => Ok(ProfileType::Cloud),
-                _ => Ok(ProfileType::K8),
-            }
-        }
-    }
-
-    fn zip_files(&self, source: &Path, output: &mut std::fs::File) -> Result<(), std::io::Error> {
+    fn zip_files(&self, source: &Path, output: &mut std::fs::File) -> Result<()> {
         use flate2::write::GzEncoder;
 
         let mut gzipper = GzEncoder::new(output, flate2::Compression::default());
@@ -142,17 +116,30 @@ impl DiagnosticsOpt {
 
     // copy logs from spu
     fn copy_local_logs(&self, dest_dir: &Path) -> Result<()> {
-        let logs_dir = std::fs::read_dir(get_log_directory())?;
-        println!("reading local logs from {:?}", logs_dir);
+        let logs_dir = std::fs::read_dir(default_log_directory())?;
+        println!("reading local logs from {logs_dir:?}");
         for entry in logs_dir.flat_map(|it| it.ok()) {
             let to = dest_dir.join(entry.file_name());
             let file_name = entry.file_name();
             if file_name == "flv_sc.log" || file_name.to_string_lossy().starts_with("spu_log") {
                 println!("copying local log file: {:?}", entry.path());
-                copy(entry.path(), &to)?;
+                copy(entry.path(), to)?;
             } else {
-                println!("skipping {:?}", file_name);
+                println!("skipping {file_name:?}");
             }
+        }
+        Ok(())
+    }
+
+    fn copy_local_metadata(&self, dest_dir: &Path) -> Result<()> {
+        let metadata_path = DEFAULT_LOCAL_DIR
+            .to_owned()
+            .unwrap_or_default()
+            .join(DEFAULT_METADATA_SUB_DIR);
+        if metadata_path.exists() {
+            println!("reading local metadata from {metadata_path:?}");
+            let mut metadata_file = std::fs::File::create(dest_dir.join("metadata.tar.gz"))?;
+            self.zip_files(&metadata_path, &mut metadata_file)?;
         }
         Ok(())
     }
@@ -170,7 +157,7 @@ impl DiagnosticsOpt {
         // Filter for only Fluvio pods
         let pods = pods
             .split(' ')
-            .filter(|pod| pod.contains("fluvio"))
+            .filter(|pod| pod.contains(FLUVIO_PROCESS_NAME))
             .collect::<Vec<_>>();
 
         for &pod in &pods {
@@ -185,7 +172,7 @@ impl DiagnosticsOpt {
                 }
             };
 
-            let dest_path = dest_dir.join(format!("pod-{}.log", pod));
+            let dest_path = dest_dir.join(format!("pod-{pod}.log"));
             write(dest_path, log)?;
         }
 
@@ -211,7 +198,7 @@ impl DiagnosticsOpt {
         // Filter for only Fluvio services
         let objects = objects
             .split(' ')
-            .filter(|obj| !filter_fluvio || obj.contains("fluvio"))
+            .filter(|obj| !filter_fluvio || obj.contains(FLUVIO_PROCESS_NAME))
             .map(|name| name.trim())
             .collect::<Vec<_>>();
 
@@ -220,7 +207,7 @@ impl DiagnosticsOpt {
             let result = cmd!(kubectl, "get", ty, obj, "-o", "yaml")
                 .stderr_capture()
                 .read();
-            let dest = dest.join(format!("{}-{}.yaml", ty, obj));
+            let dest = dest.join(format!("{ty}-{obj}.yaml"));
             self.dump(&format!("k8: {ty}"), dest, result)?;
         }
         Ok(())
@@ -234,7 +221,7 @@ impl DiagnosticsOpt {
         let admin = fluvio.admin().await;
 
         let write_spec = |yaml, name| -> Result<()> {
-            let path = dest.join(format!("admin-spec-{}.yml", name));
+            let path = dest.join(format!("admin-spec-{name}.yml"));
             self.dump(name, path, Ok(yaml))?;
             Ok(())
         };
@@ -272,16 +259,19 @@ impl DiagnosticsOpt {
 
     fn write_system_info(&self, dest: &Path) -> Result<()> {
         let write = |yaml, name| -> Result<()> {
-            let path = dest.join(format!("system-{}.yml", name));
+            let path = dest.join(format!("system-{name}.yml"));
             self.dump(name, path, Ok(yaml))?;
             Ok(())
         };
 
+        sysinfo::set_open_files_limit(0);
         let mut sys = System::new_all();
+        let mut net = Networks::new();
 
         // First we update all information of our `System` struct.
         println!("getting system info");
         sys.refresh_all();
+        net.refresh(true);
 
         let info = SystemInfo::load(&sys);
         write(serde_yaml::to_string(&info).unwrap(), "sysinfo")?;
@@ -291,7 +281,7 @@ impl DiagnosticsOpt {
         //println!("{}", disk_string);
         //  write(&disk_string, "disk")?;
 
-        let networks = NetworkInfo::load(&sys);
+        let networks = NetworkInfo::load(&net);
         write(serde_yaml::to_string(&networks).unwrap(), "networks")?;
 
         let processes = ProcessInfo::load(&sys);
@@ -327,7 +317,7 @@ impl DiagnosticsOpt {
                 let log_dir = (DEFAULT_LOCAL_DIR.to_owned())
                     .unwrap()
                     .join(format!("spu-logs-{spu}"));
-                println!("retrieved local spu disk log {:?}", log_dir);
+                println!("retrieved local spu disk log {log_dir:?}");
                 cmd!("ls", "-lh", "-R", log_dir)
             }
         };
@@ -356,9 +346,9 @@ impl DiagnosticsOpt {
                 write(path, output)?;
             }
             Err(err) => {
-                let output_err = format!("Failed to collect {label} list: {:#?}", err);
+                let output_err = format!("Failed to collect {label} list: {err:#?}");
                 if !self.quiet {
-                    println!("{}", output_err);
+                    println!("{output_err}");
                 }
                 write(path, &output_err)?;
             }
@@ -389,10 +379,10 @@ struct SystemInfo {
 impl SystemInfo {
     fn load(sys: &System) -> Self {
         Self {
-            name: sys.name().unwrap_or_default(),
-            kernel_version: sys.kernel_version().unwrap_or_default(),
-            os_version: sys.os_version().unwrap_or_default(),
-            host_name: sys.host_name().unwrap_or_default(),
+            name: System::name().unwrap_or_default(),
+            kernel_version: System::kernel_version().unwrap_or_default(),
+            os_version: System::os_version().unwrap_or_default(),
+            host_name: System::host_name().unwrap_or_default(),
             processors: sys.cpus().len(),
             total_memory: sys.total_memory(),
             total_swap: sys.total_swap(),
@@ -401,6 +391,7 @@ impl SystemInfo {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct DiskInfo {
     name: String,
@@ -411,10 +402,10 @@ struct DiskInfo {
 }
 
 impl DiskInfo {
-    fn _load(sys: &System) -> Vec<DiskInfo> {
+    fn _load(diskinfo: &Disks) -> Vec<DiskInfo> {
         let mut disks = Vec::new();
 
-        for disk in sys.disks() {
+        for disk in diskinfo {
             disks.push(DiskInfo {
                 name: format!("{:?}", disk.name()),
                 mount_point: format!("{:?}", disk.mount_point()),
@@ -436,10 +427,10 @@ struct NetworkInfo {
 }
 
 impl NetworkInfo {
-    fn load(sys: &System) -> Vec<NetworkInfo> {
+    fn load(net: &Networks) -> Vec<NetworkInfo> {
         let mut networks = Vec::new();
 
-        for network in sys.networks() {
+        for network in net {
             networks.push(NetworkInfo {
                 name: network.0.to_string(),
                 received: network.1.received(),
@@ -464,13 +455,17 @@ impl ProcessInfo {
         let mut processes = Vec::new();
 
         for (pid, process) in sys.processes() {
-            if process.name().contains("fluvio") {
-                processes.push(ProcessInfo {
-                    pid: pid.as_u32(),
-                    name: process.name().to_string(),
-                    disk_usage: format!("{:?}", process.disk_usage()),
-                    cmd: format!("{:?}", process.cmd()),
-                });
+            let process_name = process.name().to_str();
+
+            if let Some(process_name) = process_name {
+                if process_name.contains(FLUVIO_PROCESS_NAME) {
+                    processes.push(ProcessInfo {
+                        pid: pid.as_u32(),
+                        name: process_name.to_string(),
+                        disk_usage: format!("{:?}", process.disk_usage()),
+                        cmd: format!("{:?}", process.cmd()),
+                    });
+                }
             }
         }
 

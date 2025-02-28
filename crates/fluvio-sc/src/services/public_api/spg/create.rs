@@ -4,15 +4,16 @@
 //! Converts Spu Gruups API request into KV request and sends to KV store for processing.
 //!
 
-use std::io::{Error, ErrorKind};
 use std::time::Duration;
 
-use fluvio_stream_dispatcher::actions::WSAction;
+use fluvio_stream_model::core::MetadataItem;
 use tracing::{info, trace, instrument};
+use anyhow::{anyhow, Result};
 
+use fluvio_stream_dispatcher::actions::WSAction;
 use fluvio_protocol::link::ErrorCode;
 use fluvio_sc_schema::Status;
-use fluvio_sc_schema::objects::{CommonCreateRequest};
+use fluvio_sc_schema::objects::CreateRequest;
 use fluvio_sc_schema::spg::SpuGroupSpec;
 use fluvio_controlplane_metadata::extended::SpecExt;
 use fluvio_auth::{AuthContext, TypeAction};
@@ -23,13 +24,13 @@ use crate::services::auth::AuthServiceContext;
 const DEFAULT_SPG_CREATE_TIMEOUT: u32 = 120 * 1000; // 2 minutes
 
 /// Handler for spu groups request
-#[instrument(skip(common, auth_ctx))]
-pub async fn handle_create_spu_group_request<AC: AuthContext>(
-    common: CommonCreateRequest,
-    spg: SpuGroupSpec,
-    auth_ctx: &AuthServiceContext<AC>,
-) -> Result<Status, Error> {
-    let name = common.name;
+#[instrument(skip(req, auth_ctx))]
+pub async fn handle_create_spu_group_request<AC: AuthContext, C: MetadataItem>(
+    req: CreateRequest<SpuGroupSpec>,
+    auth_ctx: &AuthServiceContext<AC, C>,
+) -> Result<Status> {
+    let (create, spg) = req.parts();
+    let name = create.name;
 
     info!( spg = %name,
          replica = %spg.replicas,
@@ -49,10 +50,10 @@ pub async fn handle_create_spu_group_request<AC: AuthContext>(
             ));
         }
     } else {
-        return Err(Error::new(ErrorKind::Interrupted, "authorization io error"));
+        return Err(anyhow!("authorization io error"));
     }
 
-    let status = process_custom_spu_request(&auth_ctx.global_ctx, name, common.timeout, spg).await;
+    let status = process_custom_spu_request(&auth_ctx.global_ctx, name, create.timeout, spg).await;
     trace!("create spu-group response {:#?}", status);
 
     Ok(status)
@@ -60,8 +61,8 @@ pub async fn handle_create_spu_group_request<AC: AuthContext>(
 
 /// Process custom spu, converts spu spec to K8 and sends to KV store
 #[instrument(skip(ctx, spg_spec))]
-async fn process_custom_spu_request(
-    ctx: &Context,
+async fn process_custom_spu_request<C: MetadataItem>(
+    ctx: &Context<C>,
     name: String,
     timeout: Option<u32>,
     spg_spec: SpuGroupSpec,

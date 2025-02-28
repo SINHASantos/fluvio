@@ -1,8 +1,8 @@
 mod controller;
 mod store;
 
-pub use store::*;
-pub use context::*;
+pub(crate) use store::*;
+pub(crate) use context::*;
 
 mod context {
 
@@ -10,8 +10,9 @@ mod context {
     use std::fmt::Display;
     use std::io::Error as IoError;
 
+    use fluvio_stream_dispatcher::metadata::local::LocalMetadataItem;
     use tracing::{debug, instrument};
-    use async_rwlock::RwLockReadGuard;
+    use async_lock::RwLockReadGuard;
     use once_cell::sync::Lazy;
 
     use crate::FluvioError;
@@ -22,7 +23,7 @@ mod context {
     use crate::metadata::spu::SpuSpec;
     use crate::metadata::core::MetadataItem;
 
-    pub(crate) type CacheMetadataStoreObject<S> = MetadataStoreObject<S, AlwaysNewContext>;
+    pub(crate) type CacheMetadataStoreObject<S> = MetadataStoreObject<S, LocalMetadataItem>;
 
     /// Timeout
     static MAX_WAIT_TIME: Lazy<u64> = Lazy::new(|| {
@@ -54,7 +55,7 @@ mod context {
     where
         S: Spec,
     {
-        store: Arc<LocalStore<S, AlwaysNewContext>>,
+        store: Arc<LocalStore<S, LocalMetadataItem>>,
     }
 
     impl<S> StoreContext<S>
@@ -67,7 +68,7 @@ mod context {
             }
         }
 
-        pub fn store(&self) -> &Arc<LocalStore<S, AlwaysNewContext>> {
+        pub(crate) fn store(&self) -> &Arc<LocalStore<S, LocalMetadataItem>> {
             &self.store
         }
 
@@ -78,7 +79,7 @@ mod context {
             fields(
                 Store = %S::LABEL            )
         )]
-        pub async fn lookup_by_key(
+        pub(crate) async fn lookup_by_key(
             &self,
             key: &S::IndexKey,
         ) -> Result<Option<CacheMetadataStoreObject<S>>, IoError>
@@ -146,7 +147,7 @@ mod context {
     }
 
     impl StoreContext<SpuSpec> {
-        pub async fn look_up_by_id(
+        pub(crate) async fn look_up_by_id(
             &self,
             id: i32,
         ) -> Result<CacheMetadataStoreObject<SpuSpec>, FluvioError> {
@@ -175,7 +176,9 @@ mod context {
             <S as Spec>::Status: Send + Sync,
             S::IndexKey: Send + Sync,
         {
-            pub fn watch(&self) -> impl Stream<Item = MetadataChanges<S, AlwaysNewContext>> {
+            pub(crate) fn watch(
+                &self,
+            ) -> impl Stream<Item = MetadataChanges<S, LocalMetadataItem>> {
                 let mut listener = self.store.change_listener();
                 let (sender, receiver) = async_channel::unbounded();
 

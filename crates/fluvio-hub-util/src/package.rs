@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
 use flate2::Compression;
 use flate2::GzBuilder;
 use flate2::read::GzDecoder;
+use fluvio_hub_protocol::PkgTag;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use tracing::{debug, warn};
@@ -13,13 +15,14 @@ use wasmparser::{Parser, Chunk, Payload};
 
 use fluvio_hub_protocol::{HubError, PackageMeta, Result};
 use fluvio_hub_protocol::constants::{
-    DEF_HUB_INIT_DIR, HUB_PACKAGE_META, HUB_SIGNFILE_BASE, HUB_MANIFEST_BLOB,
-    HUB_PACKAGE_META_CLEAN,
+    HUB_PACKAGE_META, HUB_SIGNFILE_BASE, HUB_MANIFEST_BLOB, HUB_PACKAGE_META_CLEAN,
 };
 
 use crate::PackageMetaExt;
 use crate::keymgmt::{Keypair, PublicKey, Signature};
 use crate::HubAccess;
+
+pub(crate) const ARCH_TAG_NAME: &str = "arch";
 
 /// assemble files into an unsigned fluvio package, a file will be created named
 /// packagename-A.B.C.tar after signing it's called an ipkg
@@ -27,12 +30,13 @@ use crate::HubAccess;
 /// # Arguments
 /// * pkgmeta: package-meta.yaml path
 /// * outdir: optional output directory
-pub fn package_assemble_and_sign(
-    pkgmeta: &str,
+pub fn package_assemble_and_sign<P: AsRef<Path>, T: AsRef<Path>>(
+    pkgmeta: P,
     access: &HubAccess,
-    outdir: Option<&str>,
+    outdir: T,
+    target: Option<&str>,
 ) -> Result<String> {
-    let tarname = package_assemble(pkgmeta, outdir)?;
+    let tarname = package_assemble(pkgmeta, outdir, target)?;
     let ipkgname = tar_to_ipkg(&tarname);
     let keypair = access.keypair()?;
     package_sign(&tarname, &keypair, &ipkgname)?;
@@ -40,9 +44,8 @@ pub fn package_assemble_and_sign(
     Ok(ipkgname)
 }
 
-fn tar_to_ipkg(fname: &str) -> String {
-    let path = Path::new(fname);
-    path.with_extension("ipkg").display().to_string()
+fn tar_to_ipkg<P: AsRef<Path>>(path: P) -> String {
+    path.as_ref().with_extension("ipkg").display().to_string()
 }
 
 /// assemble files into an unsigned fluvio package, a file will be created named
@@ -53,33 +56,49 @@ fn tar_to_ipkg(fname: &str) -> String {
 /// * outdir: optional output directory
 ///
 /// # Returns: staging tarfilename
-fn package_assemble(pkgmeta: &str, outdir: Option<&str>) -> Result<String> {
+fn package_assemble<P: AsRef<Path>, T: AsRef<Path>>(
+    pkgmeta: P,
+    outdir: T,
+    target: Option<&str>,
+) -> Result<PathBuf> {
     debug!(target: "package_assemble", "opening");
-    let pm = PackageMeta::read_from_file(pkgmeta)?;
+    let pm = PackageMeta::read_from_file(&pkgmeta)?;
     let mut pm_clean = pm.clone();
     pm_clean.manifest = Vec::new();
+    if let Some(target) = target {
+        augment_arch(&mut pm_clean, target);
+    }
 
-    let outdir = outdir.unwrap_or(DEF_HUB_INIT_DIR);
-    let pkgtarname = outdir.to_string() + "/" + &pm.packagefile_name_unsigned();
+    let pkgtarname = outdir.as_ref().join(pm.packagefile_name_unsigned());
 
     // crate manifest blob
     //todo: create in tmpdir/tmpfile?
-    let manipath = Path::new(outdir).join(HUB_MANIFEST_BLOB);
-    debug!(target: "package_assemble", "{pkgtarname}, creating temporary manifest blob ");
+    let manipath = outdir.as_ref().join(HUB_MANIFEST_BLOB);
+    debug!(target: "package_assemble", "{}, creating temporary manifest blob", pkgtarname.to_string_lossy());
     let tfio = std::fs::File::create(&manipath)?;
     let mut tfgz = GzBuilder::new()
         .filename(HUB_MANIFEST_BLOB)
         .write(tfio, Compression::default());
     let mut tf = tar::Builder::new(&mut tfgz);
 
+    let base_directory = pkgmeta.as_ref().parent().ok_or_else(|| {
+        HubError::UnableToAssemblePackage("invalid package meta file path".to_string())
+    })?;
+    debug!("base directory: {}", base_directory.to_string_lossy());
     for fname in &pm.manifest {
-        let fname = Path::new(fname);
+        let fname = base_directory.join(fname);
 
         // in package, the source path is stripped
         let just_fname = fname
             .file_name()
             .ok_or_else(|| HubError::ManifestInvalidFile(fname.to_string_lossy().to_string()))?;
-        tf.append_path_with_name(fname, just_fname)?;
+        tf.append_path_with_name(&fname, just_fname)
+            .map_err(|err| {
+                HubError::UnableToAssemblePackage(format!(
+                    "unable to put {} into archive: {err}",
+                    fname.to_string_lossy()
+                ))
+            })?;
         let just_fname = just_fname.to_string_lossy().to_string();
         pm_clean.manifest.push(just_fname);
     }
@@ -87,9 +106,10 @@ fn package_assemble(pkgmeta: &str, outdir: Option<&str>) -> Result<String> {
     tf.finish()?;
     drop(tf);
     tfgz.finish()?;
+    debug!(target: "package_assemble", "{}, temporary manifest blob done", pkgtarname.to_string_lossy());
 
     // write the clean temporary package file
-    let clean_tmp = Path::new(outdir).join(HUB_PACKAGE_META_CLEAN);
+    let clean_tmp = outdir.as_ref().join(HUB_PACKAGE_META_CLEAN);
     debug!(target: "package_assemble", "writing clean pkg meta");
     pm_clean.write(&clean_tmp)?;
 
@@ -130,7 +150,7 @@ struct PackageSignatureBulder {
 impl PackageSignatureBulder {
     fn new(key: &Keypair) -> Result<Self> {
         let builder = PackageSignatureBulder {
-            signkey: key.clone_with_result()?,
+            signkey: key.clone(),
             pkgsig: PackageSignature {
                 files: Vec::new(),
                 pubkey: key.public().to_hex(),
@@ -165,10 +185,14 @@ impl PackageSignatureBulder {
 /// the signature is added as signature.0 for the first signature
 /// but subsequent signatures are added as .1, .2 etc.
 /// the later signatures will also sign the earlier signature files.
-pub fn package_sign(in_pkgfile: &str, key: &Keypair, out_pkgfile: &str) -> Result<()> {
+pub fn package_sign<P: AsRef<Path>, T: AsRef<Path>>(
+    in_pkgfile: P,
+    key: &Keypair,
+    out_pkgfile: T,
+) -> Result<()> {
     // todo: add public key from credentials
 
-    let file = std::fs::File::open(in_pkgfile)?;
+    let file = std::fs::File::open(&in_pkgfile)?;
     let mut ar = tar::Archive::new(file);
     let entries = ar.entries()?;
 
@@ -209,26 +233,33 @@ pub fn package_sign(in_pkgfile: &str, key: &Keypair, out_pkgfile: &str) -> Resul
     }
     if num_files == 0 {
         return Err(HubError::PackageSigning(format!(
-            "{in_pkgfile}: no files in package"
+            "{}: no files in package",
+            in_pkgfile.as_ref().to_string_lossy()
         )));
     }
     let buf = serde_json::to_string(&sig.pkgsig).map_err(|e| {
         warn!("signature serialization: {}", e);
-        HubError::PackageSigning(format!("{in_pkgfile}: signature serialization fault"))
+        HubError::PackageSigning(format!(
+            "{}: signature serialization fault",
+            in_pkgfile.as_ref().to_string_lossy()
+        ))
     })?;
     let signame = format!("{HUB_SIGNFILE_BASE}.{sig_number}");
     let tmpsigfile = tempdir.path().join(&signame);
-    std::fs::write(&tmpsigfile, &buf)?;
+    std::fs::write(&tmpsigfile, buf)?;
     signedpkg.append_path_with_name(&tmpsigfile, &signame)?;
     signedpkg.finish()?;
     drop(signedpkg);
     signedfile.flush()?;
     let sf_path = signedfile.path().to_path_buf();
-    if let Err(e) = signedfile.persist(out_pkgfile) {
+    if let Err(e) = signedfile.persist(&out_pkgfile) {
         warn!("{}, falling back to copy", e);
-        std::fs::copy(sf_path, out_pkgfile).map_err(|e| {
+        std::fs::copy(sf_path, &out_pkgfile).map_err(|e| {
             warn!("copy failure {}", e);
-            HubError::PackageSigning(format!("{in_pkgfile}: fault creating signed package\n{e}"))
+            HubError::PackageSigning(format!(
+                "{}: fault creating signed package\n{e}",
+                in_pkgfile.as_ref().to_string_lossy()
+            ))
         })?;
     }
     Ok(())
@@ -255,17 +286,17 @@ pub fn package_getsigs_with_readio<R: std::io::Read>(
         let fnamestr = fp.to_string_lossy().to_string();
         let file_base = fp
             .file_stem()
-            .ok_or_else(|| HubError::PackageVerify(format!("{} bad filename", pkgfile)))?;
+            .ok_or_else(|| HubError::PackageVerify(format!("{pkgfile} bad filename")))?;
         let file_name = fp
             .file_name()
-            .ok_or_else(|| HubError::PackageVerify(format!("{} bad filename", pkgfile)))?;
+            .ok_or_else(|| HubError::PackageVerify(format!("{pkgfile} bad filename")))?;
         if fh.unpack_in(tempdir.path())? {
             let tmpfile = tempdir.path().join(file_name);
-            let buf = std::fs::read(&tmpfile)?;
+            let buf = std::fs::read(tmpfile)?;
             if file_base == HUB_SIGNFILE_BASE {
                 // unpack the file, check if the signing key matches and validate it
                 let ps: PackageSignature = serde_json::from_slice(&buf).map_err(|_| {
-                    HubError::PackageVerify(format!("{} could not decode sig", pkgfile))
+                    HubError::PackageVerify(format!("{pkgfile} could not decode sig"))
                 })?;
                 sigs.insert(fnamestr.to_string(), ps);
             }
@@ -275,17 +306,20 @@ pub fn package_getsigs_with_readio<R: std::io::Read>(
 }
 
 // get a top level file from a package file
-pub fn package_get_topfile(pkgfile: &str, topfile: &str) -> Result<Vec<u8>> {
+pub fn package_get_topfile<P: AsRef<Path>, T: AsRef<Path>>(
+    pkgfile: P,
+    topfile: T,
+) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(pkgfile)?;
     package_get_topfile_with_readio(&mut file, topfile)
 }
 
 // get a top level file a generic reader trait obj
-pub fn package_get_topfile_with_readio<R: std::io::Read>(
+pub fn package_get_topfile_with_readio<R: std::io::Read, P: AsRef<Path>>(
     readio: &mut R,
-    topfile: &str,
+    topfile: P,
 ) -> Result<Vec<u8>> {
-    let topfile_p = Path::new(topfile);
+    let topfile_p = topfile.as_ref();
     let mut ar = tar::Archive::new(readio);
     let entries = ar.entries()?;
     for file in entries {
@@ -298,18 +332,24 @@ pub fn package_get_topfile_with_readio<R: std::io::Read>(
                 continue;
             }
             let mut buf: Vec<u8> = Vec::new();
-            f.read_to_end(&mut buf)
-                .map_err(|_| HubError::PackageMissingFile(topfile.into()))?;
+            f.read_to_end(&mut buf).map_err(|_| {
+                HubError::PackageMissingFile(topfile_p.to_string_lossy().to_string())
+            })?;
             return Ok(buf);
         }
     }
-    Err(HubError::PackageMissingFile(topfile.into()))
+    Err(HubError::PackageMissingFile(
+        topfile_p.to_string_lossy().to_string(),
+    ))
 }
 
 /// extract files out of the package manifest
 /// pkgfile: pkg-0.0.1.ipkg
 /// filename: file in manifest
-pub fn package_get_manifest_file(pkgfile: &str, filename: &str) -> Result<Vec<u8>> {
+pub fn package_get_manifest_file<P: AsRef<Path>, T: AsRef<Path>>(
+    pkgfile: P,
+    filename: T,
+) -> Result<Vec<u8>> {
     let mut file = std::fs::File::open(pkgfile)?;
     package_get_manifest_file_with_readio(&mut file, filename)
 }
@@ -317,16 +357,16 @@ pub fn package_get_manifest_file(pkgfile: &str, filename: &str) -> Result<Vec<u8
 /// extract files out of the package manifest
 /// pkgfile: pkg-0.0.1.ipkg
 /// filename: file in manifest
-pub fn package_get_manifest_file_with_readio<R: std::io::Read>(
+pub fn package_get_manifest_file_with_readio<R: std::io::Read, P: AsRef<Path>>(
     readio: &mut R,
-    filename: &str,
+    filename: P,
 ) -> Result<Vec<u8>> {
     let manifest_buf = package_get_topfile_with_readio(readio, HUB_MANIFEST_BLOB)?;
     let manifest_io = std::io::Cursor::new(&manifest_buf);
     let gzio = GzDecoder::new(manifest_io);
     let mut ar = tar::Archive::new(gzio);
     let entries = ar.entries()?;
-    let manifile = Path::new(filename);
+    let manifile = filename.as_ref();
     for file in entries {
         if file.is_err() {
             continue;
@@ -337,19 +377,22 @@ pub fn package_get_manifest_file_with_readio<R: std::io::Read>(
                 continue;
             }
             let mut buf: Vec<u8> = Vec::new();
-            f.read_to_end(&mut buf)
-                .map_err(|_| HubError::PackageMissingFile(filename.into()))?;
+            f.read_to_end(&mut buf).map_err(|_| {
+                HubError::PackageMissingFile(manifile.to_string_lossy().to_string())
+            })?;
             return Ok(buf);
         }
     }
-    Err(HubError::PackageMissingFile(filename.into()))
+    Err(HubError::PackageMissingFile(
+        manifile.to_string_lossy().to_string(),
+    ))
 }
 
 /// Extracts WASM files from the package manifest ensuring these are valid
 /// WASM files by parsing until encountering a discrepancy.
-pub fn package_get_wasmfile_with_readio<R: std::io::Read>(
+pub fn package_get_wasmfile_with_readio<R: std::io::Read, P: AsRef<Path>>(
     readio: &mut R,
-    filename: &str,
+    filename: P,
 ) -> Result<Vec<u8>> {
     let wasm_bytes = package_get_manifest_file_with_readio(readio, filename)?;
 
@@ -423,19 +466,20 @@ fn package_verify_sig_from_readio<R: std::io::Read>(
         let fnamestr = fp.to_string_lossy().to_string();
         let file_name = fp
             .file_name()
-            .ok_or_else(|| HubError::PackageVerify(format!("{} bad filename", pkgfile)))?;
+            .ok_or_else(|| HubError::PackageVerify(format!("{pkgfile} bad filename")))?;
         if vers.contains_key(&fnamestr) && fh.unpack_in(tempdir.path())? {
             let tmpfile = tempdir.path().join(file_name);
-            let buf = std::fs::read(&tmpfile)?;
+            let buf = std::fs::read(tmpfile)?;
 
-            let mut iv = vers
+            let iv = vers
                 .get_mut(&fnamestr)
-                .ok_or_else(|| HubError::PackageVerify(format!("{} verify error", pkgfile)))?;
+                .ok_or_else(|| HubError::PackageVerify(format!("{pkgfile} verify error")))?;
             iv.seen = true;
             let sigbytes = hex::decode(&iv.fsig.sig)
-                .map_err(|_| HubError::PackageVerify(format!("{} key decode error", pkgfile)))?;
-            let signature = Signature::from_bytes(&sigbytes)
-                .map_err(|_| HubError::PackageVerify(format!("{} key decode error", pkgfile)))?;
+                .map_err(|_| HubError::PackageVerify(format!("{pkgfile} key decode error")))?
+                .try_into()
+                .map_err(|_| HubError::PackageVerify(format!("{pkgfile} key decode error")))?;
+            let signature = Signature::from_bytes(&sigbytes);
             iv.verify_ok = pubkey.verify(&buf, &signature).is_ok();
         }
     }
@@ -485,6 +529,25 @@ pub fn package_verify_with_readio<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
+fn augment_arch(package_meta: &mut PackageMeta, target: &str) {
+    if package_meta
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.iter().find(|t| t.tag.eq(ARCH_TAG_NAME)))
+        .is_none()
+    {
+        let arch_tag = PkgTag {
+            tag: String::from(ARCH_TAG_NAME),
+            value: target.to_owned(),
+        };
+        if let Some(ref mut tags) = package_meta.tags {
+            tags.push(arch_tag);
+        } else {
+            package_meta.tags = Some(vec![arch_tag]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::read;
@@ -512,11 +575,15 @@ mod tests {
     #[test]
     fn hubutil_package_get_meta() {
         let testfile: &str = "tests/apackage/package-meta.yaml";
-        let pkgfile =
-            package_assemble(testfile, Some("tests/apackage")).expect("package assemble fail");
+        let pkgfile = package_assemble(
+            testfile,
+            "tests/apackage",
+            Some("aarch64-unknown-linux-gnu"),
+        )
+        .expect("package assemble fail");
 
         let pm_from_inner =
-            package_get_meta(&pkgfile).expect("couldn't get meta file from package file");
+            package_get_meta(pkgfile).expect("couldn't get meta file from package file");
 
         // we expect pm_from_file manifest paths to be source paths
         // but inside the package they're stripped. So remap to strip
@@ -542,7 +609,7 @@ mod tests {
     #[test]
     fn hubutil_package_assemble() {
         let testfile: &str = "tests/apackage/package-meta.yaml";
-        let res = package_assemble(testfile, Some("tests"));
+        let res = package_assemble(testfile, "tests", None);
         assert!(res.is_ok());
         let outpath = std::path::Path::new("tests/example-0.0.1.tar");
         assert!(outpath.exists());
@@ -618,5 +685,86 @@ mod tests {
         let result = validate_wasm_file(wasm_bytes.as_slice());
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_augment_arch_if_not_present() {
+        //given
+        let mut package_meta = PackageMeta::default();
+
+        //when
+        augment_arch(&mut package_meta, "some_arch");
+
+        //then
+        let tag = package_meta
+            .tags
+            .as_ref()
+            .and_then(|tags| tags.iter().find(|t| t.tag.eq(ARCH_TAG_NAME)));
+
+        assert_eq!(
+            tag,
+            Some(&PkgTag {
+                tag: ARCH_TAG_NAME.to_owned(),
+                value: "some_arch".to_owned()
+            })
+        )
+    }
+
+    #[test]
+    fn test_augment_arch_if_not_present_and_tags_not_empty() {
+        //given
+        let mut package_meta = PackageMeta {
+            tags: Some(vec![PkgTag {
+                tag: "other_tag".to_owned(),
+                value: "value".to_owned(),
+            }]),
+            ..PackageMeta::default()
+        };
+
+        //when
+        augment_arch(&mut package_meta, "some_arch");
+
+        //then
+        let tag = package_meta
+            .tags
+            .as_ref()
+            .and_then(|tags| tags.iter().find(|t| t.tag.eq(ARCH_TAG_NAME)));
+
+        assert_eq!(
+            tag,
+            Some(&PkgTag {
+                tag: ARCH_TAG_NAME.to_owned(),
+                value: "some_arch".to_owned()
+            })
+        )
+    }
+
+    #[test]
+    fn test_augment_arch_if_present() {
+        //given
+        let mut package_meta = PackageMeta {
+            tags: Some(vec![PkgTag {
+                tag: ARCH_TAG_NAME.to_owned(),
+                value: "present_arch".to_owned(),
+            }]),
+            ..PackageMeta::default()
+        };
+
+        //when
+        augment_arch(&mut package_meta, "some_arch");
+
+        //then
+        let tag = package_meta
+            .tags
+            .as_ref()
+            .and_then(|tags| tags.iter().find(|t| t.tag.eq(ARCH_TAG_NAME)));
+
+        assert_eq!(
+            tag,
+            Some(&PkgTag {
+                tag: ARCH_TAG_NAME.to_owned(),
+                value: "present_arch".to_owned()
+            })
+        )
     }
 }

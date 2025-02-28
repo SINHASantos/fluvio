@@ -3,11 +3,11 @@
 use std::{env::temp_dir, sync::Arc};
 use std::time::Duration;
 
-use fluvio_spu_schema::Isolation;
 use tracing::debug;
 use futures_lite::StreamExt;
 use futures_lite::future::zip;
 
+use fluvio_spu_schema::Isolation;
 use fluvio_future::timer::sleep;
 use fluvio_future::net::TcpListener;
 use fluvio_spu_schema::{
@@ -16,7 +16,7 @@ use fluvio_spu_schema::{
         FilePartitionResponse, FileTopicResponse,
     },
 };
-use fluvio_protocol::api::RequestMessage;
+use fluvio_protocol::api::{Request, RequestMessage};
 use fluvio_protocol::record::{Record, RecordSet};
 use fluvio_protocol::record::Offset;
 use fluvio_protocol::fixture::BatchProducer;
@@ -42,7 +42,7 @@ fn default_option() -> ReplicaConfig {
 }
 
 fn generate_record(record_index: usize, _producer: &BatchProducer) -> Record {
-    let msg = format!("record {}", record_index);
+    let msg = format!("record {record_index}");
     Record::new(msg)
 }
 
@@ -63,7 +63,7 @@ async fn setup_replica() -> Result<FileReplica, StorageError> {
     ensure_clean_dir(&option.base_dir);
 
     let mut replica =
-        FileReplica::create_or_load(TOPIC_NAME, 0, START_OFFSET, option, storage_config())
+        FileReplica::create_or_load_inner(TOPIC_NAME, 0, START_OFFSET, option, storage_config())
             .await
             .expect("test replica");
     replica
@@ -119,7 +119,7 @@ async fn handle_response(socket: &mut FluvioSocket, replica: &FileReplica) {
     let response = RequestMessage::<FileFetchRequest>::response_with_header(&header, response);
     socket
         .get_mut_sink()
-        .encode_file_slices(&response, 10)
+        .encode_file_slices(&response, FileFetchRequest::DEFAULT_API_VERSION)
         .await
         .expect("encoding");
     debug!("server: finish sending out");

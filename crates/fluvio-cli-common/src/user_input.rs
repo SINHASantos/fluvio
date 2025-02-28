@@ -9,6 +9,7 @@ use fluvio_protocol::bytes::Bytes;
 
 pub enum UserInputType {
     Text { key: Option<Bytes>, data: Bytes },
+    StdIn { key: Option<Bytes>, data: Bytes },
     File { key: Option<Bytes>, path: PathBuf },
     FileByLine { key: Option<Bytes>, path: PathBuf },
 }
@@ -85,6 +86,11 @@ impl TryFrom<UserInputType> for UserInputRecords {
                 size: data.len(),
                 data: vec![RecordData::from(data)],
             }),
+            UserInputType::StdIn { key, data } => Ok(UserInputRecords {
+                key,
+                size: data.len(),
+                data: vec![RecordData::from(data)],
+            }),
             UserInputType::File { key, path } => {
                 let data: Vec<u8> = std::fs::read(path)?;
                 let size = data.len();
@@ -102,7 +108,7 @@ impl TryFrom<UserInputType> for UserInputRecords {
 
                 let mut data: Vec<RecordData> = Vec::new();
 
-                for line in buf.flatten() {
+                for line in buf.map_while(Result::ok) {
                     let l = line.as_bytes();
 
                     size += l.len();
@@ -142,7 +148,7 @@ mod file_tests {
     #[test]
     fn file_lines() -> Result<(), ()> {
         let mut file = NamedTempFile::new().unwrap();
-        let data = vec!["123", "abc", "📼🍅🐊"];
+        let data = ["123", "abc", "📼🍅🐊"];
 
         writeln!(file, "{}", data[0]).unwrap();
         writeln!(file, "{}", data[1]).unwrap();
@@ -167,7 +173,7 @@ mod file_tests {
     fn file_whole() -> Result<(), ()> {
         let mut file = NamedTempFile::new().unwrap();
 
-        let data = vec!["123", "abc", "📼🍅🐊"];
+        let data = ["123", "abc", "📼🍅🐊"];
 
         writeln!(file, "{}", data[0]).unwrap();
         writeln!(file, "{}", data[1]).unwrap();
@@ -182,7 +188,7 @@ mod file_tests {
         assert_eq!(d.data().len(), 1);
         assert_eq!(
             d.len(),
-            data.iter().map(|d| format!("{}\n", d).len()).sum::<usize>()
+            data.iter().map(|d| format!("{d}\n").len()).sum::<usize>()
         );
         assert_eq!(
             std::str::from_utf8(d.data()[0].as_ref()).unwrap(),

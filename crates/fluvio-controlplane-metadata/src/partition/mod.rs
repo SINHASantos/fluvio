@@ -1,19 +1,12 @@
 mod spec;
 mod status;
-mod policy;
-mod replica;
-pub mod store;
 
 pub use self::spec::*;
 pub use self::status::*;
 pub use fluvio_protocol::record::ReplicaKey;
-pub use self::policy::*;
-pub use self::replica::*;
 
 #[cfg(feature = "k8")]
 mod k8;
-#[cfg(feature = "k8")]
-pub use k8::*;
 
 mod metadata {
 
@@ -51,7 +44,6 @@ mod metadata {
 
         impl K8ExtendedSpec for PartitionSpec {
             type K8Spec = Self;
-            type K8Status = Self::Status;
 
             const FINALIZER: Option<&'static str> =
                 Some("partitions.finalizer.fluvio.infinyon.com");
@@ -62,6 +54,14 @@ mod metadata {
             ) -> Result<MetadataStoreObject<Self, K8MetaItem>, K8ConvertError<Self::K8Spec>>
             {
                 default_convert_from_k8(k8_obj, multi_namespace_context)
+            }
+
+            fn convert_status_from_k8(status: Self::Status) -> Self::Status {
+                status
+            }
+
+            fn into_k8(self) -> Self::K8Spec {
+                self
             }
         }
     }

@@ -1,26 +1,29 @@
-use std::{time::Duration};
-use std::io::Error as IoError;
+use std::time::Duration;
 
 use tracing::{info, trace, error, debug, warn, instrument};
-use flv_util::print_cli_err;
-
 use tokio::select;
 use futures_util::stream::StreamExt;
+use anyhow::{anyhow, Result};
 
+use fluvio_controlplane::sc_api::register_spu::RegisterSpuRequest;
+use fluvio_controlplane::sc_api::update_lrs::UpdateLrsRequest;
+use fluvio_controlplane::spu_api::api::{InternalSpuRequest, InternalSpuApi};
+use fluvio_controlplane::spu_api::update_replica::UpdateReplicaRequest;
+use fluvio_controlplane::spu_api::update_smartmodule::UpdateSmartModuleRequest;
+use fluvio_controlplane::spu_api::update_spu::UpdateSpuRequest;
+use flv_util::print_cli_err;
 use fluvio_future::task::spawn;
 use fluvio_future::timer::sleep;
-use fluvio_controlplane::{InternalSpuApi, UpdateSmartModuleRequest, UpdateDerivedStreamRequest};
-use fluvio_controlplane::InternalSpuRequest;
-use fluvio_controlplane::RegisterSpuRequest;
-use fluvio_controlplane::{UpdateSpuRequest, UpdateLrsRequest};
-use fluvio_controlplane::UpdateReplicaRequest;
 use fluvio_protocol::api::RequestMessage;
-use fluvio_socket::{FluvioSocket, SocketError, FluvioSink};
+use fluvio_socket::{FluvioSocket, FluvioSink};
 use fluvio_storage::FileReplica;
-use crate::core::SharedGlobalContext;
-use crate::InternalServerError;
+use fluvio_controlplane::sc_api::update_mirror::UpdateMirrorStatRequest;
+use fluvio_controlplane::spu_api::update_mirror::UpdateMirrorRequest;
 
-use super::message_sink::{SharedStatusUpdate};
+use crate::core::SharedGlobalContext;
+
+use super::message_sink::SharedLrsStatusUpdate;
+use super::SharedMirrorStatusUpdate;
 
 // keep track of various internal state of dispatcher
 #[derive(Default)]
@@ -29,14 +32,15 @@ struct DispatcherCounter {
     pub spu_changes: u64,     // spu changes received from sc
     pub reconnect: u64,       // number of reconnect to sc
     pub smartmodule: u64,     // number of sm updates from sc
-    pub derivedstream: u64,   // number of derivedstream updates from sc
+    pub mirror: u64,          // number of mirror updates from sc
 }
 
 /// Controller for handling connection to SC
 /// including registering and reconnect
 pub struct ScDispatcher<S> {
     ctx: SharedGlobalContext<S>,
-    status_update: SharedStatusUpdate,
+    status_update: SharedLrsStatusUpdate,
+    mirror_status_update: SharedMirrorStatusUpdate,
     counter: DispatcherCounter,
 }
 
@@ -44,6 +48,7 @@ impl ScDispatcher<FileReplica> {
     pub fn new(ctx: SharedGlobalContext<FileReplica>) -> Self {
         Self {
             status_update: ctx.status_update_owned(),
+            mirror_status_update: ctx.mirror_status_update_owned(),
             ctx,
             counter: DispatcherCounter::default(),
         }
@@ -60,12 +65,12 @@ impl ScDispatcher<FileReplica> {
         const WAIT_RECONNECT_INTERVAL: u64 = 3000;
 
         loop {
-            debug!("entering SC dispatch loop: {}", counter);
+            debug!(%counter, "entering SC dispatch loop", );
 
             let mut socket = self.create_socket_to_sc().await;
             info!(
-                "established connection to sc for spu: {}",
-                self.ctx.local_spu_id()
+                local_spu_id=%self.ctx.local_spu_id(),
+                "established connection to sc for spu",
             );
 
             // register and exit on error
@@ -73,8 +78,7 @@ impl ScDispatcher<FileReplica> {
                 Ok(status) => status,
                 Err(err) => {
                     print_cli_err!(format!(
-                        "spu registration failed with sc due to error: {}",
-                        err
+                        "spu registration failed with sc due to error: {err}"
                     ));
                     false
                 }
@@ -88,18 +92,15 @@ impl ScDispatcher<FileReplica> {
                 match self.request_loop(socket).await {
                     Ok(_) => {
                         debug!(
-                            "sc connection terminated: {}, waiting before reconnecting",
-                            counter
+                            %counter,
+                            "sc connection terminated, waiting before reconnecting",
                         );
                         // give little bit time before trying to reconnect
                         sleep(Duration::from_millis(10)).await;
                         counter += 1;
                     }
                     Err(err) => {
-                        warn!(
-                            "error connecting to sc: {:#?}, waiting before reconnecting",
-                            err
-                        );
+                        warn!(?err, "error connecting to sc, waiting before reconnecting",);
                         // We are  connection to sc.  Retry again
                         // Currently we use 3 seconds to retry but this should be using backoff algorithm
                         sleep(Duration::from_millis(WAIT_RECONNECT_INTERVAL)).await;
@@ -116,7 +117,7 @@ impl ScDispatcher<FileReplica> {
             socket = socket.id()
         )
     )]
-    async fn request_loop(&mut self, socket: FluvioSocket) -> Result<(), SocketError> {
+    async fn request_loop(&mut self, socket: FluvioSocket) -> Result<()> {
         use async_io::Timer;
 
         /// Interval between each send to SC
@@ -134,7 +135,8 @@ impl ScDispatcher<FileReplica> {
             select! {
 
                 _ = status_timer.next() =>  {
-                    self.send_status_back_to_sc(&mut sink).await?;
+                    self.send_lrs_status_back_to_sc(&mut sink).await?;
+                    self.send_mirror_status_back_to_sc(&mut sink).await?;
                 },
 
                 sc_request = api_stream.next() => {
@@ -147,31 +149,29 @@ impl ScDispatcher<FileReplica> {
                         Some(Ok(InternalSpuRequest::UpdateSpuRequest(request))) => {
                             self.counter.spu_changes += 1;
                             if let Err(err) = self.handle_update_spu_request(request).await {
-                                error!("error handling update spu request: {}", err);
+                                error!(%err, "error handling update spu request");
                                 break;
                             }
                         },
                         Some(Ok(InternalSpuRequest::UpdateSmartModuleRequest(request))) => {
                             self.counter.smartmodule += 1;
                             if let Err(err) = self.handle_update_smartmodule_request(request).await {
-                                error!("error handling update SmartModule request: {}", err);
+                                error!(%err, "error handling update SmartModule request", );
                                 break;
                             }
                         },
-
-                        Some(Ok(InternalSpuRequest::UpdateDerivedStreamRequest(request))) => {
-                            self.counter.derivedstream += 1;
-                            if let Err(err) = self.handle_update_derivedstream_request(request).await {
-                                error!("error handling update DerivedStream request: {}", err);
+                        Some(Ok(InternalSpuRequest::UpdateMirrorRequest(request))) => {
+                            self.counter.mirror += 1;
+                            if let Err(err) = self.handle_update_mirror_request(request).await {
+                                error!(%err, "error handling update mirror request", );
                                 break;
                             }
                         },
-
-                        Some(_) => {
-                            debug!("no more sc msg content, end");
+                        Some(Err(err)) => {
+                            error!(%err, "Api error");
                             break;
                         },
-                        _ => {
+                        None => {
                             debug!("sc connection terminated");
                             break;
                         }
@@ -188,10 +188,7 @@ impl ScDispatcher<FileReplica> {
 
     /// send status back to sc, if there is error return false
     #[instrument(skip(self))]
-    async fn send_status_back_to_sc(
-        &mut self,
-        sc_sink: &mut FluvioSink,
-    ) -> Result<(), SocketError> {
+    async fn send_lrs_status_back_to_sc(&mut self, sc_sink: &mut FluvioSink) -> Result<()> {
         let requests = self.status_update.remove_all().await;
 
         if requests.is_empty() {
@@ -201,10 +198,27 @@ impl ScDispatcher<FileReplica> {
         }
         let message = RequestMessage::new_request(UpdateLrsRequest::new(requests));
 
-        sc_sink.send_request(&message).await.map_err(|err| {
-            error!("error sending status back: {:#?}", err);
-            err
-        })
+        sc_sink
+            .send_request(&message)
+            .await
+            .map_err(|err| anyhow!("error sending status back to sc: {}", err))
+    }
+
+    /// send mirror status back to sc, if there is error return false
+    #[instrument(skip(self))]
+    async fn send_mirror_status_back_to_sc(&mut self, sc_sink: &mut FluvioSink) -> Result<()> {
+        let requests = self.mirror_status_update.remove_all().await;
+
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        trace!(requests = ?requests, "sending mirror status back to sc");
+        let message = RequestMessage::new_request(UpdateMirrorStatRequest::new(requests));
+        sc_sink
+            .send_request(&message)
+            .await
+            .map_err(|err| anyhow!("error sending status back to sc: {}", err))
     }
 
     /// register local spu to sc
@@ -212,35 +226,32 @@ impl ScDispatcher<FileReplica> {
         skip(self),
         fields(socket = socket.id())
     )]
-    async fn send_spu_registration(
-        &self,
-        socket: &mut FluvioSocket,
-    ) -> Result<bool, InternalServerError> {
+    async fn send_spu_registration(&self, socket: &mut FluvioSocket) -> Result<bool> {
         let local_spu_id = self.ctx.local_spu_id();
 
-        debug!("sending spu '{}' registration request", local_spu_id);
+        debug!(%local_spu_id, "sending spu registration request",);
 
         let register_req = RegisterSpuRequest::new(local_spu_id);
         let mut message = RequestMessage::new_request(register_req);
         message
             .get_mut_header()
-            .set_client_id(format!("spu: {}", local_spu_id));
+            .set_client_id(format!("spu: {local_spu_id}"));
 
         let response = socket.send(&message).await?;
 
-        trace!("register response: {:#?}", response);
+        trace!(?response, "register response",);
 
         let register_resp = &response.response;
         if register_resp.is_error() {
             warn!(
-                "spu '{}' registration failed: {}",
-                local_spu_id,
-                register_resp.error_message()
+                err = register_resp.error_message(),
+                %local_spu_id,
+                "spu registration failed",
             );
 
             Ok(false)
         } else {
-            info!("spu '{}' registration successful", local_spu_id);
+            info!(local_spu_id, "spu registration successful");
 
             Ok(true)
         }
@@ -295,11 +306,11 @@ impl ScDispatcher<FileReplica> {
                 ReplicaChange::Remove(remove) => {
                     let message = RequestMessage::new_request(remove);
                     if let Err(err) = sc_sink.send_request(&message).await {
-                        error!("error sending back to sc {}", err);
+                        error!("error sending back to sc {err:#?}");
                     }
                 }
                 ReplicaChange::StorageError(err) => {
-                    error!("error storage {}", err);
+                    error!("error storage {err:#?}");
                 }
             }
         }
@@ -312,7 +323,7 @@ impl ScDispatcher<FileReplica> {
     async fn handle_update_spu_request(
         &mut self,
         req_msg: RequestMessage<UpdateSpuRequest>,
-    ) -> Result<(), IoError> {
+    ) -> Result<()> {
         let (_, request) = req_msg.get_header_request();
 
         debug!( message = ?request,"starting spu update");
@@ -349,7 +360,7 @@ impl ScDispatcher<FileReplica> {
     async fn handle_update_smartmodule_request(
         &mut self,
         req_msg: RequestMessage<UpdateSmartModuleRequest>,
-    ) -> Result<(), IoError> {
+    ) -> Result<()> {
         let (_, request) = req_msg.get_header_request();
 
         debug!( message = ?request,"starting SmartModule update");
@@ -380,41 +391,39 @@ impl ScDispatcher<FileReplica> {
     }
 
     ///
-    /// Handle DerivedStream update sent by SC
+    /// Handle Mirror Cluster update sent by SC
     ///
-    #[instrument(skip(self, req_msg), name = "update_derivedstream_request")]
-    async fn handle_update_derivedstream_request(
+    #[instrument(skip(self, req_msg), name = "update_mirror_request")]
+    async fn handle_update_mirror_request(
         &mut self,
-        req_msg: RequestMessage<UpdateDerivedStreamRequest>,
-    ) -> Result<(), IoError> {
+        req_msg: RequestMessage<UpdateMirrorRequest>,
+    ) -> anyhow::Result<()> {
         let (_, request) = req_msg.get_header_request();
 
-        debug!( message = ?request,"starting DerivedStream update");
+        debug!( message = ?request,"starting remote cluster update");
 
         let actions = if !request.all.is_empty() {
             debug!(
                 epoch = request.epoch,
                 item_count = request.all.len(),
-                "received derivedstream all"
+                "received remote cluster sync all"
             );
-            trace!("received derivedstream all items: {:#?}", request.all);
-            self.ctx.derivedstream_store().sync_all(request.all)
+            trace!("received spu all items: {:#?}", request.all);
+            self.ctx.mirrors_localstore().sync_all(request.all)
         } else {
             debug!(
                 epoch = request.epoch,
                 item_count = request.changes.len(),
-                "received derivedstream changes"
+                "received remote cluster changes"
             );
             trace!(
-                "received derivedstream change items: {:#?}",
+                "received remote cluster change items: {:#?}",
                 request.changes
             );
-            self.ctx
-                .derivedstream_store()
-                .apply_changes(request.changes)
+            self.ctx.mirrors_localstore().apply_changes(request.changes)
         };
 
-        debug!(actions = actions.count(), "finished DerivedStream update");
+        debug!(actions = actions.count(), "finished remote cluster update");
 
         Ok(())
     }

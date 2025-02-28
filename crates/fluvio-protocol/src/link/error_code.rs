@@ -14,6 +14,7 @@ use crate::{Encoder, Decoder, api::RequestKind};
 #[repr(i16)]
 #[derive(thiserror::Error, Encoder, Decoder, Eq, PartialEq, Debug, Clone)]
 #[non_exhaustive]
+#[derive(Default)]
 pub enum ErrorCode {
     #[fluvio(tag = -1)]
     #[error("An unknown server error occurred")]
@@ -22,6 +23,7 @@ pub enum ErrorCode {
     // Not an error
     #[fluvio(tag = 0)]
     #[error("ErrorCode indicated success. If you see this it is likely a bug.")]
+    #[default]
     None,
 
     #[fluvio(tag = 2)]
@@ -52,6 +54,9 @@ pub enum ErrorCode {
     #[fluvio(tag = 61)]
     #[error("invalid Delete request")]
     InvalidDeleteRequest,
+    #[fluvio(tag = 71)]
+    #[error("Offset {offset} is evicted. The next available is {next_available}")]
+    OffsetEvicted { offset: i64, next_available: i64 },
 
     // Spu errors
     #[fluvio(tag = 1000)]
@@ -92,6 +97,12 @@ pub enum ErrorCode {
     #[fluvio(tag = 2006)]
     #[error("the topic name is invalid")]
     TopicInvalidName,
+    #[fluvio(tag = 2007)]
+    #[error("the topic was deleted")]
+    TopicDeleted,
+    #[fluvio(tag = 2008)]
+    #[error("the topic has invalid replica type")]
+    TopicInvalidReplicaType,
 
     // Partition errors
     #[fluvio(tag = 3000)]
@@ -105,13 +116,15 @@ pub enum ErrorCode {
     #[fluvio(tag = 3002)]
     #[error("the fetch session was not found")]
     FetchSessionNotFoud,
-
-    // Legacy SmartModule errors
-    #[cfg(feature = "smartmodule")]
-    #[deprecated(since = "0.9.13")]
-    #[fluvio(tag = 4000)]
-    #[error("a legacy SmartModule error occurred")]
-    LegacySmartModuleError(#[from] crate::smartmodule::LegacySmartModuleError),
+    #[fluvio(tag = 3003)]
+    #[error("offset flush error: {0}")]
+    OffsetFlushRequestError(String),
+    #[fluvio(tag = 3004)]
+    #[error("the offset management is disabled for the stream")]
+    OffsetManagementDisabled,
+    #[fluvio(tag = 3005)]
+    #[error("max retry attempts reached")]
+    MaxRetryReached,
 
     // Managed Connector Errors
     #[fluvio(tag = 5000)]
@@ -148,6 +161,14 @@ pub enum ErrorCode {
     #[fluvio(tag = 6006)]
     #[error("SmartModule init error {0}")]
     SmartModuleInitError(super::smartmodule::SmartModuleInitRuntimeError),
+    #[fluvio(tag = 6007)]
+    #[error("SmartModule look_back error: {0}")]
+    SmartModuleLookBackError(String),
+    #[fluvio(tag = 6008)]
+    #[error(
+        "SmartModule memory limit exceeded: requested {requested} bytes, max allowed {max} bytes"
+    )]
+    SmartModuleMemoryLimitExceeded { requested: u64, max: u64 },
 
     // TableFormat Errors
     #[fluvio(tag = 7000)]
@@ -173,21 +194,46 @@ pub enum ErrorCode {
     #[fluvio(tag = 8003)]
     #[error("the derivedstream {0} is invalid")]
     DerivedStreamInvalid(String),
-    #[error("can't do recursive derivedstream yet: {0}->{1}")]
-    DerivedStreamRecursion(String, String),
-    #[error("the derivedstream already exists")]
-    DerivedStreamAlreadyExists,
-
     // Compression errors
     #[fluvio(tag = 9000)]
     #[error("a compression error occurred in the SPU")]
     CompressionError,
-}
 
-impl Default for ErrorCode {
-    fn default() -> ErrorCode {
-        ErrorCode::None
-    }
+    // Deduplication
+    #[fluvio(tag = 10000)]
+    #[error("Deduplication SmartModule is not loaded into the cluster")]
+    DeduplicationSmartModuleNotLoaded,
+    #[fluvio(tag = 10001)]
+    #[error("Deduplication SmartModule name is invalid: {0}")]
+    DeduplicationSmartModuleNameInvalid(String),
+
+    // Remote
+    #[fluvio(tag = 11001)]
+    #[error("the mirror was not found")]
+    MirrorNotFound,
+    #[fluvio(tag = 11002)]
+    #[error("the mirror already exists")]
+    MirrorAlreadyExists,
+    #[fluvio(tag = 11003)]
+    #[error("produce from home is not allowed")]
+    MirrorProduceFromHome,
+    #[fluvio(tag = 11004)]
+    #[error("delete from remote is not allowed")]
+    MirrorDeleteFromRemote,
+    #[fluvio(tag = 11005)]
+    #[error("the mirror is invalid")]
+    MirrorInvalidType,
+    #[fluvio(tag = 11006)]
+    #[error("produce from remote target is not allowed")]
+    MirrorProduceFromRemoteNotAllowed,
+
+    // Specs
+    #[fluvio(tag = 12001)]
+    #[error("system {kind} '{name}' can only be deleted forcibly")]
+    SystemSpecDeletionAttempt { kind: String, name: String },
+    #[fluvio(tag = 12002)]
+    #[error("system {kind} '{name}' can only be updated forcibly")]
+    SystemSpecUpdatingAttempt { kind: String, name: String },
 }
 
 impl ErrorCode {
@@ -198,7 +244,7 @@ impl ErrorCode {
     pub fn to_sentence(&self) -> String {
         match self {
             ErrorCode::None => "".to_owned(),
-            _ => upper_cammel_case_to_sentence(format!("{:?}", self), true),
+            _ => upper_cammel_case_to_sentence(format!("{self:?}"), true),
         }
     }
 

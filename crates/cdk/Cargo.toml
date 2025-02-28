@@ -13,13 +13,28 @@ name = "cdk"
 path = "src/main.rs"
 doc = false
 
-[dependencies]
-tracing = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context", "env", "wrap_help", "suggestions"], default-features = false }
-cargo-builder = { path = "../cargo-builder"}
+[package.metadata.cargo-udeps.ignore]
+normal = ["fluvio"]
 
-fluvio-future = { version = "0.4.0", features = ["subscriber"]}
+[dependencies]
+anyhow = { workspace = true }
+cargo-builder = { path = "../cargo-builder"}
+cargo-generate = { workspace = true }
+clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context", "env", "wrap_help", "suggestions"], default-features = false }
+comfy-table = { workspace = true  }
+current_platform = { workspace = true }
+enum-display = { workspace = true }
+include_dir = { workspace = true }
+serde = { workspace = true,  features = ["derive"] }
+sysinfo = { workspace = true, default-features = false }
+tempfile = { workspace = true }
+toml = { workspace = true, features = ["parse", "display", "preserve_order"] }
+tracing = { workspace = true }
+
+fluvio = { workspace = true }
+fluvio-cli-common = { workspace = true, features = ["serde", "version-cmd"] }
 fluvio-connector-deployer = { path = "../fluvio-connector-deployer"}
-fluvio-connector-package = { path = "../fluvio-connector-package", features = ["toml"]}
+fluvio-connector-package = { workspace = true,  features = ["toml"]}
+fluvio-extension-common = { workspace = true }
+fluvio-future = { workspace = true, features = ["subscriber"]}
+fluvio-hub-util = { workspace = true, features = ["connector-cmds"] }

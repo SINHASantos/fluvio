@@ -1,7 +1,8 @@
 mod create;
 mod delete;
 mod fetch;
+pub mod update;
 
-pub use create::*;
-pub use delete::*;
-pub use fetch::*;
+pub(crate) use create::*;
+pub(crate) use delete::*;
+pub(crate) use fetch::*;

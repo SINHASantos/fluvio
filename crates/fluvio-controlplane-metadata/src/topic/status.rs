@@ -11,6 +11,10 @@ use std::fmt;
 use fluvio_protocol::{Encoder, Decoder};
 use fluvio_types::{ReplicaMap, SpuId, PartitionId};
 
+use crate::partition::PartitionMirrorConfig;
+
+pub type MirrorMap = BTreeMap<PartitionId, PartitionMirrorConfig>;
+
 // -----------------------------------
 // Data Structures
 // -----------------------------------
@@ -24,6 +28,9 @@ use fluvio_types::{ReplicaMap, SpuId, PartitionId};
 pub struct TopicStatus {
     pub resolution: TopicResolution,
     pub replica_map: ReplicaMap,
+    #[cfg_attr(feature = "use_serde", serde(default))]
+    #[fluvio(min_version = 14)]
+    pub mirror_map: MirrorMap,
     pub reason: String,
 }
 
@@ -33,15 +40,22 @@ impl fmt::Display for TopicStatus {
     }
 }
 
-#[derive(Decoder, Encoder, Debug, Clone, Eq, PartialEq)]
+#[derive(Decoder, Default, Encoder, Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TopicResolution {
-    Init,                  // Initializing this is starting state.
-    Pending,               // Has valid config, ready for replica mapping assignment
+    #[default]
+    #[fluvio(tag = 0)]
+    Init, // Initializing this is starting state.
+    #[fluvio(tag = 1)]
+    Pending, // Has valid config, ready for replica mapping assignment
+    #[fluvio(tag = 2)]
     InsufficientResources, // Replica map cannot be created due to lack of capacity
-    InvalidConfig,         // Invalid configuration
-    Provisioned,           // All partitions has been provisioned
-    Deleting,              // Process of being deleted
+    #[fluvio(tag = 3)]
+    InvalidConfig, // Invalid configuration
+    #[fluvio(tag = 4)]
+    Provisioned, // All partitions has been provisioned
+    #[fluvio(tag = 5)]
+    Deleting, // Process of being deleted
 }
 
 impl TopicResolution {
@@ -107,13 +121,8 @@ impl ::std::default::Default for TopicStatus {
             resolution: TopicResolution::Init,
             replica_map: BTreeMap::new(),
             reason: "".to_owned(),
+            mirror_map: BTreeMap::new(),
         }
-    }
-}
-
-impl ::std::default::Default for TopicResolution {
-    fn default() -> Self {
-        TopicResolution::Init
     }
 }
 
@@ -130,14 +139,16 @@ fn create_replica_map(rows: Vec<Vec<SpuId>>) -> ReplicaMap {
 }
 
 impl TopicStatus {
-    pub fn new<S>(resolution: TopicResolution, replica_map: Vec<Vec<SpuId>>, reason: S) -> Self
-    where
-        S: Into<String>,
-    {
+    pub fn new(
+        resolution: TopicResolution,
+        replica_map: Vec<Vec<SpuId>>,
+        reason: impl Into<String>,
+    ) -> Self {
         TopicStatus {
             resolution,
             replica_map: create_replica_map(replica_map),
             reason: reason.into(),
+            mirror_map: BTreeMap::new(),
         }
     }
 
@@ -151,6 +162,10 @@ impl TopicStatus {
 
     pub fn set_replica_map(&mut self, replica_map: ReplicaMap) {
         self.replica_map = replica_map;
+    }
+
+    pub fn set_mirror_map(&mut self, mirror_map: MirrorMap) {
+        self.mirror_map = mirror_map;
     }
 
     pub fn spus_in_replica(&self) -> Vec<SpuId> {
@@ -174,7 +189,7 @@ impl TopicStatus {
     pub fn replica_map_cnt_str(&self) -> String {
         let map_rows = self.replica_map_cnt();
         if map_rows > 0 {
-            format!("{}", map_rows)
+            format!("{map_rows}")
         } else {
             "-".to_owned()
         }
@@ -210,27 +225,13 @@ impl TopicStatus {
         self.resolution == TopicResolution::Provisioned
     }
 
-    pub fn next_resolution_provisioned() -> (TopicResolution, String) {
-        (TopicResolution::Provisioned, "".to_owned())
-    }
-
     /// set to pending mode which means it is waiting for spu resources to be allocated
     pub fn next_resolution_pending() -> (TopicResolution, String) {
         (TopicResolution::Pending, super::PENDING_REASON.to_owned())
     }
 
-    pub fn next_resolution_invalid_config<S>(reason: S) -> (TopicResolution, String)
-    where
-        S: Into<String>,
-    {
+    pub fn next_resolution_invalid_config(reason: impl Into<String>) -> (TopicResolution, String) {
         (TopicResolution::InvalidConfig, reason.into())
-    }
-
-    pub fn set_resolution_no_resource<S>(reason: S) -> (TopicResolution, String)
-    where
-        S: Into<String>,
-    {
-        (TopicResolution::InsufficientResources, reason.into())
     }
 
     pub fn set_next_resolution(&mut self, next: (TopicResolution, String)) {

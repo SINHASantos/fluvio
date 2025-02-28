@@ -1,19 +1,36 @@
+#[cfg(feature = "smartengine")]
 use tracing::{debug, error};
 use fluvio_protocol::link::ErrorCode;
-use fluvio_smartengine::{
-    SmartEngine, SmartModuleChainBuilder, SmartModuleChainInstance, SmartModuleConfig,
-    SmartModuleInitialData,
-};
-use fluvio_spu_schema::server::smartmodule::{
-    SmartModuleContextData, SmartModuleInvocation, SmartModuleKind,
-};
+use fluvio_spu_schema::server::smartmodule::SmartModuleInvocation;
 
+#[cfg(feature = "smartengine")]
+use fluvio_smartengine::{EngineError, SmartModuleConfig, SmartModuleInitialData};
+
+#[cfg(feature = "smartengine")]
+use fluvio_spu_schema::server::smartmodule::{SmartModuleContextData, SmartModuleKind};
+
+use crate::smartengine::SmartModuleChainBuilder;
+use crate::smartengine::SmartEngine;
+use crate::smartengine::SmartModuleChainInstance;
+
+#[cfg(not(feature = "smartengine"))]
 pub(crate) fn build_chain(
+    mut _chain_builder: SmartModuleChainBuilder,
+    _invocations: Vec<SmartModuleInvocation>,
+    _version: i16,
+    _engine: SmartEngine,
+) -> Result<SmartModuleChainInstance, ErrorCode> {
+    let smci = SmartModuleChainInstance {};
+    Ok(smci)
+}
+
+#[cfg(feature = "smartengine")]
+pub(crate) fn build_chain(
+    mut chain_builder: SmartModuleChainBuilder,
     invocations: Vec<SmartModuleInvocation>,
     version: i16,
     engine: SmartEngine,
 ) -> Result<SmartModuleChainInstance, ErrorCode> {
-    let mut chain_builder = SmartModuleChainBuilder::default();
     for invocation in invocations {
         let raw = invocation
             .wasm
@@ -35,11 +52,14 @@ pub(crate) fn build_chain(
             _ => SmartModuleInitialData::default(),
         };
 
+        let lookback = invocation.params.lookback().map(Into::into);
+
         debug!("param: {:#?}", invocation.params);
         chain_builder.add_smart_module(
             SmartModuleConfig::builder()
                 .params(invocation.params)
                 .version(version)
+                .lookback(lookback)
                 .initial_data(initial_data)
                 .build()
                 .map_err(|err| ErrorCode::SmartModuleInvalid {
@@ -51,11 +71,18 @@ pub(crate) fn build_chain(
     }
 
     let chain = chain_builder.initialize(&engine).map_err(|err| {
-        error!(
-            error = err.to_string().as_str(),
-            "Error Initializing SmartModule"
-        );
-        ErrorCode::SmartModuleChainInitError(err.to_string())
+        error!("Error Initializing SmartModule chain: {err:#?}");
+        match err.downcast_ref() {
+            Some(EngineError::StoreMemoryExceeded {
+                current: _,
+                requested,
+                max,
+            }) => ErrorCode::SmartModuleMemoryLimitExceeded {
+                requested: *requested as u64,
+                max: *max as u64,
+            },
+            _ => ErrorCode::SmartModuleChainInitError(err.to_string()),
+        }
     })?;
     Ok(chain)
 }

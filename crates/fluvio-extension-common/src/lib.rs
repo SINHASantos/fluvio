@@ -5,6 +5,9 @@ mod common;
 #[cfg(feature = "target")]
 pub mod tls;
 
+#[cfg(feature = "installation")]
+pub mod installation;
+
 pub use common::*;
 pub use crate::output::Terminal;
 use fluvio_index::{PackageId, MaybeVersion};
@@ -70,11 +73,11 @@ impl Default for PrintTerminal {
 
 impl Terminal for PrintTerminal {
     fn print(&self, msg: &str) {
-        print!("{}", msg);
+        print!("{msg}");
     }
 
     fn println(&self, msg: &str) {
-        println!("{}", msg);
+        println!("{msg}");
     }
 }
 
@@ -84,7 +87,9 @@ pub mod target {
     use std::convert::TryInto;
     use clap::Parser;
 
-    use fluvio::FluvioConfig;
+    use anyhow::Result;
+
+    use fluvio::FluvioClusterConfig;
     use fluvio::FluvioError;
     use fluvio::Fluvio;
     use fluvio::config::ConfigFile;
@@ -103,7 +108,7 @@ pub mod target {
     }
 
     impl TargetError {
-        pub fn invalid_arg<M: Into<String>>(reason: M) -> Self {
+        pub fn invalid_arg(reason: impl Into<String>) -> Self {
             Self::InvalidArg(reason.into())
         }
     }
@@ -112,27 +117,25 @@ pub mod target {
     #[derive(Debug, Parser, Default, Clone)]
     pub struct ClusterTarget {
         /// Address of cluster
-        #[clap(short = 'c', long, value_name = "host:port")]
+        #[arg(short = 'c', long, value_name = "host:port")]
         pub cluster: Option<String>,
 
         #[clap(flatten)]
         pub tls: TlsClientOpt,
 
-        #[clap(short = 'P', long, value_name = "profile")]
+        #[arg(short = 'P', long, value_name = "profile")]
         pub profile: Option<String>,
     }
 
     impl ClusterTarget {
         /// helper method to connect to fluvio
-        pub async fn connect(self) -> Result<Fluvio, TargetError> {
+        pub async fn connect(self) -> Result<Fluvio> {
             let fluvio_config = self.load()?;
-            Fluvio::connect_with_config(&fluvio_config)
-                .await
-                .map_err(|err| err.into())
+            Fluvio::connect_with_config(&fluvio_config).await
         }
 
         /// try to create sc config
-        pub fn load(self) -> Result<FluvioConfig, TargetError> {
+        pub fn load(self) -> Result<FluvioClusterConfig> {
             let tls = self.tls.try_into()?;
 
             use fluvio::config::TlsPolicy::*;
@@ -140,28 +143,25 @@ pub mod target {
                 // Profile and Cluster together is illegal
                 (Some(_profile), Some(_cluster)) => Err(TargetError::invalid_arg(
                     "cluster addr is not valid when profile is used",
-                )),
+                )
+                .into()),
                 (Some(profile), _) => {
                     // Specifying TLS is illegal when also giving a profile
                     if let Anonymous | Verified(_) = tls {
                         return Err(TargetError::invalid_arg(
                             "tls is not valid when profile is is used",
-                        ));
+                        )
+                        .into());
                     }
 
-                    let config_file = ConfigFile::load(None)?;
-                    let cluster = config_file
-                        .config()
-                        // NOTE: This will not fallback to current cluster like it did before
-                        // Current cluster will be used when no profile is given.
-                        .cluster_with_profile(&profile)
-                        .ok_or_else(|| {
+                    let cluster =
+                        FluvioClusterConfig::load_with_profile(&profile)?.ok_or_else(|| {
                             IoError::new(ErrorKind::Other, "Cluster not found for profile")
                         })?;
                     Ok(cluster.clone())
                 }
                 (None, Some(cluster)) => {
-                    let cluster = FluvioConfig::new(cluster).with_tls(tls);
+                    let cluster = FluvioClusterConfig::new(cluster).with_tls(tls);
                     Ok(cluster)
                 }
                 (None, None) => {
@@ -169,7 +169,8 @@ pub mod target {
                     if let Anonymous | Verified(_) = tls {
                         return Err(TargetError::invalid_arg(
                             "tls is only valid if cluster addr is used",
-                        ));
+                        )
+                        .into());
                     }
 
                     // Try to use the default cluster from saved config

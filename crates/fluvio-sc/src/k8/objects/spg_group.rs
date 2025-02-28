@@ -13,13 +13,13 @@ use crate::stores::MetadataStoreObject;
 use crate::stores::spg::SpuGroupSpec;
 use crate::stores::spu::is_conflict;
 use crate::stores::k8::K8MetaItem;
-use crate::stores::spu::{SpuSpec};
-use crate::stores::{LocalStore};
+use crate::stores::spu::SpuSpec;
+use crate::stores::LocalStore;
 use crate::stores::actions::WSAction;
 use crate::cli::TlsConfig;
 
 use super::spu_k8_config::ScK8Config;
-use super::statefulset::{StatefulsetSpec};
+use super::statefulset::StatefulsetSpec;
 use super::spg_service::SpgServiceSpec;
 
 #[derive(Debug)]
@@ -71,7 +71,7 @@ impl SpuGroupObj {
         namespace: &str,
         spu_k8_config: &ScK8Config,
         tls: Option<&TlsConfig>,
-    ) -> (String, WSAction<StatefulsetSpec>) {
+    ) -> (String, WSAction<StatefulsetSpec, K8MetaItem>) {
         let statefulset_name = format!("fluvio-spg-{}", self.key());
         let k8_spec = k8_convert::generate_k8_stateful(
             &self.spec,
@@ -119,8 +119,11 @@ impl SpuGroupObj {
         };
 
         let ns = self.ctx().item().namespace();
-        let private_svc_fqdn = format!("fluvio-spg-{}.{}.svc.cluster.local", self.key(), ns);
-        let public_svc_fqdn = format!("fluvio-spu-{}.{}.svc.cluster.local", spu_name, ns);
+        let private_svc_fqdn = format!(
+            "fluvio-spg-main-{spu}.fluvio-spg-{}.{ns}.svc.cluster.local",
+            self.key()
+        );
+        let public_svc_fqdn = format!("fluvio-spu-{spu_name}.{ns}.svc.cluster.local");
 
         let spu_spec = SpuSpec {
             id: spu_id,
@@ -154,7 +157,7 @@ impl SpuGroupObj {
         )
     }
 
-    pub fn as_service(&self) -> (String, WSAction<SpgServiceSpec>) {
+    pub fn as_service(&self) -> (String, WSAction<SpgServiceSpec, K8MetaItem>) {
         let svc_name = self.svc_name.to_owned();
         let k8_service = k8_convert::generate_service(self.spec(), self.key());
 
@@ -177,12 +180,12 @@ mod k8_convert {
 
     use std::collections::HashMap;
 
-    use k8_types::*;
-    use k8_types::core::pod::{
+    use fluvio_stream_model::k8_types::*;
+    use fluvio_stream_model::k8_types::core::pod::{
         ContainerSpec, ContainerPortSpec, PodSpec, VolumeMount, VolumeSpec, SecretVolumeSpec,
     };
-    use k8_types::core::service::*;
-    use k8_types::app::stateful::{
+    use fluvio_stream_model::k8_types::core::service::*;
+    use fluvio_stream_model::k8_types::app::stateful::{
         PersistentVolumeClaim, VolumeAccessMode, ResourceRequirements, VolumeRequest,
     };
     use fluvio_types::defaults::{
@@ -191,7 +194,7 @@ mod k8_convert {
     };
 
     use crate::stores::spg::SpuGroupSpec;
-    use super::super::statefulset::{K8StatefulSetSpec};
+    use super::super::statefulset::K8StatefulSetSpec;
     use super::{ScK8Config, TlsConfig};
 
     /// convert spu group spec into k8 statefulset spec
@@ -237,7 +240,7 @@ mod k8_convert {
 
         let mut volume_mounts = vec![VolumeMount {
             name: "data".to_owned(),
-            mount_path: format!("/var/lib/{}/data", PRODUCT_NAME),
+            mount_path: format!("/var/lib/{PRODUCT_NAME}/data"),
             ..Default::default()
         }];
 
@@ -247,10 +250,7 @@ mod k8_convert {
             "/fluvio-run".to_owned(),
             "spu".to_owned(),
             "--sc-addr".to_owned(),
-            format!(
-                "fluvio-sc-internal.{}.svc.cluster.local:{}",
-                namespace, SC_PRIVATE_PORT
-            ),
+            format!("fluvio-sc-internal.{namespace}.svc.cluster.local:{SC_PRIVATE_PORT}"),
             "--log-base-dir".to_owned(),
             storage.log_dir,
             "--log-size".to_owned(),
@@ -385,6 +385,48 @@ mod k8_convert {
             ports: vec![public_port, private_port],
             selector: Some(selector),
             ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+
+    use fluvio_sc_schema::{
+        core::MetadataContext,
+        spg::SpuGroupSpec,
+        store::{k8::K8MetaItem, MetadataStoreObject},
+    };
+
+    use crate::k8::objects::spg_group::SpuGroupObj;
+
+    #[test]
+    fn test_as_spu_id_private_endpoint_for_k8s() {
+        let spu_cases = vec![0, 1, 2];
+
+        for spu in spu_cases {
+            let mut item = K8MetaItem::default();
+            "default".clone_into(&mut item.namespace);
+            let ctx = MetadataContext::new(item);
+
+            let inner: MetadataStoreObject<SpuGroupSpec, K8MetaItem> =
+                MetadataStoreObject::new_with_context(
+                    spu.to_string(),
+                    SpuGroupSpec::default(),
+                    ctx,
+                );
+
+            let spu_group = SpuGroupObj::new(inner);
+            let services = HashMap::new();
+            let as_spu = spu_group.as_spu(spu, &services);
+            let private_endpoint = as_spu.1.spec.private_endpoint;
+
+            assert_eq!(
+                private_endpoint.host,
+                format!("fluvio-spg-main-{spu}.fluvio-spg-{spu}.default.svc.cluster.local")
+            );
+            assert_eq!(private_endpoint.port, 9006);
         }
     }
 }

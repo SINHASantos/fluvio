@@ -4,14 +4,13 @@
 //! Contains contexts, profiles
 //!
 use std::env;
-use std::fs::read_to_string;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
-use std::fs::File;
 use std::fs::create_dir_all;
+
+use fluvio_types::config_file::LoadConfigError;
 use thiserror::Error;
 
 use tracing::debug;
@@ -26,8 +25,9 @@ fn home_dir() -> Option<PathBuf> {
 use serde::Deserialize;
 use serde::Serialize;
 
-use fluvio_types::defaults::{CLI_CONFIG_PATH};
-use crate::{FluvioConfig, FluvioError};
+use fluvio_types::defaults::CLI_CONFIG_PATH;
+use fluvio_types::config_file::SaveLoadConfig;
+use crate::{FluvioClusterConfig, FluvioError};
 
 use super::TlsPolicy;
 
@@ -95,12 +95,16 @@ impl ConfigFile {
     /// read from file
     fn from_file<T: AsRef<Path>>(path: T) -> Result<Self, FluvioError> {
         let path_ref = path.as_ref();
-        let file_str: String = read_to_string(path_ref)
-            .map_err(|e| config_file_error(&format!("{:?}", path_ref.as_os_str()), e))?;
-        let config = toml::from_str(&file_str).map_err(|e| ConfigError::TomlError {
-            msg: path_ref.display().to_string(),
-            source: e,
+        let config = Config::load_from(path_ref).map_err(|e| match e {
+            LoadConfigError::IoError(e) => {
+                config_file_error(&format!("{:?}", path_ref.as_os_str()), e)
+            }
+            LoadConfigError::TomlError(e) => ConfigError::TomlError {
+                msg: path_ref.display().to_string(),
+                source: e,
+            },
         })?;
+
         Ok(Self::new(path_ref.to_owned(), config))
     }
 
@@ -135,7 +139,7 @@ impl ConfigFile {
         &mut self.config
     }
 
-    // save to file
+    /// Save to file
     pub fn save(&self) -> Result<(), FluvioError> {
         create_dir_all(self.path.parent().unwrap())
             .map_err(|e| config_file_error(&format!("parent {:?}", self.path), e))?;
@@ -163,7 +167,7 @@ impl ConfigFile {
                 cluster.tls = tls_policy.clone();
             }
             None => {
-                let mut new_cluster = FluvioConfig::new(cluster_addr);
+                let mut new_cluster = FluvioClusterConfig::new(cluster_addr);
                 new_cluster.tls = tls_policy.clone();
                 config.add_cluster(new_cluster, profile_name.to_string());
             }
@@ -189,12 +193,12 @@ impl ConfigFile {
 pub const LOCAL_PROFILE: &str = "local";
 const CONFIG_VERSION: &str = "2.0";
 
-#[derive(Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     version: String,
     current_profile: Option<String>,
     pub profile: HashMap<String, Profile>,
-    pub cluster: HashMap<String, FluvioConfig>,
+    pub cluster: HashMap<String, FluvioClusterConfig>,
     client_id: Option<String>,
 }
 
@@ -208,7 +212,7 @@ impl Config {
 
     /// create new config with a single local cluster
     pub fn new_with_local_cluster(domain: String) -> Self {
-        let cluster = FluvioConfig::new(domain);
+        let cluster = FluvioClusterConfig::new(domain);
         let mut config = Self::new();
 
         config.cluster.insert(LOCAL_PROFILE.to_owned(), cluster);
@@ -221,25 +225,12 @@ impl Config {
     }
 
     /// add new cluster
-    pub fn add_cluster(&mut self, cluster: FluvioConfig, name: String) {
+    pub fn add_cluster(&mut self, cluster: FluvioClusterConfig, name: String) {
         self.cluster.insert(name, cluster);
     }
 
     pub fn add_profile(&mut self, profile: Profile, name: String) {
         self.profile.insert(name, profile);
-    }
-
-    // save to file
-    fn save_to<T: AsRef<Path>>(&self, path: T) -> Result<(), IoError> {
-        let path_ref = path.as_ref();
-        debug!("saving config: {:#?} to: {:#?}", self, path_ref);
-        let toml =
-            toml::to_vec(self).map_err(|err| IoError::new(ErrorKind::Other, format!("{}", err)))?;
-
-        let mut file = File::create(path_ref)?;
-        file.write_all(&toml)?;
-        // On windows flush() is noop, but sync_all() calls FlushFileBuffers.
-        file.sync_all()
     }
 
     pub fn version(&self) -> &str {
@@ -248,7 +239,7 @@ impl Config {
 
     /// current profile
     pub fn current_profile_name(&self) -> Option<&str> {
-        self.current_profile.as_ref().map(|c| c.as_ref())
+        self.current_profile.as_deref()
     }
 
     /// set current profile, if profile doesn't exists return false
@@ -308,10 +299,10 @@ impl Config {
     /// # Example
     ///
     /// ```
-    /// # use fluvio::FluvioConfig;
+    /// # use fluvio::FluvioClusterConfig;
     /// # use fluvio::config::{Config, Profile};
     /// let mut config = Config::new();
-    /// let cluster = FluvioConfig::new("https://cloud.fluvio.io".to_string());
+    /// let cluster = FluvioClusterConfig::new("https://cloud.fluvio.io".to_string());
     /// config.add_cluster(cluster, "fluvio-cloud".to_string());
     /// let profile = Profile::new("fluvio-cloud".to_string());
     /// config.add_profile(profile, "fluvio-cloud".to_string());
@@ -319,7 +310,7 @@ impl Config {
     /// config.delete_cluster("fluvio-cloud").unwrap();
     /// assert!(config.cluster("fluvio-cloud").is_none());
     /// ```
-    pub fn delete_cluster(&mut self, cluster_name: &str) -> Option<FluvioConfig> {
+    pub fn delete_cluster(&mut self, cluster_name: &str) -> Option<FluvioClusterConfig> {
         self.cluster.remove(cluster_name)
     }
 
@@ -335,10 +326,10 @@ impl Config {
     /// # Example
     ///
     /// ```
-    /// # use fluvio::FluvioConfig;
+    /// # use fluvio::FluvioClusterConfig;
     /// # use fluvio::config::{Config, Profile};
     /// let mut config = Config::new();
-    /// let cluster = FluvioConfig::new("https://cloud.fluvio.io".to_string());
+    /// let cluster = FluvioClusterConfig::new("https://cloud.fluvio.io".to_string());
     /// config.add_cluster(cluster, "fluvio-cloud".to_string());
     /// let profile = Profile::new("fluvio-cloud".to_string());
     /// config.add_profile(profile, "fluvio-cloud".to_string());
@@ -382,8 +373,8 @@ impl Config {
         self.profile.get_mut(profile_name)
     }
 
-    /// Returns the FluvioConfig belonging to the current profile.
-    pub fn current_cluster(&self) -> Result<&FluvioConfig, FluvioError> {
+    /// Returns the FluvioClusterConfig belonging to the current profile.
+    pub fn current_cluster(&self) -> Result<&FluvioClusterConfig, FluvioError> {
         let profile = self.current_profile()?;
         let maybe_cluster = self.cluster.get(&profile.cluster);
         let cluster = maybe_cluster.ok_or_else(|| {
@@ -393,20 +384,31 @@ impl Config {
         Ok(cluster)
     }
 
-    /// Returns the FluvioConfig belonging to the named profile.
-    pub fn cluster_with_profile(&self, profile_name: &str) -> Option<&FluvioConfig> {
+    /// Returns the mutable reference to FluvioClusterConfig belonging to the current profile.
+    pub fn current_cluster_mut(&mut self) -> Result<&mut FluvioClusterConfig, FluvioError> {
+        let profile = self.current_profile()?.clone();
+        let maybe_cluster = self.cluster.get_mut(&profile.cluster);
+        let cluster = maybe_cluster.ok_or_else(|| {
+            let profile = profile.cluster;
+            ConfigError::NoClusterForProfile { profile }
+        })?;
+        Ok(cluster)
+    }
+
+    /// Returns the FluvioClusterConfig belonging to the named profile.
+    pub fn cluster_with_profile(&self, profile_name: &str) -> Option<&FluvioClusterConfig> {
         self.profile
             .get(profile_name)
             .and_then(|profile| self.cluster.get(&profile.cluster))
     }
 
-    /// Returns a reference to the named FluvioConfig.
-    pub fn cluster(&self, cluster_name: &str) -> Option<&FluvioConfig> {
+    /// Returns a reference to the named FluvioClusterConfig.
+    pub fn cluster(&self, cluster_name: &str) -> Option<&FluvioClusterConfig> {
         self.cluster.get(cluster_name)
     }
 
-    /// Returns a mutable reference to the named FluvioConfig.
-    pub fn cluster_mut(&mut self, cluster_name: &str) -> Option<&mut FluvioConfig> {
+    /// Returns a mutable reference to the named FluvioClusterConfig.
+    pub fn cluster_mut(&mut self, cluster_name: &str) -> Option<&mut FluvioClusterConfig> {
         self.cluster.get_mut(cluster_name)
     }
 
@@ -487,7 +489,7 @@ pub mod test {
     fn test_config() {
         // test read & parse
         let mut conf_file = ConfigFile::load(Some("test-data/profiles/config.toml".to_owned()))
-            .expect("parse failed");
+            .expect("failed to parse file");
         let config = conf_file.mut_config();
 
         assert_eq!(config.version(), "1.0");
@@ -501,6 +503,12 @@ pub mod test {
 
         let cluster = config.current_cluster().expect("cluster should exist");
         assert_eq!(cluster.endpoint, "127.0.0.1:9003");
+        // access from profile
+        config
+            .cluster_with_profile("local")
+            .expect("cluster should exists");
+        // access from cluster
+        config.cluster("local").expect("cluster should exists");
     }
 
     #[test]
@@ -556,14 +564,6 @@ pub mod test {
             "local3"
         );
     }
-
-    /*
-    #[test]
-    fn test_topic_config() {
-        let conf_file = ConfigFile::load(Some("test-data/profiles/config.toml".to_owned())).expect("parse failed");
-        let config = conf_file.config().resolve_replica_config("test3",0);
-    }
-    */
 
     #[test]
     fn test_local_cluster() {

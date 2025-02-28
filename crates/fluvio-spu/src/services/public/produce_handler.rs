@@ -1,24 +1,22 @@
-use std::io::{Error, ErrorKind};
 use std::time::Duration;
 
 use tokio::select;
 use tracing::{debug, trace, error};
 use tracing::instrument;
+use anyhow::{anyhow, Result};
 
-use fluvio_protocol::api::{RequestKind};
+use fluvio_protocol::api::{RequestKind, RequestHeader};
 use fluvio_spu_schema::Isolation;
-use fluvio_protocol::record::{BatchRecords, Offset};
-use fluvio::{Compression};
+use fluvio_protocol::record::{BatchRecords, Offset, Batch, RawRecords};
+use fluvio::Compression;
 use fluvio_controlplane_metadata::topic::CompressionAlgorithm;
 use fluvio_storage::StorageError;
 use fluvio_spu_schema::produce::{
     ProduceResponse, TopicProduceResponse, PartitionProduceResponse, PartitionProduceData,
     DefaultProduceRequest, DefaultTopicRequest,
 };
-use fluvio_protocol::{
-    api::{RequestMessage},
-    link::ErrorCode,
-};
+use fluvio_spu_schema::server::smartmodule::SmartModuleInvocation;
+use fluvio_protocol::{api::RequestMessage, link::ErrorCode};
 use fluvio_protocol::api::ResponseMessage;
 use fluvio_protocol::record::RecordSet;
 use fluvio_controlplane_metadata::partition::ReplicaKey;
@@ -26,6 +24,13 @@ use fluvio_controlplane_metadata::partition::ReplicaKey;
 use fluvio_future::timer::sleep;
 
 use crate::core::DefaultSharedGlobalContext;
+use crate::replication::leader::SharedFileLeaderState;
+use crate::smartengine::batch::process_batch;
+use crate::smartengine::context::SmartModuleContext;
+use crate::smartengine::EngineError;
+use crate::smartengine::map_engine_error;
+use crate::smartengine::produce_batch::ProduceBatchIterator;
+
 use crate::traffic::TrafficType;
 
 struct TopicWriteResult {
@@ -51,13 +56,16 @@ struct PartitionWriteResult {
 pub async fn handle_produce_request(
     request: RequestMessage<DefaultProduceRequest>,
     ctx: DefaultSharedGlobalContext,
-) -> Result<ResponseMessage<ProduceResponse>, Error> {
+) -> Result<ResponseMessage<ProduceResponse>> {
     let (header, produce_request) = request.get_header_request();
     trace!("Handling ProduceRequest: {:#?}", produce_request);
 
+    let smartmodules = produce_request.smartmodules;
+
     let mut topic_results = Vec::with_capacity(produce_request.topics.len());
     for topic_request in produce_request.topics.into_iter() {
-        let topic_result = handle_produce_topic(&ctx, topic_request, header.is_connector()).await;
+        let topic_result =
+            handle_produce_topic(&ctx, topic_request, &smartmodules, &header).await?;
         topic_results.push(topic_result);
     }
     wait_for_acks(
@@ -73,14 +81,15 @@ pub async fn handle_produce_request(
 }
 
 #[instrument(
-    skip(ctx, topic_request),
+    skip(ctx, topic_request, smartmodules, header),
     fields(topic = %topic_request.name),
 )]
 async fn handle_produce_topic(
     ctx: &DefaultSharedGlobalContext,
     topic_request: DefaultTopicRequest,
-    is_connector: bool,
-) -> TopicWriteResult {
+    smartmodules: &[SmartModuleInvocation],
+    header: &RequestHeader,
+) -> Result<TopicWriteResult> {
     let topic = &topic_request.name;
 
     trace!("Handling produce request for topic: {topic}");
@@ -90,34 +99,81 @@ async fn handle_produce_topic(
         partitions: vec![],
     };
 
-    for partition_request in topic_request.partitions.into_iter() {
+    for mut partition_request in topic_request.partitions.into_iter() {
         let replica_id = ReplicaKey::new(topic.clone(), partition_request.partition_index);
-        let partition_response =
-            handle_produce_partition(ctx, replica_id, partition_request, is_connector).await;
+        let leader_state = match ctx.leaders_state().get(&replica_id).await {
+            Some(leader_state) => leader_state,
+            None => {
+                debug!(%replica_id, "Replica not found");
+                topic_result.partitions.push(PartitionWriteResult::error(
+                    replica_id,
+                    ErrorCode::NotLeaderForPartition,
+                ));
+
+                continue;
+            }
+        };
+
+        if let Some(mirror) = &leader_state.get_replica().mirror {
+            if let Some(err) = mirror.accept_traffic() {
+                debug!(%replica_id, "Mirror replica is not supported for produce");
+                topic_result
+                    .partitions
+                    .push(PartitionWriteResult::error(replica_id, err));
+                continue;
+            }
+        }
+
+        if let Err(err) = apply_smartmodules(
+            &mut partition_request,
+            smartmodules,
+            header.api_version(),
+            &leader_state,
+            ctx,
+        )
+        .await
+        {
+            error!(
+                ?replica_id,
+                api_version = header.api_version(),
+                "smartmodule engine failed: {err:#?}"
+            );
+            topic_result
+                .partitions
+                .push(PartitionWriteResult::error(replica_id, err));
+            continue;
+        };
+
+        let partition_response = if partition_request.records.total_records() == 0 {
+            PartitionWriteResult::filtered(replica_id)
+        } else {
+            handle_produce_partition(
+                ctx,
+                replica_id,
+                leader_state,
+                partition_request,
+                header.is_connector(),
+            )
+            .await
+        };
+
         topic_result.partitions.push(partition_response);
     }
-    topic_result
+    Ok(topic_result)
 }
 
 #[instrument(
-    skip(ctx, replica_id, partition_request),
+    skip(ctx, replica_id, partition_request, leader_state),
     fields(%replica_id),
 )]
-async fn handle_produce_partition<R: BatchRecords>(
+async fn handle_produce_partition(
     ctx: &DefaultSharedGlobalContext,
     replica_id: ReplicaKey,
-    partition_request: PartitionProduceData<RecordSet<R>>,
+    leader_state: SharedFileLeaderState,
+    partition_request: PartitionProduceData<RecordSet<RawRecords>>,
     is_connector: bool,
 ) -> PartitionWriteResult {
     trace!("Handling produce request for partition:");
-
-    let leader_state = match ctx.leaders_state().get(&replica_id).await {
-        Some(leader_state) => leader_state,
-        None => {
-            debug!(%replica_id, "Replica not found");
-            return PartitionWriteResult::error(replica_id, ErrorCode::NotLeaderForPartition);
-        }
-    };
 
     let replica_metadata = match ctx.replica_localstore().spec(&replica_id) {
         Some(replica_metadata) => replica_metadata,
@@ -142,26 +198,91 @@ async fn handle_produce_partition<R: BatchRecords>(
     match write_result {
         Ok((base_offset, leo, bytes)) => {
             metrics
-                .inbound
+                .inbound()
                 .increase(is_connector, (leo - base_offset) as u64, bytes as u64);
 
             PartitionWriteResult::ok(replica_id, base_offset, leo)
         }
-        Err(err @ StorageError::BatchTooBig(_)) => {
-            error!(%replica_id, "Batch is too big: {:#?}", err);
-            PartitionWriteResult::error(replica_id, ErrorCode::MessageTooLarge)
-        }
         Err(err) => {
-            error!(%replica_id, "Error writing to replica: {:#?}", err);
-            PartitionWriteResult::error(replica_id, ErrorCode::StorageError)
+            if let Some(engine_err) = err.downcast_ref::<EngineError>() {
+                error!(%replica_id, "Replica SmartEngine error: {:#?}", engine_err);
+                return PartitionWriteResult::error(replica_id, map_engine_error(engine_err));
+            };
+            match err.downcast_ref::<StorageError>() {
+                Some(StorageError::BatchTooBig(_)) => {
+                    error!(%replica_id, "Batch is too big: {:#?}", err);
+                    PartitionWriteResult::error(replica_id, ErrorCode::MessageTooLarge)
+                }
+                Some(StorageError::BatchExceededSegment {
+                    batch_size,
+                    max_segment_size,
+                }) => {
+                    error!(%replica_id, batch_size, max_segment_size, "Batch size exceeded max segment size");
+                    PartitionWriteResult::error(replica_id, ErrorCode::MessageTooLarge)
+                }
+                _ => {
+                    error!(%replica_id, "Error writing to replica: {:#?}", err);
+                    PartitionWriteResult::error(replica_id, ErrorCode::StorageError)
+                }
+            }
         }
     }
+}
+
+async fn apply_smartmodules(
+    partition_request: &mut PartitionProduceData<RecordSet<RawRecords>>,
+    smartmodules: &[SmartModuleInvocation],
+    api_version: i16,
+    leader_state: &SharedFileLeaderState,
+    ctx: &DefaultSharedGlobalContext,
+) -> Result<(), ErrorCode> {
+    let Some(mut sm_ctx) =
+        SmartModuleContext::try_from(smartmodules.to_vec(), api_version, ctx).await?
+    else {
+        return Ok(());
+    };
+
+    sm_ctx.look_back(leader_state).await?;
+
+    let records = &partition_request.records;
+    let batches = &records.batches;
+
+    let mut batches = ProduceBatchIterator::new(batches);
+
+    let sm_result = match process_batch(
+        sm_ctx.chain_mut(),
+        &mut batches,
+        usize::MAX,
+        ctx.metrics().chain_metrics(),
+    ) {
+        Ok((result, sm_runtime_error)) => {
+            if let Some(error) = sm_runtime_error {
+                return Err(ErrorCode::SmartModuleRuntimeError(error));
+            } else {
+                result
+            }
+        }
+        Err(general_error) => {
+            return Err(ErrorCode::Other(format!(
+                "smartmodule chain failed: {general_error}"
+            )));
+        }
+    };
+
+    let smartmoduled_records = Batch::<RawRecords>::try_from(sm_result)
+        .map_err(|e| ErrorCode::Other(format!("Compression Error: {:?}", e)))?;
+
+    partition_request.records = RecordSet {
+        batches: vec![smartmoduled_records],
+    };
+
+    Ok(())
 }
 
 fn validate_records<R: BatchRecords>(
     records: &RecordSet<R>,
     compression: CompressionAlgorithm,
-) -> Result<(), Error> {
+) -> Result<()> {
     if records.batches.iter().all(|batch| {
         let batch_compression = if let Ok(compression) = batch.get_compression() {
             compression
@@ -174,14 +295,12 @@ fn validate_records<R: BatchRecords>(
             CompressionAlgorithm::Gzip => batch_compression == Compression::Gzip,
             CompressionAlgorithm::Snappy => batch_compression == Compression::Snappy,
             CompressionAlgorithm::Lz4 => batch_compression == Compression::Lz4,
+            CompressionAlgorithm::Zstd => batch_compression == Compression::Zstd,
         }
     }) {
         Ok(())
     } else {
-        Err(Error::new(
-            ErrorKind::Other,
-            "Compression not supported by topic",
-        ))
+        Err(anyhow!("Compression not supported by topic"))
     }
 }
 /// For isolation = ReadCommitted wait until the replica's `hw` includes written records offsets or
@@ -272,6 +391,13 @@ impl PartitionWriteResult {
             replica_id,
             base_offset,
             leo,
+            ..Default::default()
+        }
+    }
+
+    fn filtered(replica_id: ReplicaKey) -> Self {
+        Self {
+            replica_id,
             ..Default::default()
         }
     }

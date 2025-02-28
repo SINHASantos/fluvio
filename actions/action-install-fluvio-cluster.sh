@@ -5,7 +5,7 @@
 set -eu -o pipefail
 echo "Installing Fluvio Local Cluster"
 
-curl -fsS https://packages.fluvio.io/v1/install.sh | bash
+curl -fsS https://hub.infinyon.cloud/install/install.sh?ctx=ci | bash
 echo 'export PATH="$HOME/.fluvio/bin:$PATH"' >> $HOME/.bash_profile
 . $HOME/.bash_profile
 
@@ -19,6 +19,10 @@ IMAGE=""
 # Install Local Fluvio Cluster
 if [ "$CLUSTER_TYPE" = "local" ]; then
     LOCAL_FLAG="--local"
+fi
+# Install K8S Fluvio Cluster
+if [ "$CLUSTER_TYPE" = "k8" ]; then
+    LOCAL_FLAG="--k8"
 fi
 
 # For latest, we need to put image tag

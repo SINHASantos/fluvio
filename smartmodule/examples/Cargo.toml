@@ -4,23 +4,31 @@ members = [
     "aggregate-sum",
     "aggregate-json",
     "aggregate-average",
+    "aggregate-init",
+    "aggregate_with_timestamp",
     "filter",
     "filter_init",
+    "filter_look_back",
+    "filter_look_back_with_timestamps",
     "filter_with_param",
     "filter_odd",
     "filter_json",
     "filter_regex",
     "filter_with_param_v1",
-    "join",
+    "filter_hashset",
     "map",
     "map_double",
     "map_json",
     "map_regex",
+    "map_with_timestamp",
     "array_map_json_array",
+    "array_map_json_array_with_timestamp",
     "array_map_json_object",
     "array_map_json_reddit",
     "filter_map",
 ]
+
+resolver = "2"
 
 [workspace.dependencies]
 fluvio-smartmodule = { path = "../../crates/fluvio-smartmodule" }
@@ -30,3 +38,9 @@ fluvio-smartmodule = { path = "../../crates/fluvio-smartmodule" }
 [profile.release]
 lto = true
 strip = "symbols"
+
+[profile.release-lto]
+inherits = "release"
+lto = true
+strip = "symbols"
+

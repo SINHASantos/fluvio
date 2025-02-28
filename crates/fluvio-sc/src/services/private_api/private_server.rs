@@ -1,57 +1,74 @@
-use fluvio_controlplane::UpdateDerivedStreamRequest;
-use fluvio_controlplane_metadata::message::SmartModuleMsg;
-use fluvio_controlplane_metadata::partition::Replica;
-use fluvio_controlplane_metadata::smartmodule::SmartModuleSpec;
-use fluvio_controlplane_metadata::derivedstream::DerivedStreamSpec;
-use fluvio_future::timer::sleep;
-use fluvio_service::ConnectInfo;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::time::Duration;
 
+use fluvio_controlplane::message::ReplicaMsg;
+use fluvio_controlplane::message::SmartModuleMsg;
+use fluvio_controlplane::message::SpuMsg;
+use fluvio_controlplane::replica::Replica;
+use fluvio_controlplane::sc_api::api::InternalScKey;
+use fluvio_controlplane::sc_api::api::InternalScRequest;
+use fluvio_controlplane::sc_api::register_spu::RegisterSpuResponse;
+use fluvio_controlplane::sc_api::remove::ReplicaRemovedRequest;
+use fluvio_controlplane::sc_api::update_lrs::UpdateLrsRequest;
+use fluvio_controlplane::sc_api::update_mirror::UpdateMirrorStatRequest;
+use fluvio_controlplane::spu_api::update_mirror::MirrorMsg;
+use fluvio_controlplane::spu_api::update_mirror::UpdateMirrorRequest;
+use fluvio_controlplane::spu_api::update_replica::UpdateReplicaRequest;
+use fluvio_controlplane::spu_api::update_smartmodule::UpdateSmartModuleRequest;
+use fluvio_controlplane::spu_api::update_spu::UpdateSpuRequest;
+use fluvio_controlplane_metadata::message::Message;
+use fluvio_sc_schema::mirror::MirrorSpec;
+use fluvio_stream_model::core::MetadataItem;
+use fluvio_stream_model::store::ChangeListener;
+use tracing::warn;
 use tracing::{debug, info, trace, instrument, error};
 use async_trait::async_trait;
 use futures_util::stream::Stream;
 use anyhow::Result;
 
+use fluvio_future::timer::sleep;
+use fluvio_service::ConnectInfo;
+use fluvio_controlplane_metadata::smartmodule::SmartModuleSpec;
 use fluvio_types::SpuId;
 use fluvio_protocol::api::RequestMessage;
-use fluvio_controlplane_metadata::spu::store::SpuLocalStorePolicy;
 use fluvio_service::{FluvioService, wait_for_request};
 use fluvio_socket::{FluvioSocket, SocketError, FluvioSink};
-use fluvio_controlplane::{
-    InternalScRequest, InternalScKey, RegisterSpuResponse, UpdateLrsRequest, UpdateReplicaRequest,
-    UpdateSpuRequest, ReplicaRemovedRequest, UpdateSmartModuleRequest,
-};
-use fluvio_controlplane_metadata::message::{ReplicaMsg, Message, SpuMsg};
 
 use crate::core::SharedContext;
-use crate::stores::{K8ChangeListener};
+use crate::stores::partition::PartitonStatusExtension;
 use crate::stores::partition::{PartitionSpec, PartitionStatus, PartitionResolution};
+use crate::stores::spu::SpuLocalStorePolicy;
 use crate::stores::spu::SpuSpec;
 use crate::stores::actions::WSAction;
 
 const HEALTH_DURATION: u64 = 90;
 
 #[derive(Debug)]
-pub struct ScInternalService {}
+pub struct ScInternalService<C> {
+    data: PhantomData<C>,
+}
 
-impl ScInternalService {
+impl<C> ScInternalService<C> {
     pub fn new() -> Self {
-        Self {}
+        Self { data: PhantomData }
     }
 }
 
 #[async_trait]
-impl FluvioService for ScInternalService {
-    type Context = SharedContext;
+impl<C> FluvioService for ScInternalService<C>
+where
+    C: MetadataItem,
+{
+    type Context = SharedContext<C>;
     type Request = InternalScRequest;
 
     #[instrument(skip(self, context))]
     async fn respond(
         self: Arc<Self>,
-        context: SharedContext,
+        context: Self::Context,
         socket: FluvioSocket,
         _connection: ConnectInfo,
     ) -> Result<()> {
@@ -104,16 +121,19 @@ impl FluvioService for ScInternalService {
 
 // perform internal dispatch
 #[instrument(name = "ScInternalService", skip(context, api_stream))]
-async fn dispatch_loop(
-    context: SharedContext,
+async fn dispatch_loop<C>(
+    context: SharedContext<C>,
     spu_id: SpuId,
     mut api_stream: impl Stream<Item = Result<InternalScRequest, SocketError>> + Unpin,
     mut sink: FluvioSink,
-) -> Result<(), SocketError> {
+) -> Result<(), SocketError>
+where
+    C: MetadataItem,
+{
     let mut spu_spec_listener = context.spus().change_listener();
     let mut partition_spec_listener = context.partitions().change_listener();
     let mut sm_spec_listener = context.smartmodules().change_listener();
-    let mut ss_spec_listener = context.derivedstreams().change_listener();
+    let mut mirror_spec_listener = context.mirrors().change_listener();
 
     // send initial changes
 
@@ -124,9 +144,9 @@ async fn dispatch_loop(
         use futures_util::stream::StreamExt;
 
         send_spu_spec_changes(&mut spu_spec_listener, &mut sink, spu_id).await?;
-        send_replica_spec_changes(&mut partition_spec_listener, &mut sink, spu_id).await?;
         send_smartmodule_changes(&mut sm_spec_listener, &mut sink, spu_id).await?;
-        send_derivedstream_changes(&mut ss_spec_listener, &mut sink, spu_id).await?;
+        send_replica_spec_changes(&mut partition_spec_listener, &mut sink, spu_id).await?;
+        send_mirror_changes(&mut mirror_spec_listener, &mut sink, spu_id).await?;
 
         trace!(spu_id, "waiting for SPU channel");
 
@@ -153,7 +173,10 @@ async fn dispatch_loop(
                             },
                             InternalScRequest::ReplicaRemovedRequest(msg) => {
                                 receive_replica_remove(&context,msg.request).await;
-                            }
+                            },
+                            InternalScRequest::UpdateMirrorStatRequest(msg) => {
+                                receive_mirror_update(&context, msg.request).await;
+                            },
                         }
                         // reset timer
                         health_check_timer = sleep(Duration::from_secs(HEALTH_DURATION));
@@ -180,6 +203,10 @@ async fn dispatch_loop(
 
             }
 
+            _ = mirror_spec_listener.listen() => {
+                debug!("mirror lister changed");
+            }
+
         }
     }
 
@@ -188,7 +215,10 @@ async fn dispatch_loop(
 
 /// send lrs update to metadata stores
 #[instrument(skip(ctx, requests))]
-async fn receive_lrs_update(ctx: &SharedContext, requests: UpdateLrsRequest) {
+async fn receive_lrs_update<C>(ctx: &SharedContext<C>, requests: UpdateLrsRequest)
+where
+    C: MetadataItem,
+{
     let requests = requests.into_requests();
     if requests.is_empty() {
         trace!("no requests, just health check");
@@ -207,10 +237,11 @@ async fn receive_lrs_update(ctx: &SharedContext, requests: UpdateLrsRequest) {
                 lrs_req.replicas,
                 lrs_req.size,
                 PartitionResolution::Online,
+                lrs_req.base_offset,
             );
             current_status.merge(new_status);
 
-            actions.push(WSAction::UpdateStatus::<PartitionSpec>((
+            actions.push(WSAction::<PartitionSpec, C>::UpdateStatus((
                 key,
                 current_status,
             )));
@@ -234,7 +265,10 @@ async fn receive_lrs_update(ctx: &SharedContext, requests: UpdateLrsRequest) {
     skip(ctx,request),
     fields(replica=%request.id)
 )]
-async fn receive_replica_remove(ctx: &SharedContext, request: ReplicaRemovedRequest) {
+async fn receive_replica_remove<C>(ctx: &SharedContext<C>, request: ReplicaRemovedRequest)
+where
+    C: MetadataItem,
+{
     debug!(request=?request);
     // create action inside to optimize read locking
     let read_guard = ctx.partitions().store().read().await;
@@ -242,13 +276,13 @@ async fn receive_replica_remove(ctx: &SharedContext, request: ReplicaRemovedRequ
         // force to delete partition regardless if confirm
         if request.confirm {
             debug!("force delete");
-            Some(WSAction::DeleteFinal::<PartitionSpec>(request.id))
+            Some(WSAction::<PartitionSpec, C>::DeleteFinal(request.id))
         } else {
             debug!("no delete");
             None
         }
     } else {
-        error!("replica doesn't exist");
+        warn!("replica doesn't exist");
         None
     };
 
@@ -259,10 +293,51 @@ async fn receive_replica_remove(ctx: &SharedContext, request: ReplicaRemovedRequ
     }
 }
 
+/// send mirror update to metadata stores
+#[instrument(skip(ctx, requests))]
+async fn receive_mirror_update<C>(ctx: &SharedContext<C>, requests: UpdateMirrorStatRequest)
+where
+    C: MetadataItem,
+{
+    let stats = requests.into_stats();
+    if stats.is_empty() {
+        trace!("no stats, just health check");
+        return;
+    }
+    debug!(?stats, "received mirror stats");
+
+    let mut actions = vec![];
+    let read_guard = ctx.mirrors().store().read().await;
+    for stat in stats.into_iter() {
+        if let Some(mirror) = read_guard.get(&stat.mirror_id) {
+            let mut current_status = mirror.inner().status().clone();
+            let key = stat.mirror_id.clone();
+            current_status.merge_from_spu(stat.status);
+
+            actions.push(WSAction::<MirrorSpec, C>::UpdateStatus((
+                key,
+                current_status,
+            )));
+        } else {
+            error!(
+                "trying to update replica: {}, that doesn't exist",
+                stat.mirror_id
+            );
+            return;
+        }
+    }
+
+    drop(read_guard);
+
+    for action in actions.into_iter() {
+        ctx.mirrors().send_action(action).await;
+    }
+}
+
 /// send spu spec changes only
 #[instrument(skip(sink))]
-async fn send_spu_spec_changes(
-    listener: &mut K8ChangeListener<SpuSpec>,
+async fn send_spu_spec_changes<C: MetadataItem>(
+    listener: &mut ChangeListener<SpuSpec, C>,
     sink: &mut FluvioSink,
     spu_id: SpuId,
 ) -> Result<(), SocketError> {
@@ -307,8 +382,8 @@ async fn send_spu_spec_changes(
 }
 
 #[instrument(level = "trace", skip(sink))]
-async fn send_replica_spec_changes(
-    listener: &mut K8ChangeListener<PartitionSpec>,
+async fn send_replica_spec_changes<C: MetadataItem>(
+    listener: &mut ChangeListener<PartitionSpec, C>,
     sink: &mut FluvioSink,
     spu_id: SpuId,
 ) -> Result<(), SocketError> {
@@ -378,8 +453,8 @@ async fn send_replica_spec_changes(
 }
 
 #[instrument(level = "trace", skip(sink))]
-async fn send_smartmodule_changes(
-    listener: &mut K8ChangeListener<SmartModuleSpec>,
+async fn send_smartmodule_changes<C: MetadataItem>(
+    listener: &mut ChangeListener<SmartModuleSpec, C>,
     sink: &mut FluvioSink,
     spu_id: SpuId,
 ) -> Result<(), SocketError> {
@@ -432,13 +507,11 @@ async fn send_smartmodule_changes(
 }
 
 #[instrument(level = "trace", skip(sink))]
-async fn send_derivedstream_changes(
-    listener: &mut K8ChangeListener<DerivedStreamSpec>,
+async fn send_mirror_changes<C: MetadataItem>(
+    listener: &mut ChangeListener<MirrorSpec, C>,
     sink: &mut FluvioSink,
     spu_id: SpuId,
 ) -> Result<(), SocketError> {
-    use fluvio_controlplane_metadata::message::{DerivedStreamMsg};
-
     use crate::stores::ChangeFlag;
 
     if !listener.has_change() {
@@ -449,7 +522,7 @@ async fn send_derivedstream_changes(
     let changes = listener
         .sync_changes_with_filter(&ChangeFlag {
             spec: true,
-            status: true,
+            status: false,
             meta: true,
         })
         .await;
@@ -464,12 +537,9 @@ async fn send_derivedstream_changes(
     let (updates, deletes) = changes.parts();
 
     let request = if is_sync_all {
-        UpdateDerivedStreamRequest::with_all(
-            epoch,
-            updates.into_iter().map(|sm| sm.into()).collect(),
-        )
+        UpdateMirrorRequest::with_all(epoch, updates.into_iter().map(|sm| sm.into()).collect())
     } else {
-        let mut changes: Vec<DerivedStreamMsg> = updates
+        let mut changes: Vec<MirrorMsg> = updates
             .into_iter()
             .map(|sm| Message::update(sm.into()))
             .collect();
@@ -478,10 +548,10 @@ async fn send_derivedstream_changes(
             .map(|sm| Message::delete(sm.into()))
             .collect();
         changes.append(&mut deletes);
-        UpdateDerivedStreamRequest::with_changes(epoch, changes)
+        UpdateMirrorRequest::with_changes(epoch, changes)
     };
 
-    debug!(?request, "sending ss to spu");
+    debug!(?request, "sending mirror to spu");
 
     let mut message = RequestMessage::new_request(request);
     message.get_mut_header().set_client_id("sc");

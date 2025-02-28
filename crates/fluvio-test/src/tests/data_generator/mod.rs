@@ -12,10 +12,10 @@ use fluvio::{Offset, RecordKey};
 use futures::StreamExt;
 
 #[derive(Debug, Clone, Parser, Default, Eq, PartialEq, MyTestCase)]
-#[clap(name = "Fluvio Longevity Test")]
+#[command(name = "Fluvio Longevity Test")]
 pub struct GeneratorTestOption {
     /// Opt-in to detailed output printed to stdout
-    #[clap(long, short)]
+    #[arg(long, short)]
     verbose: bool,
 }
 
@@ -31,7 +31,7 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
         "forever".to_string()
     };
 
-    println!("Expected runtime: {:?}", expected_runtime);
+    println!("Expected runtime: {expected_runtime:?}");
 
     println!("# Producers: {}", option.environment.producer);
 
@@ -47,7 +47,7 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
     );
 
     let sync_topic = if let Some(run_id) = &option.environment.topic_salt {
-        format!("sync-{}", run_id)
+        format!("sync-{run_id}")
     } else {
         "sync".to_string()
     };
@@ -81,7 +81,7 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
     // Pass run id to producers, so they can select the correct topics
     let mut producer_wait = Vec::new();
     for i in 0..option.environment.producer {
-        println!("Starting Producer #{}", i);
+        println!("Starting Producer #{i}");
         let producer = async_process!(
             async {
                 producer::producer(
@@ -92,7 +92,7 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
                 )
                 .await
             },
-            format!("producer-{}", i)
+            format!("producer-{i}")
         );
 
         producer_wait.push(producer);
@@ -108,14 +108,7 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
 
             println!("setup");
 
-            let sync_consumer = test_driver
-                .get_consumer(&sync_topic, 0)
-                .await;
-
-            let mut sync_stream = sync_consumer
-                .stream(Offset::from_end(0))
-                .await
-                .expect("Unable to open stream");
+            let mut sync_stream = test_driver.get_consumer_with_start(&sync_topic, 0, Offset::from_end(0)).await;
 
             let sync_producer = test_driver
                 .create_producer(&sync_topic)
@@ -126,9 +119,9 @@ pub fn data_generator(test_driver: FluvioTestDriver, test_case: TestCase) {
             let mut is_ready = false;
             while let Some(Ok(record)) = sync_stream.next().await {
                 let _key = record
-                    .key()
-                    .map(|key| String::from_utf8_lossy(key).to_string());
-                let value = String::from_utf8_lossy(record.value()).to_string();
+                    .get_key()
+                    .map(|key| key.as_utf8_lossy_string());
+                let value = record.get_value().as_utf8_lossy_string();
 
                 if !is_ready {
                     if value.contains("ready") {

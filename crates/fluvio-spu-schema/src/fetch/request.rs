@@ -7,6 +7,7 @@ use fluvio_protocol::derive::FluvioDefault;
 use fluvio_protocol::record::RecordSet;
 use fluvio_types::PartitionId;
 
+use crate::COMMON_VERSION;
 use crate::isolation::Isolation;
 
 use super::FetchResponse;
@@ -14,10 +15,7 @@ use super::FetchResponse;
 pub type DefaultFetchRequest = FetchRequest<RecordSet>;
 
 #[derive(Encoder, Decoder, FluvioDefault, Debug)]
-pub struct FetchRequest<R>
-where
-    R: Encoder + Decoder + Default + Debug,
-{
+pub struct FetchRequest<R> {
     /// The maximum time in milliseconds to wait for the response.
     pub max_wait: i32,
 
@@ -54,8 +52,7 @@ where
     const API_KEY: u16 = 1;
 
     const MIN_API_VERSION: i16 = 0;
-    const MAX_API_VERSION: i16 = 10;
-    const DEFAULT_API_VERSION: i16 = 10;
+    const DEFAULT_API_VERSION: i16 = COMMON_VERSION;
 
     type Response = FetchResponse<R>;
 }

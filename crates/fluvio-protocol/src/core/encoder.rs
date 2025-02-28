@@ -4,6 +4,7 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use bytes::BufMut;
 use bytes::Bytes;
@@ -295,6 +296,26 @@ impl Encoder for u32 {
     }
 }
 
+impl Encoder for f32 {
+    fn write_size(&self, _version: Version) -> usize {
+        4
+    }
+
+    fn encode<T>(&self, dest: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: BufMut,
+    {
+        if dest.remaining_mut() < 4 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "not enough capacity for f32",
+            ));
+        }
+        dest.put_f32(*self);
+        Ok(())
+    }
+}
+
 impl Encoder for u64 {
     fn write_size(&self, _version: Version) -> usize {
         8
@@ -345,6 +366,47 @@ impl EncoderVarInt for i64 {
         T: BufMut,
     {
         variant_encode(dest, *self)?;
+        Ok(())
+    }
+}
+
+impl Encoder for f64 {
+    fn write_size(&self, _version: Version) -> usize {
+        8
+    }
+
+    fn encode<T>(&self, dest: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: BufMut,
+    {
+        if dest.remaining_mut() < 8 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "not enough capacity for f64",
+            ));
+        }
+        dest.put_f64(*self);
+        Ok(())
+    }
+}
+
+impl Encoder for Duration {
+    fn write_size(&self, _version: Version) -> usize {
+        12
+    }
+
+    fn encode<T>(&self, dest: &mut T, _version: Version) -> Result<(), Error>
+    where
+        T: BufMut,
+    {
+        if dest.remaining_mut() < 12 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "not enough capacity for u64+u32",
+            ));
+        }
+        dest.put_u64(self.as_secs());
+        dest.put_u32(self.subsec_nanos());
         Ok(())
     }
 }

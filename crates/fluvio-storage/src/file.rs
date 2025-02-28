@@ -7,7 +7,7 @@ use blocking::unblock;
 use bytes::{BytesMut, Bytes};
 use fluvio_protocol::record::Size;
 
-use libc::{c_void};
+use libc::c_void;
 use nix::errno::Errno;
 use nix::Result as NixResult;
 use tracing::{debug, instrument, trace};
@@ -26,7 +26,7 @@ pub struct FileBytesIterator {
 #[async_trait]
 impl StorageBytesIterator for FileBytesIterator {
     async fn open<P: AsRef<Path> + Send>(path: P) -> Result<Self, IoError> {
-        debug!(path = ?path.as_ref().display(),"open file");
+        debug!(path = ?path.as_ref().display(),"opening log file for iteration");
         let file = File::open(path).await?;
         Self::from_file(file).await
     }
@@ -52,7 +52,7 @@ impl StorageBytesIterator for FileBytesIterator {
         let file_pos = self.pos as i64;
         match unblock(move || pread(fd, file_pos, len as usize))
             .await
-            .map_err(|e| IoError::new(ErrorKind::Other, format!("pread error: {:#?}", e)))?
+            .map_err(|e| IoError::new(ErrorKind::Other, format!("pread error: {e:#?}")))?
         {
             ReadOutput::Some { buffer, eof } => {
                 trace!(len = buffer.len(), "read bytes");
@@ -105,12 +105,24 @@ impl ReadOutput {
 #[instrument(level = "trace", fields(fd, offset, len))]
 fn pread(fd: RawFd, offset: i64, len: usize) -> NixResult<ReadOutput> {
     let mut eof = false;
-    let mut buf = BytesMut::with_capacity(len as usize);
+    let mut buf = BytesMut::with_capacity(len);
     let mut buf_len = len;
     let mut buf_offset = 0;
     let mut total_read = 0;
     while buf_len > 0 {
         trace!(buf_len, buf_offset, total_read, "pread start");
+
+        #[cfg(target_pointer_width = "32")]
+        let res = unsafe {
+            libc::pread64(
+                fd,
+                buf.as_mut_ptr().offset(buf_offset) as *mut c_void,
+                buf_len,
+                offset + total_read as i64,
+            )
+        };
+
+        #[cfg(not(target_pointer_width = "32"))]
         let res = unsafe {
             libc::pread(
                 fd,
@@ -119,7 +131,7 @@ fn pread(fd: RawFd, offset: i64, len: usize) -> NixResult<ReadOutput> {
                 offset + total_read as i64,
             )
         };
-        let read = Errno::result(res).map(|r| r as isize)?;
+        let read = Errno::result(res)?;
         if read == 0 {
             trace!(fd, total_read, "end of file");
             if total_read == 0 {
@@ -313,21 +325,28 @@ impl StorageBytesIterator for BufferedFileBytesIterator {
 mod tests {
 
     use std::env::temp_dir;
+    use std::path::PathBuf;
 
     use futures_lite::AsyncWriteExt;
 
-    use fluvio_future::{fs::File};
+    use fluvio_future::fs::File;
 
     use super::*;
+
+    async fn write_hello_world(fname: &PathBuf) {
+        let mut file = File::create(fname).await.expect("file creation");
+        file.write_all(b"hello world").await.expect("write");
+        file.flush().await.expect("flush");
+        drop(file);
+
+        // possible CI fix for unstable readback in gh actions
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
 
     #[fluvio_future::test]
     async fn test_file_descriptor() {
         let test_file = temp_dir().join("simple_write");
-
-        let mut file = File::create(&test_file).await.expect("file creation");
-        file.write_all(b"hello world").await.expect("write");
-        file.flush().await.expect("flush");
-        drop(file);
+        write_hello_world(&test_file).await;
 
         let file = File::open(&test_file).await.expect("open");
         let fd = file.as_raw_fd();

@@ -8,41 +8,10 @@ pub use self::spec::*;
 pub use self::status::*;
 pub use self::package::*;
 
-use std::fmt;
-
-use fluvio_stream_model::core::MetadataItem;
-use fluvio_stream_model::store::MetadataStoreObject;
-use fluvio_types::SmartModuleName;
-use fluvio_protocol::{Encoder, Decoder};
-
 #[cfg(feature = "k8")]
 mod k8;
 #[cfg(feature = "k8")]
 pub use k8::*;
-
-/// SmartModule object that can be used to transport from SC to SPU
-#[derive(Debug, Default, Clone, Eq, PartialEq, Encoder, Decoder)]
-pub struct SmartModule {
-    pub name: SmartModuleName,
-    pub spec: SmartModuleSpec,
-}
-
-impl fmt::Display for SmartModule {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SmartModule({})", self.name)
-    }
-}
-
-impl<C> From<MetadataStoreObject<SmartModuleSpec, C>> for SmartModule
-where
-    C: MetadataItem,
-{
-    fn from(mso: MetadataStoreObject<SmartModuleSpec, C>) -> Self {
-        let name = mso.key_owned();
-        let spec = mso.spec;
-        Self { name, spec }
-    }
-}
 
 mod metadata {
 
@@ -84,7 +53,6 @@ mod metadata {
 
         impl K8ExtendedSpec for SmartModuleSpec {
             type K8Spec = Self;
-            type K8Status = Self::Status;
 
             fn convert_from_k8(
                 k8_obj: K8Obj<Self::K8Spec>,
@@ -92,6 +60,14 @@ mod metadata {
             ) -> Result<MetadataStoreObject<Self, K8MetaItem>, K8ConvertError<Self::K8Spec>>
             {
                 default_convert_from_k8(k8_obj, multi_namespace_context)
+            }
+
+            fn convert_status_from_k8(status: Self::Status) -> Self::Status {
+                status
+            }
+
+            fn into_k8(self) -> Self::K8Spec {
+                self
             }
         }
     }

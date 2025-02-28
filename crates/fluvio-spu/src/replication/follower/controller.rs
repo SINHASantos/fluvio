@@ -1,17 +1,17 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tracing::{debug, error, trace, warn, instrument};
-use async_rwlock::{RwLock};
+use async_lock::RwLock;
 use adaptive_backoff::prelude::*;
 
 use fluvio_types::SpuId;
 use fluvio_types::event::offsets::OffsetPublisher;
-use crate::core::{FileGlobalContext};
+use crate::core::FileGlobalContext;
 
-use super::{FollowersState};
+use super::FollowersState;
 use super::state::{SharedFollowersState, FollowerReplicaState};
-use super::api_key::{FollowerPeerApiEnum};
-use super::sync::{DefaultSyncRequest};
+use super::api_key::FollowerPeerApiEnum;
+use super::sync::DefaultSyncRequest;
 use super::peer_api::FollowerPeerRequest;
 
 /// time to resync follower offsets to leader
@@ -181,12 +181,7 @@ mod inner {
             debug!("shutting down");
         }
 
-        async fn sync_with_leader(
-            &mut self,
-            mut socket: FluvioSocket,
-        ) -> Result<bool, SocketError> {
-            self.send_fetch_stream_request(&mut socket).await?;
-
+        async fn sync_with_leader(&mut self, socket: FluvioSocket) -> Result<bool, SocketError> {
             let (mut sink, mut stream) = socket.split();
             let mut api_stream = stream.api_stream::<FollowerPeerRequest, FollowerPeerApiEnum>();
 
@@ -194,7 +189,7 @@ mod inner {
 
             // starts initial sync
             debug!("performing initial offset sync to leader");
-            let mut replicas = FollowerGroup::filter_from(&self.states, self.leader).await;
+            let replicas = FollowerGroup::filter_from(&self.states, self.leader).await;
             self.sync_all_offsets_to_leader(&mut sink, &replicas)
                 .await?;
 
@@ -218,7 +213,7 @@ mod inner {
                             return Ok(true);
                         }
                         // if sync counter changes, then we need to re-compute replicas and send offsets again
-                        replicas = FollowerGroup::filter_from(&self.states,self.leader).await;
+                        let replicas = FollowerGroup::filter_from(&self.states,self.leader).await;
                         self.sync_all_offsets_to_leader(&mut sink,&replicas).await?;
                     }
 
@@ -328,25 +323,39 @@ mod inner {
                 );
 
                 match FluvioSocket::connect(&leader_endpoint).await {
-                    Ok(socket) => {
+                    Ok(mut socket) => {
                         debug!("connected to leader");
-                        return socket;
-                    }
 
+                        match self.send_fetch_stream_request(&mut socket).await {
+                            Ok(Some(spu)) => {
+                                info!("connected to leader with spu {} as replica", spu);
+                                return socket;
+                            }
+                            Ok(None) => {
+                                error!("leader rejected connection");
+                                drop(socket);
+                            }
+                            Err(err) => {
+                                error!("error stabilishing fetch stream: {}", err);
+                                drop(socket);
+                            }
+                        }
+                    }
                     Err(err) => {
                         error!(
                             "error connecting to leader at: <{}> err: {}",
                             leader_endpoint, err
                         );
-                        let wait = backoff.wait();
-                        info!(
-                            seconds = wait.as_secs(),
-                            "sleeping seconds to connect to leader"
-                        );
-                        sleep(wait).await;
-                        counter += 1;
                     }
                 }
+
+                let wait = backoff.wait();
+                info!(
+                    seconds = wait.as_secs(),
+                    "sleeping seconds to connect to leader"
+                );
+                sleep(wait).await;
+                counter += 1;
             }
         }
 
@@ -355,22 +364,23 @@ mod inner {
         async fn send_fetch_stream_request(
             &self,
             socket: &mut FluvioSocket,
-        ) -> Result<(), SocketError> {
+        ) -> Result<Option<SpuId>, SocketError> {
             let local_spu_id = self.local_spu_id();
             debug!("sending fetch stream for leader",);
             let fetch_request = FetchStreamRequest {
                 spu_id: local_spu_id,
+                leader_spu_id: self.leader,
                 ..Default::default()
             };
             let mut message = RequestMessage::new_request(fetch_request);
             message
                 .get_mut_header()
-                .set_client_id(format!("peer spu: {}", local_spu_id));
+                .set_client_id(format!("peer spu: {local_spu_id}"));
 
             let response = socket.send(&message).await?;
             trace!(?response, "follower: fetch stream response",);
             debug!("follower: established peer to peer channel to leader",);
-            Ok(())
+            Ok(response.response.spu_id)
         }
 
         async fn sync_all_offsets_to_leader(
@@ -392,7 +402,7 @@ mod inner {
             let local_spu = self.config.id();
             debug!(local_spu, "sending offsets to leader");
             let req_msg = RequestMessage::new_request(offsets)
-                .set_client_id(format!("follower spu: {}", local_spu));
+                .set_client_id(format!("follower spu: {local_spu}"));
 
             sink.send_request(&req_msg).await
         }

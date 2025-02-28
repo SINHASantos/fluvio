@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{SeqCst, Relaxed};
 use std::sync::atomic::AtomicI32;
 use std::time::Duration;
 use std::fmt;
@@ -17,17 +17,17 @@ use async_channel::bounded;
 use async_channel::Receiver;
 use async_channel::Sender;
 use async_lock::Mutex;
-use bytes::{Bytes};
+use bytes::Bytes;
 use event_listener::Event;
-use fluvio_future::net::ConnectionFd;
+use futures_util::ready;
 use futures_util::stream::{Stream, StreamExt};
 use pin_project::{pin_project, pinned_drop};
 use tokio::select;
 use tracing::{info, warn};
 use tracing::{debug, error, trace, instrument};
 
+use fluvio_future::net::ConnectionFd;
 use fluvio_future::timer::sleep;
-use futures_util::ready;
 use fluvio_protocol::api::Request;
 use fluvio_protocol::api::RequestHeader;
 use fluvio_protocol::api::RequestMessage;
@@ -40,7 +40,8 @@ use crate::FluvioStream;
 
 pub type SharedMultiplexerSocket = Arc<MultiplexerSocket>;
 
-type SharedMsg = (Arc<Mutex<Option<Bytes>>>, Arc<Event>);
+#[derive(Clone)]
+struct SharedMsg(Arc<Mutex<Option<Bytes>>>, Arc<Event>);
 
 /// Handle different way to multiplex
 enum SharedSender {
@@ -118,7 +119,7 @@ impl MultiplexerSocket {
 
     /// get next available correlation to use
     fn next_correlation_id(&self) -> i32 {
-        self.correlation_id_counter.fetch_add(1, SeqCst)
+        self.correlation_id_counter.fetch_add(1, Relaxed)
     }
 
     /// create socket to perform request and response
@@ -136,12 +137,12 @@ impl MultiplexerSocket {
             use std::env;
 
             let var_value = env::var("FLV_SOCKET_WAIT").unwrap_or_default();
-            let wait_time: u64 = var_value.parse().unwrap_or(300); // match TCP socket timeout
+            let wait_time: u64 = var_value.parse().unwrap_or(60);
             wait_time
         });
 
         let correlation_id = self.next_correlation_id();
-        let bytes_lock: SharedMsg = (Arc::new(Mutex::new(None)), Arc::new(Event::new()));
+        let bytes_lock = SharedMsg(Arc::new(Mutex::new(None)), Arc::new(Event::new()));
 
         req_msg.header.set_correlation_id(correlation_id);
 
@@ -150,7 +151,7 @@ impl MultiplexerSocket {
         senders.insert(correlation_id, SharedSender::Serial(bytes_lock.clone()));
         drop(senders);
 
-        let (msg, msg_event) = bytes_lock;
+        let SharedMsg(msg, msg_event) = bytes_lock;
         // make sure we set up listener, otherwise dispatcher may notify before
         let listener = msg_event.listen();
 
@@ -207,7 +208,7 @@ impl MultiplexerSocket {
                     },
                     None => Err(IoError::new(
                         ErrorKind::BrokenPipe,
-                        format!("locked failed: {}, serial socket is in bad state",correlation_id)
+                        format!("locked failed: {correlation_id}, serial socket is in bad state")
                     ).into())
                 }
             },
@@ -396,8 +397,8 @@ impl MultiPlexingResponseDispatcher {
 
             select! {
                 frame = frame_stream.next() => {
-                    if let Some(request) = frame {
-                        if let Ok(mut msg) = request {
+                    match frame {
+                        Some(Ok(mut msg)) => {
                             let mut correlation_id: i32 = 0;
                             match correlation_id.decode(&mut msg, 0) {
                                 Ok(_) => {
@@ -410,25 +411,17 @@ impl MultiPlexingResponseDispatcher {
                                 }
                                 Err(err) => error!("error decoding response, {}", err),
                             }
-                        } else {
-                            info!("problem getting frame from stream. terminating");
+                        },
+                        Some(Err(err)) => {
+                            warn!("problem getting frame from stream: {err}. terminating");
+                            self.close().await;
+                            break;
+                        },
+                        None => {
+                            info!("inner stream has terminated ");
+                            self.close().await;
                             break;
                         }
-                    } else {
-                        info!("inner stream has terminated ");
-                        self.stale.store(true, SeqCst);
-
-                        let guard = self.senders.lock().await;
-                        for sender in guard.values() {
-                            match sender {
-                                SharedSender::Serial(_) => {},
-                                SharedSender::Queue(stream_sender) => {
-                                    let _ = stream_sender.send(None).await;
-                                }
-                            }
-                        }
-
-                        break;
                     }
                 },
 
@@ -438,7 +431,7 @@ impl MultiPlexingResponseDispatcher {
                     let guard = self.senders.lock().await;
                     for sender in guard.values() {
                         match sender {
-                            SharedSender::Serial(_) => {},
+                            SharedSender::Serial(msg) => msg.close().await,
                             SharedSender::Queue(stream_sender) => {
                                 stream_sender.close();
                             }
@@ -473,8 +466,7 @@ impl MultiPlexingResponseDispatcher {
                         None => Err(IoError::new(
                             ErrorKind::BrokenPipe,
                             format!(
-                                "failed locking, abandoning sending to socket: {}",
-                                correlation_id
+                                "failed locking, abandoning sending to socket: {correlation_id}"
                             ),
                         )
                         .into()),
@@ -491,8 +483,7 @@ impl MultiPlexingResponseDispatcher {
                             IoError::new(
                                 ErrorKind::BrokenPipe,
                                 format!(
-                                    "problem sending to queue socket: {}, err: {}",
-                                    correlation_id, err
+                                    "problem sending to queue socket: {correlation_id}, err: {err}"
                                 ),
                             )
                             .into()
@@ -509,12 +500,38 @@ impl MultiPlexingResponseDispatcher {
             Ok(())
         }
     }
+
+    async fn close(&self) {
+        self.stale.store(true, SeqCst);
+
+        let guard = self.senders.lock().await;
+        for sender in guard.values() {
+            match sender {
+                SharedSender::Serial(msg) => msg.close().await,
+                SharedSender::Queue(stream_sender) => {
+                    let _ = stream_sender.send(None).await;
+                }
+            }
+        }
+
+        info!("multiplexer closed")
+    }
+}
+
+impl SharedMsg {
+    async fn close(&self) {
+        let mut guard = self.0.lock().await;
+        *guard = None;
+        drop(guard);
+        self.1.notify(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
     use std::time::Duration;
+    use std::io::ErrorKind;
 
     use async_trait::async_trait;
     use futures_util::future::{join, join3};
@@ -529,6 +546,7 @@ mod tests {
     use fluvio_protocol::api::RequestMessage;
 
     use super::MultiplexerSocket;
+    use super::SocketError;
     use crate::test_request::*;
     use crate::ExclusiveFlvSink;
     use crate::FluvioSocket;
@@ -543,6 +561,9 @@ mod tests {
     const X509_CLIENT: &str = "certs/certs/client.crt";
     #[allow(unused)]
     const X509_CLIENT_KEY: &str = "certs/certs/client.key";
+
+    #[allow(unused)]
+    const SLEEP_MS: u64 = 10;
 
     #[async_trait]
     trait AcceptorHandler {
@@ -562,7 +583,21 @@ mod tests {
         }
     }
 
-    async fn test_server<A: AcceptorHandler + 'static>(addr: &str, mut handler: A) {
+    fn get_error_kind<T: std::fmt::Debug>(
+        result: Result<T, SocketError>,
+    ) -> Option<std::io::ErrorKind> {
+        match result {
+            Err(SocketError::Io { source, .. }) => Some(source.kind()),
+            _ => None,
+        }
+    }
+
+    async fn test_server<A: AcceptorHandler + 'static>(
+        addr: &str,
+        mut handler: A,
+        nb_iter: usize,
+        timeout: u64,
+    ) {
         let listener = TcpListener::bind(addr).await.expect("binding");
         debug!("server is running");
         let mut incoming = listener.incoming();
@@ -577,7 +612,7 @@ mod tests {
 
         let mut api_stream = stream.api_stream::<TestApiRequest, TestKafkaApiEnum>();
 
-        for i in 0..4u16 {
+        for i in 0..nb_iter {
             debug!("server: waiting for next msg: {}", i);
             let msg = api_stream.next().await.expect("msg").expect("unwrap");
             debug!("server: msg received: {:#?}", msg);
@@ -589,7 +624,8 @@ mod tests {
                     if echo_request.request().msg == "slow" {
                         debug!("server: received slow msg");
                         spawn(async move {
-                            sleep(Duration::from_millis(500)).await;
+                            sleep(Duration::from_millis(SLEEP_MS * 50)).await;
+                            sleep(Duration::from_secs(timeout)).await; //simulate more waiting time from server while receiving slow msg
                             let resp =
                                 echo_request.new_response(EchoResponse::new("slow".to_owned()));
                             debug!("server send slow response");
@@ -615,7 +651,7 @@ mod tests {
                     debug!("server: received async status msg");
                     let mut reply_sink = shared_sink.clone();
                     spawn(async move {
-                        sleep(Duration::from_millis(30)).await;
+                        sleep(Duration::from_millis(SLEEP_MS * 3)).await;
                         let resp = status_request.new_response(AsyncStatusResponse {
                             status: status_request.request.count * 2,
                         });
@@ -624,7 +660,7 @@ mod tests {
                             .await
                             .expect("send succeed");
                         debug!("server: send back status first");
-                        sleep(Duration::from_millis(100)).await;
+                        sleep(Duration::from_millis(SLEEP_MS * 10)).await;
                         let resp = status_request.new_response(AsyncStatusResponse {
                             status: status_request.request.count * 4,
                         });
@@ -660,12 +696,12 @@ mod tests {
     async fn test_client<C: ConnectorHandler + 'static>(addr: &str, mut handler: C) {
         use std::time::SystemTime;
 
-        sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
         debug!("client: trying to connect");
         let tcp_stream = TcpStream::connect(&addr).await.expect("connection fail");
         let socket = handler.connect(tcp_stream).await;
         debug!("client: connected to test server and waiting...");
-        sleep(Duration::from_millis(20)).await;
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
         let multiplexer = MultiplexerSocket::shared(socket);
 
         // create async status
@@ -693,7 +729,7 @@ mod tests {
             },
             async move {
                 // this message will be send later than slow but since there is no delay, it should get earlier than first
-                sleep(Duration::from_millis(20)).await;
+                sleep(Duration::from_millis(SLEEP_MS * 2)).await;
                 debug!("trying to send fast");
                 let request = RequestMessage::new_request(EchoRequest::new("fast".to_owned()));
                 let response = multiplexor2
@@ -705,7 +741,7 @@ mod tests {
                 SystemTime::now()
             },
             async move {
-                sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(SLEEP_MS * 10)).await;
                 let response = status_response
                     .next()
                     .await
@@ -739,6 +775,76 @@ mod tests {
         assert_eq!(response.msg, "hello");
     }
 
+    async fn test_client_closed_socket<C: ConnectorHandler + 'static>(addr: &str, mut handler: C) {
+        use std::time::SystemTime;
+
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
+        debug!("client: trying to connect");
+        let tcp_stream = TcpStream::connect(&addr).await.expect("connection fail");
+        let socket = handler.connect(tcp_stream).await;
+        debug!("client: connected to test server and waiting...");
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
+        let multiplexer: std::sync::Arc<MultiplexerSocket> = MultiplexerSocket::shared(socket);
+
+        let multiplexor2 = multiplexer.clone();
+
+        let (slow, fast) = join(
+            async move {
+                debug!("trying to send slow");
+                // this message was send first but since there is delay of 500ms, it will return slower than fast
+                let request = RequestMessage::new_request(EchoRequest::new("slow".to_owned()));
+                let response = multiplexer.send_and_receive(request).await;
+                assert!(response.is_err());
+
+                let err_kind = get_error_kind(response).expect("Get right Error Kind");
+                let expected = ErrorKind::UnexpectedEof;
+                assert_eq!(expected, err_kind);
+                debug!("client: socket was closed");
+
+                SystemTime::now()
+            },
+            async move {
+                // this message will be send later than slow but since there is no delay, it should get earlier than first
+                sleep(Duration::from_millis(SLEEP_MS * 2)).await;
+                debug!("trying to send fast");
+                let request = RequestMessage::new_request(EchoRequest::new("fast".to_owned()));
+                let response = multiplexor2
+                    .send_and_receive(request)
+                    .await
+                    .expect("send success");
+                debug!("received fast response");
+                assert_eq!(response.msg, "hello");
+                multiplexor2.terminate.notify(usize::MAX); //close multiplexor2
+                SystemTime::now()
+            },
+        )
+        .await;
+        assert!(slow > fast);
+    }
+
+    async fn test_client_time_out<C: ConnectorHandler + 'static>(addr: &str, mut handler: C) {
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
+        debug!("client: trying to connect");
+        let tcp_stream = TcpStream::connect(&addr).await.expect("connection fail");
+        let socket = handler.connect(tcp_stream).await;
+        debug!("client: connected to test server and waiting...");
+        sleep(Duration::from_millis(SLEEP_MS * 2)).await;
+        let multiplexer: std::sync::Arc<MultiplexerSocket> = MultiplexerSocket::shared(socket);
+
+        let expected: ErrorKind = ErrorKind::TimedOut;
+
+        debug!("trying to send slow");
+
+        let request = RequestMessage::new_request(EchoRequest::new("slow".to_owned()));
+        let response = multiplexer.send_and_receive(request).await;
+        assert!(response.is_err());
+
+        let err_kind = get_error_kind(response).expect("Get right Error Kind");
+
+        assert_eq!(expected, err_kind);
+        debug!("client: socket was timeout");
+    }
+
     #[fluvio_future::test(ignore)]
     async fn test_multiplexing() {
         debug!("start testing");
@@ -746,11 +852,34 @@ mod tests {
 
         let _r = join(
             test_client(addr, TcpStreamHandler {}),
-            test_server(addr, TcpStreamHandler {}),
+            test_server(addr, TcpStreamHandler {}, 4, 0),
         )
         .await;
     }
 
+    #[fluvio_future::test(ignore)]
+    async fn test_multiplexing_close_socket() {
+        debug!("start test_multiplexing_close_socket");
+        let addr = "127.0.0.1:6000";
+
+        let _r = join(
+            test_client_closed_socket(addr, TcpStreamHandler {}),
+            test_server(addr, TcpStreamHandler {}, 2, 0),
+        )
+        .await;
+    }
+
+    #[fluvio_future::test(ignore)]
+    async fn test_multiplexing_time_out() {
+        debug!("start test_multiplexing_timeout");
+        let addr = "127.0.0.1:6000";
+
+        let _r = join(
+            test_client_time_out(addr, TcpStreamHandler {}),
+            test_server(addr, TcpStreamHandler {}, 1, 60), //MAX_WAIT_TIME is 60 second
+        )
+        .await;
+    }
     #[cfg(unix)]
     mod tls_test {
         use std::os::unix::io::AsRawFd;
@@ -840,7 +969,7 @@ mod tests {
 
             let _r = join(
                 test_client(addr, TlsConnectorHandler::new()),
-                test_server(addr, TlsAcceptorHandler::new()),
+                test_server(addr, TlsAcceptorHandler::new(), 4, 0),
             )
             .await;
         }

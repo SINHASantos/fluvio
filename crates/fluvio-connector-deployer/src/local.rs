@@ -1,33 +1,66 @@
+use std::fs::canonicalize;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
-use anyhow::{Result, anyhow};
-use tempfile::NamedTempFile;
+use anyhow::{Context, Result};
+use clap::ValueEnum;
+use enum_display::EnumDisplay;
+use tracing::debug;
+
 use crate::Deployment;
 
-pub(crate) fn deploy_local(deployment: &Deployment) -> Result<()> {
-    let (_, config_path) = NamedTempFile::new()?.keep()?;
-    deployment.config.write_to_file(&config_path)?;
+#[derive(ValueEnum, Debug, Clone, PartialEq, Eq, Default, EnumDisplay)]
+#[clap(rename_all = "kebab-case")]
+#[enum_display(case = "Kebab")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
 
-    let mut log_path = std::env::current_dir()?;
-    log_path.push(&deployment.config.name);
-    log_path.set_extension("log");
-    let log_file = std::fs::File::create(log_path.as_path())?;
+pub(crate) fn deploy_local<P: AsRef<Path>>(
+    deployment: &Deployment,
+    output_file: Option<P>,
+    name: &str,
+) -> Result<u32> {
+    let (stdout, stderr, wait) = if let Some(log_path) = output_file {
+        println!("Log file: {}", log_path.as_ref().to_string_lossy());
+        let log_file = std::fs::File::create(log_path)?;
+        (log_file.try_clone()?.into(), log_file.into(), false)
+    } else {
+        (Stdio::inherit(), Stdio::inherit(), true)
+    };
 
-    let mut cmd = Command::new(&deployment.executable);
+    let executable = canonicalize(&deployment.executable).context(format!(
+        "Executable file path ({}) is invalid or file does not exist",
+        deployment.executable.to_string_lossy()
+    ))?;
+    debug!("running executable: {}", &executable.to_string_lossy());
+    let mut cmd = Command::new(executable);
+
+    cmd.env("RUST_LOG", deployment.log_level.to_string());
     cmd.stdin(Stdio::null());
-    cmd.stdout(log_file.try_clone()?);
-    cmd.stderr(log_file);
+    cmd.stdout(stdout);
+    cmd.stderr(stderr);
     cmd.arg("--config");
     cmd.arg(
-        config_path
-            .to_str()
-            .ok_or_else(|| anyhow!("illegal path of temp config file"))?,
+        canonicalize(&deployment.config)
+            .context("Config file path is invalid or file does not exist")?,
     );
-    let child = cmd.spawn()?;
-    println!(
-        "Connector runs with process id: {}. Log file: {}",
-        child.id(),
-        log_path.to_string_lossy()
-    );
-    Ok(())
+    if let Some(secrets) = &deployment.secrets {
+        cmd.arg("--secrets");
+        cmd.arg(
+            canonicalize(secrets).context("Secrets file path is invalid or file does not exist")?,
+        );
+    }
+    let mut child = cmd.spawn()?;
+    println!("Connector runs with process id: {}", child.id());
+    println!("Started connector `{}`", name);
+    if wait {
+        child.wait()?;
+    }
+    Ok(child.id())
 }

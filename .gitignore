@@ -9,3 +9,7 @@ VERSION
 .env
 .vscode/
 vendor/
+*.tmp
+
+# Test Connectors Logs
+connector/**/*.log

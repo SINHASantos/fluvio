@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, trace, error, instrument, info};
+use anyhow::Result;
 
 use fluvio_protocol::link::ErrorCode;
 use fluvio_protocol::record::Size64;
@@ -15,7 +16,6 @@ use fluvio_future::file_slice::AsyncFileSlice;
 
 use crate::config::SharedReplicaConfig;
 use crate::segment::ReadSegment;
-use crate::StorageError;
 use crate::util::log_path_get_offset;
 
 const MEM_ORDER: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
@@ -39,7 +39,7 @@ impl SharedSegments {
 
     pub async fn from_dir(
         option: Arc<SharedReplicaConfig>,
-    ) -> Result<(Arc<SharedSegments>, Option<Offset>), StorageError> {
+    ) -> Result<(Arc<SharedSegments>, Option<Offset>)> {
         let dirs = option.base_dir.read_dir()?;
         debug!("reading segments at: {:#?}", dirs);
         let files: Vec<_> = dirs.filter_map(|entry| entry.ok()).collect();
@@ -124,22 +124,18 @@ impl SharedSegments {
         &self,
         start_offset: Offset,
         max_offset: Option<Offset>,
-    ) -> Result<AsyncFileSlice, ErrorCode> {
+    ) -> Result<Option<AsyncFileSlice>, ErrorCode> {
         let reader = self.read().await;
         if let Some((_offset, segment)) = reader.find_segment(start_offset) {
             if let Some(slice) = segment.records_slice(start_offset, max_offset).await? {
-                Ok(slice)
+                Ok(Some(slice))
             } else {
                 Err(ErrorCode::Other(format!(
-                    "slice not found in start_offset: {}, segment: {:#?} ",
-                    start_offset, segment
+                    "slice not found in start_offset: {start_offset}, segment: {segment:#?} "
                 )))
             }
         } else {
-            Err(ErrorCode::Other(format!(
-                "Segment not found for start_offset: {}",
-                start_offset
-            )))
+            Ok(None)
         }
     }
 
@@ -225,6 +221,7 @@ impl SegmentList {
     }
 
     #[cfg(test)]
+    #[cfg(feature = "fixture")]
     pub fn get_segment(&self, offset: Offset) -> Option<&ReadSegment> {
         self.segments.get(&offset)
     }
@@ -274,11 +271,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use anyhow::Result;
+
     use flv_util::fixture::ensure_new_dir;
     use fluvio_protocol::fixture::create_batch;
     use fluvio_protocol::record::Offset;
 
-    use crate::StorageError;
     use crate::config::SharedReplicaConfig;
     use crate::segment::MutableSegment;
     use crate::segment::ReadSegment;
@@ -291,7 +289,7 @@ mod tests {
         option: Arc<SharedReplicaConfig>,
         start: Offset,
         end_offset: Offset,
-    ) -> Result<ReadSegment, StorageError> {
+    ) -> Result<ReadSegment> {
         let mut mut_segment = MutableSegment::create(start, option).await?;
         mut_segment.append_batch(&mut create_batch()).await?;
         mut_segment.set_end_offset(end_offset); // only used for testing
@@ -331,7 +329,7 @@ mod tests {
         let option = default_option(rep_dir).shared();
 
         list.add_segment(create_segment(option, 0, 500).await.expect("create"));
-        println!("segments: {:#?}", list);
+        println!("segments: {list:#?}");
         assert_eq!(list.min_offset, 0);
         assert_eq!(list.max_offset, 500);
         assert!(list.find_segment(-1).is_none());
@@ -351,7 +349,7 @@ mod tests {
         let option = default_option(rep_dir).shared();
 
         list.add_segment(create_segment(option, 100, 500).await.expect("create"));
-        println!("segments: {:#?}", list);
+        println!("segments: {list:#?}");
 
         assert!(list.find_segment(50).is_none());
         assert!(list.find_segment(99).is_none());
@@ -389,7 +387,7 @@ mod tests {
                 .expect("create"),
         );
 
-        println!("segments: {:#?}", list);
+        println!("segments: {list:#?}");
 
         assert_eq!(list.min_offset, 0);
         assert_eq!(list.max_offset, 4000);
@@ -429,7 +427,7 @@ mod tests {
                 .expect("create"),
         );
 
-        println!("segments: {:#?}", list);
+        println!("segments: {list:#?}");
 
         assert_eq!(list.min_offset, 100);
         assert_eq!(list.max_offset, 9000);

@@ -23,7 +23,13 @@ pub trait Partitioner {
 }
 
 pub struct PartitionerConfig {
-    pub(crate) partition_count: PartitionCount,
+    pub partition_count: PartitionCount,
+}
+
+impl PartitionerConfig {
+    pub fn partition_count(&self) -> PartitionCount {
+        self.partition_count
+    }
 }
 
 /// A [`Partitioner`] which combines hashing and round-robin partition assignment
@@ -50,7 +56,7 @@ impl Partitioner for SiphashRoundRobinPartitioner {
         _value: &[u8],
     ) -> PartitionId {
         match maybe_key {
-            Some(key) => partition_siphash(key, config.partition_count),
+            Some(key) => partition_siphash(key, config.partition_count()),
             None => {
                 // Atomic increment. This will wrap on overflow, which is fine
                 // because we are only interested in the modulus anyway
@@ -72,6 +78,28 @@ fn partition_siphash(key: &[u8], partition_count: PartitionCount) -> PartitionId
     match PartitionId::try_from(partition_id) {
         Ok(partition_id) => partition_id,
         Err(_) => panic!("partition_siphash failed for partition_count={partition_count} "),
+    }
+}
+
+/// A [`Partitioner`] which assigns all records to a specific partition
+pub(crate) struct SpecificPartitioner {
+    partition_id: PartitionId,
+}
+
+impl SpecificPartitioner {
+    pub fn new(partition_id: PartitionId) -> Self {
+        Self { partition_id }
+    }
+}
+
+impl Partitioner for SpecificPartitioner {
+    fn partition(
+        &self,
+        _config: &PartitionerConfig,
+        _maybe_key: Option<&[u8]>,
+        _value: &[u8],
+    ) -> PartitionId {
+        self.partition_id
     }
 }
 

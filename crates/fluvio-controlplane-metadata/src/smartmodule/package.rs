@@ -29,18 +29,33 @@ impl SmartModuleMetadata {
         use std::fs::read_to_string;
 
         let path_ref = path.as_ref();
-        let file_str: String = read_to_string(path_ref)?;
-        let metadata = toml::from_str(&file_str)?;
+        let file_str: String = read_to_string(path_ref).map_err(|err| {
+            let dpath = path_ref.display();
+            IoError::new(
+                err.kind(),
+                format!("reading smartmodule metadata file {dpath}, {err}"),
+            )
+        })?;
+        let metadata = toml::from_str(&file_str).map_err(|err| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid toml: {err}"),
+            )
+        })?;
         Ok(metadata)
     }
 
     #[cfg(feature = "smartmodule")]
     /// parse the metadata bytes and return the metadata
     pub fn from_bytes(bytedata: &[u8]) -> std::io::Result<Self> {
-        use std::io::ErrorKind;
         let strdata = std::str::from_utf8(bytedata)
-            .map_err(|_| IoError::new(ErrorKind::InvalidData, "Smartmodule toml"))?;
-        let metadata = toml::from_str(strdata)?;
+            .map_err(|_| IoError::new(std::io::ErrorKind::InvalidData, "cant convert to utf8"))?;
+        let metadata = toml::from_str(strdata).map_err(|err| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid toml: {err}"),
+            )
+        })?;
         Ok(metadata)
     }
 
@@ -116,7 +131,9 @@ pub enum SmartModuleKeyError {
 )]
 pub enum SmartModuleVisibility {
     #[default]
+    #[fluvio(tag = 0)]
     Private,
+    #[fluvio(tag = 1)]
     Public,
 }
 
@@ -193,13 +210,13 @@ impl SmartModulePackageKey {
     /// return key for storing SmartModule in the store
     pub fn store_id(&self) -> String {
         let group_id = if let Some(package) = &self.group {
-            format!("-{}", package)
+            format!("-{package}")
         } else {
             "".to_owned()
         };
 
         let version_id = if let Some(version) = &self.version {
-            format!("-{}", version)
+            format!("-{version}")
         } else {
             "".to_owned()
         };
@@ -271,7 +288,7 @@ impl std::fmt::Display for SmartModuleVisibility {
             Self::Private => "private",
             Self::Public => "public",
         };
-        write!(f, "{}", lbl)
+        write!(f, "{lbl}")
     }
 }
 
@@ -289,7 +306,6 @@ impl std::convert::TryFrom<&str> for SmartModuleVisibility {
 
 /// Convert from name into something that can be used as key in the store
 /// For now, we respect
-
 #[cfg(test)]
 mod package_test {
     use crate::smartmodule::SmartModulePackageKey;
@@ -480,7 +496,7 @@ mod test {
         };
 
         let toml = toml::to_string(&metadata).expect("toml");
-        println!("{}", toml);
+        println!("{toml}");
         assert!(toml.contains("param1"));
     }
 

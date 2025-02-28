@@ -1,14 +1,17 @@
+mod hex_dump;
+
+pub mod time;
+
 use clap::Parser;
 
-mod hex_dump;
 pub use self::hex_dump::*;
 
 use crate::output::OutputType;
 
-#[derive(Debug, Parser, Default)]
+#[derive(Debug, Parser, Default, Clone)]
 pub struct OutputFormat {
     /// Output
-    #[clap(
+    #[arg(
         default_value_t,
         short = 'O',
         long = "output",

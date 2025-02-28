@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 
 use tracing::trace;
 
@@ -22,16 +22,29 @@ where
     pub ctx: MetadataContext<C>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataStoreList<S, C>
+where
+    S: Spec,
+    C: MetadataItem,
+{
+    pub version: String,
+    pub items: Vec<MetadataStoreObject<S, C>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NameSpace {
+    All,
+    Named(String),
+}
+
 impl<S, C> MetadataStoreObject<S, C>
 where
     S: Spec,
     C: MetadataItem,
     S::Status: Default,
 {
-    pub fn new<J>(key: J, spec: S, status: S::Status) -> Self
-    where
-        J: Into<S::IndexKey>,
-    {
+    pub fn new(key: impl Into<S::IndexKey>, spec: S, status: S::Status) -> Self {
         Self {
             key: key.into(),
             spec,
@@ -40,10 +53,7 @@ where
         }
     }
 
-    pub fn new_with_context<J>(key: J, spec: S, ctx: MetadataContext<C>) -> Self
-    where
-        J: Into<S::IndexKey>,
-    {
+    pub fn new_with_context(key: impl Into<S::IndexKey>, spec: S, ctx: MetadataContext<C>) -> Self {
         Self {
             key: key.into(),
             spec,
@@ -52,18 +62,14 @@ where
         }
     }
 
-    pub fn with_spec<J>(key: J, spec: S) -> Self
+    pub fn with_spec(key: impl Into<S::IndexKey>, spec: S) -> Self
     where
-        J: Into<S::IndexKey>,
         C: Default,
     {
         Self::new(key.into(), spec, S::Status::default())
     }
 
-    pub fn with_key<J>(key: J) -> Self
-    where
-        J: Into<S::IndexKey>,
-    {
+    pub fn with_key(key: impl Into<S::IndexKey>) -> Self {
         Self::with_spec(key.into(), S::default())
     }
 
@@ -123,7 +129,7 @@ where
 
     /// check if metadata is owned by other
     pub fn is_owned(&self, uid: &C::UId) -> bool {
-        match self.ctx().owner() {
+        match self.ctx().item().owner() {
             Some(parent) => parent.uid() == uid,
             None => false,
         }
@@ -188,5 +194,32 @@ where
 {
     fn from(it: MetadataStoreObject<S, C>) -> Self {
         (it.key, it.spec, it.status)
+    }
+}
+
+impl NameSpace {
+    pub fn as_str(&self) -> &str {
+        match self {
+            NameSpace::All => "all",
+            NameSpace::Named(s) => s.as_str(),
+        }
+    }
+}
+
+impl Display for NameSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<String> for NameSpace {
+    fn from(namespace: String) -> Self {
+        NameSpace::Named(namespace)
+    }
+}
+
+impl From<&str> for NameSpace {
+    fn from(namespace: &str) -> Self {
+        NameSpace::Named(namespace.to_owned())
     }
 }

@@ -1,11 +1,12 @@
 //use fluvio::consumer::{PartitionSelectionStrategy, ConsumerConfig};
-use fluvio::consumer::PartitionSelectionStrategy;
+
+use fluvio::dataplane::link::ErrorCode;
 use tracing::debug;
+use anyhow::Result;
 
-use fluvio::{Fluvio, FluvioError};
-
+use fluvio::consumer::{ConsumerConfigExt, ConsumerConfigExtBuilder, ConsumerStream, Record};
+use fluvio::{TopicProducerPool, Fluvio, Offset, RecordKey};
 use fluvio::metadata::topic::TopicSpec;
-use fluvio::{TopicProducer, RecordKey, PartitionConsumer, MultiplePartitionConsumer};
 use fluvio::TopicProducerConfig;
 use fluvio::metadata::topic::CleanupPolicy;
 use fluvio::metadata::topic::SegmentBasedPolicy;
@@ -45,7 +46,7 @@ impl TestDriver {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<(), FluvioError> {
+    pub async fn connect(&mut self) -> Result<()> {
         let client = self.create_client().await?;
 
         self.client = Some(client);
@@ -76,7 +77,7 @@ impl TestDriver {
         &self,
         topic: &str,
         config: TopicProducerConfig,
-    ) -> TopicProducer {
+    ) -> TopicProducerPool {
         debug!(topic, "creating producer");
         let fluvio_client = self.create_client().await.expect("cant' create client");
         match fluvio_client
@@ -88,13 +89,13 @@ impl TestDriver {
                 client
             }
             Err(err) => {
-                panic!("could not create producer: {:#?}", err);
+                panic!("could not create producer: {err:#?}");
             }
         }
     }
 
     // Wrapper to getting a producer. We keep track of the number of producers we create
-    pub async fn create_producer(&self, topic: &str) -> TopicProducer {
+    pub async fn create_producer(&self, topic: &str) -> TopicProducerPool {
         self.create_producer_with_config(topic, Default::default())
             .await
     }
@@ -102,10 +103,10 @@ impl TestDriver {
     // Wrapper to producer send. We measure the latency and accumulation of message payloads sent.
     pub async fn send_count(
         &self,
-        p: &TopicProducer,
+        p: &TopicProducerPool,
         key: RecordKey,
         message: Vec<u8>,
-    ) -> Result<(), FluvioError> {
+    ) -> Result<()> {
         use std::time::SystemTime;
         let now = SystemTime::now();
 
@@ -129,37 +130,35 @@ impl TestDriver {
         Ok(())
     }
 
-    pub async fn get_consumer(&self, topic: &str, partition: PartitionId) -> PartitionConsumer {
+    pub async fn get_consumer_with_config(
+        &self,
+        config: ConsumerConfigExt,
+    ) -> impl ConsumerStream<Item = Result<Record, ErrorCode>> {
         let fluvio_client = self.create_client().await.expect("cant' create client");
-        match fluvio_client
-            .partition_consumer(topic.to_string(), partition)
-            .await
-        {
+        match fluvio_client.consumer_with_config(config).await {
             Ok(client) => {
                 //self.consumer_num += 1;
                 client
             }
             Err(err) => {
-                panic!("can't create consumer: {:#?}", err);
+                panic!("can't create consumer: {err:#?}");
             }
         }
     }
 
-    // TODO: Create a multi-partition api w/ a list of partitions based off this
-    pub async fn get_all_partitions_consumer(&self, topic: &str) -> MultiplePartitionConsumer {
-        let fluvio_client = self.create_client().await.expect("cant' create client");
-        match fluvio_client
-            .consumer(PartitionSelectionStrategy::All(topic.to_string()))
-            .await
-        {
-            Ok(client) => {
-                //self.consumer_num += 1;
-                client
-            }
-            Err(err) => {
-                panic!("can't create consumer: {:#?}", err);
-            }
-        }
+    pub async fn get_consumer_with_start(
+        &self,
+        topic: &str,
+        partition: PartitionId,
+        offset_start: Offset,
+    ) -> impl ConsumerStream<Item = Result<Record, ErrorCode>> {
+        let config = ConsumerConfigExtBuilder::default()
+            .topic(topic)
+            .partition(partition)
+            .offset_start(offset_start)
+            .build()
+            .expect("config");
+        self.get_consumer_with_config(config).await
     }
 
     // Re-enable when we re-enable metrics
@@ -233,13 +232,13 @@ impl TestDriver {
             let _topic_time = now.elapsed().unwrap().as_nanos();
 
             if topic_create.is_ok() {
-                println!("topic \"{}\" created", topic_name);
+                println!("topic \"{topic_name}\" created");
                 //self.topic_create_latency_histogram
                 //    .record(topic_time as u64)
                 //    .unwrap();
                 //self.topic_num += 1;
             } else {
-                println!("topic \"{}\" already exists", topic_name);
+                println!("topic \"{topic_name}\" already exists");
             }
         }
 
@@ -250,7 +249,7 @@ impl TestDriver {
         // if `min_spu` undefined, min 1
         if let Some(min_spu) = test_reqs.min_spu {
             if min_spu > test_case.environment.spu() {
-                println!("Test requires {} spu", min_spu);
+                println!("Test requires {min_spu} spu");
                 return false;
             }
         }
@@ -260,7 +259,7 @@ impl TestDriver {
         // if `cluster_type = k8`, then environment must be k8 or skip
         if let Some(cluster_type) = &test_reqs.cluster_type {
             if &test_case.environment.cluster_type() != cluster_type {
-                println!("Test requires cluster type {:?} ", cluster_type);
+                println!("Test requires cluster type {cluster_type:?} ");
                 return false;
             }
         }
@@ -269,7 +268,7 @@ impl TestDriver {
     }
 
     /// create new fluvio client
-    async fn create_client(&self) -> Result<Fluvio, FluvioError> {
+    async fn create_client(&self) -> Result<Fluvio> {
         Fluvio::connect().await
     }
 }

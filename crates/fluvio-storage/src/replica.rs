@@ -1,13 +1,14 @@
 use std::cmp::min;
-use std::mem;
+use std::{fmt, mem};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fluvio_future::file_slice::AsyncFileSlice;
-use fluvio_protocol::Encoder;
 use tracing::{debug, trace, warn, instrument, info};
 use async_trait::async_trait;
+use anyhow::Result;
 
+use fluvio_future::file_slice::AsyncFileSlice;
+use fluvio_protocol::Encoder;
 use fluvio_future::fs::{create_dir_all, remove_dir_all};
 use fluvio_protocol::link::ErrorCode;
 use fluvio_spu_schema::Isolation;
@@ -15,6 +16,7 @@ use fluvio_protocol::record::{Offset, ReplicaKey, Size, Size64};
 use fluvio_protocol::record::{Batch, BatchRecords};
 use fluvio_protocol::record::RecordSet;
 
+use crate::checkpoint::HW_CHECKPOINT_FILE_NAME;
 use crate::{OffsetInfo, checkpoint::CheckPoint};
 use crate::segments::SharedSegments;
 use crate::segment::MutableSegment;
@@ -35,9 +37,12 @@ pub struct FileReplica {
     option: Arc<SharedReplicaConfig>,
     active_segment: MutableSegment,
     prev_segments: Arc<SharedSegments>,
-    commit_checkpoint: CheckPoint<Offset>,
+    commit_checkpoint: CheckPoint,
     cleaner: Arc<Cleaner>,
     size: Arc<ReplicaSize>,
+    append_failure: bool, // if this is true, last append failed, should not append again
+    max_request_size: usize,
+    max_segment_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -55,14 +60,14 @@ impl ReplicaStorage for FileReplica {
     async fn create_or_load(
         replica: &ReplicaKey,
         replica_config: Self::ReplicaConfig,
-    ) -> Result<Self, StorageError> {
-        let storage_config = StorageConfig::builder().build().map_err(|err| {
-            StorageError::Other(format!("failed to build cleaner config: {}", err))
-        })?;
+    ) -> Result<Self> {
+        let storage_config = StorageConfig::builder()
+            .build()
+            .map_err(|err| StorageError::Other(format!("failed to build cleaner config: {err}")))?;
 
-        Self::create_or_load(
+        Self::create_or_load_inner(
             replica.topic.clone(),
-            replica.partition as u32,
+            replica.partition,
             0,
             replica_config,
             Arc::new(storage_config),
@@ -72,7 +77,7 @@ impl ReplicaStorage for FileReplica {
 
     #[inline(always)]
     fn get_hw(&self) -> Offset {
-        *self.commit_checkpoint.get_offset()
+        self.commit_checkpoint.get_offset()
     }
 
     /// offset mark that beginning of uncommitted
@@ -130,15 +135,21 @@ impl ReplicaStorage for FileReplica {
         &mut self,
         records: &mut RecordSet<R>,
         update_highwatermark: bool,
-    ) -> Result<usize, StorageError> {
-        let max_batch_size = self.option.max_batch_size.get() as usize;
+    ) -> Result<usize> {
         let mut total_size = 0;
         // check if any of the records's batch exceed max length
         for batch in &records.batches {
             let batch_size = batch.write_size(0);
+            if batch_size > self.max_segment_size {
+                return Err(StorageError::BatchExceededSegment {
+                    batch_size: batch_size.try_into()?,
+                    max_segment_size: self.max_segment_size.try_into()?,
+                }
+                .into());
+            }
             total_size += batch_size;
-            if batch_size > max_batch_size {
-                return Err(StorageError::BatchTooBig(max_batch_size));
+            if batch_size > self.max_request_size {
+                return Err(StorageError::BatchTooBig(self.max_request_size).into());
             }
         }
 
@@ -169,7 +180,7 @@ impl ReplicaStorage for FileReplica {
                 old_offset,
                 offset
             );
-            self.commit_checkpoint.write(offset).await?;
+            self.commit_checkpoint.write(offset);
             Ok(true)
         }
     }
@@ -202,23 +213,22 @@ impl FileReplica {
     /// If there is existing directory then it will load existing logs.
     /// The logs will be validated to ensure it's safe to use it.
     /// It is possible logs can't be used because they may be corrupted.
-    #[instrument(skip(topic, partition, base_offset, replica_config, storage_config))]
-    pub async fn create_or_load<S>(
+    #[instrument(skip(replica_config, storage_config))]
+    pub async fn create_or_load_inner<S>(
         topic: S,
         partition: Size,
         base_offset: Offset,
         replica_config: ReplicaConfig,
         storage_config: Arc<StorageConfig>,
-    ) -> Result<FileReplica, StorageError>
+    ) -> Result<FileReplica>
     where
-        S: AsRef<str> + Send + 'static,
+        S: AsRef<str> + Send + 'static + fmt::Debug,
     {
         let replica_dir = replica_config
             .base_dir
             .join(replica_dir_name(topic, partition));
 
-        info!("creating rep dir: {}", replica_dir.display());
-        debug!("replica config: {:?}", replica_config);
+        info!(replica_dir = %replica_dir.display(),  "creating");
         create_dir_all(&replica_dir).await?; // ensure dir_name exits
 
         let mut rep_option = replica_config.clone();
@@ -229,10 +239,10 @@ impl FileReplica {
         let (segments, last_offset_res) = SharedSegments::from_dir(shared_config.clone()).await?;
 
         let active_segment = if let Some(last_offset) = last_offset_res {
-            debug!(last_offset, "last segment found, validating offsets");
+            info!(last_offset, "last segment found, validating offsets");
             let mut last_segment =
                 MutableSegment::open_for_write(last_offset, shared_config.clone()).await?;
-            last_segment.validate(false, false).await?;
+            last_segment.validate_and_repair().await?;
             info!(
                 end_offset = last_segment.get_end_offset(),
                 "existing segment validated with last offset",
@@ -245,16 +255,36 @@ impl FileReplica {
 
         let last_base_offset = active_segment.get_base_offset();
 
-        let commit_checkpoint: CheckPoint<Offset> =
-            CheckPoint::create(shared_config.clone(), "replication.chk", last_base_offset).await?;
+        let mut commit_checkpoint = CheckPoint::create(
+            shared_config.clone(),
+            HW_CHECKPOINT_FILE_NAME,
+            last_base_offset,
+        )
+        .await?;
+
+        // ensure checkpoint is valid
+        let hw = commit_checkpoint.get_offset();
+        let leo = active_segment.get_end_offset();
+        if hw > leo {
+            info!(
+                hw,
+                leo, "high watermark is greater than log end offset, resetting to leo"
+            );
+            commit_checkpoint.write(leo);
+        }
 
         let size = Arc::new(ReplicaSize::default());
+        size.store_active(active_segment.occupied_memory());
+
         let cleaner = Cleaner::start_new(
             storage_config,
             shared_config.clone(),
             segments.clone(),
             size.clone(),
         );
+
+        let max_request_size = shared_config.max_request_size.get_consistent() as usize;
+        let max_segment_size = shared_config.segment_max_bytes.get_consistent() as usize;
 
         Ok(Self {
             option: shared_config,
@@ -265,6 +295,9 @@ impl FileReplica {
             commit_checkpoint,
             cleaner,
             size,
+            append_failure: false,
+            max_request_size,
+            max_segment_size,
         })
     }
 
@@ -273,7 +306,7 @@ impl FileReplica {
     pub async fn clear(replica: &ReplicaKey, option: &SharedReplicaConfig) {
         let replica_dir = option
             .base_dir
-            .join(replica_dir_name(&replica.topic, replica.partition as u32));
+            .join(replica_dir_name(&replica.topic, replica.partition));
 
         info!("removing dir: {}", replica_dir.display());
         if let Err(err) = remove_dir_all(&replica_dir).await {
@@ -328,8 +361,7 @@ impl FileReplica {
                 return Ok(slice);
             } else if start_offset > leo {
                 return Err(ErrorCode::Other(format!(
-                    "start offset: {} is greater than leo: {}",
-                    start_offset, leo
+                    "start offset: {start_offset} is greater than leo: {leo}"
                 )));
             } else if let Some(slice) = self
                 .active_segment
@@ -348,6 +380,10 @@ impl FileReplica {
             self.prev_segments
                 .find_slice(start_offset, max_offset)
                 .await?
+                .ok_or_else(|| ErrorCode::OffsetEvicted {
+                    offset: start_offset,
+                    next_available: self.get_log_start_offset(),
+                })?
         };
 
         let limited_slice = AsyncFileSlice::new(
@@ -368,27 +404,75 @@ impl FileReplica {
     }
 
     #[instrument(skip(self, item))]
-    async fn write_batch<R: BatchRecords>(
-        &mut self,
-        item: &mut Batch<R>,
-    ) -> Result<(), StorageError> {
-        if !(self.active_segment.append_batch(item).await?) {
-            info!(
-                partition = self.partition,
-                path = %self.option.base_dir.display(),
-                base_offset = self.active_segment.get_base_offset(),
-                "rolling over active segment");
-            self.active_segment.roll_over().await?;
-            let last_offset = self.active_segment.get_end_offset();
-            let new_segment = MutableSegment::create(last_offset, self.option.clone()).await?;
-            let old_mut_segment = mem::replace(&mut self.active_segment, new_segment);
-            let old_segment = old_mut_segment.as_segment().await?;
-            self.size.add_prev(old_segment.occupied_memory());
-            self.prev_segments.add_segment(old_segment).await;
-            self.active_segment.append_batch(item).await?;
+    async fn write_batch<R: BatchRecords>(&mut self, item: &mut Batch<R>) -> Result<()> {
+        if self.append_failure {
+            return Err(
+                StorageError::Other("last append failed, disabling append".to_owned()).into(),
+            );
         }
+
+        match self.active_segment.append_batch(item).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // segment is full, need to rollver
+                match self.roll_over().await {
+                    Ok(_) => {
+                        // after rollver is done, append to new segment, this should succeed
+                        match self.active_segment.append_batch(item).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!("failed to append even after rollver");
+                                self.append_failure = true;
+                                return Err(StorageError::Other(
+                                    "failed to append even after rollver".to_owned(),
+                                )
+                                .into());
+                            }
+                            Err(err) => {
+                                warn!("failed to append after rollver: {:#?}", err);
+                                self.append_failure = true;
+                                return Err(err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("failed to rollver: {:#?}", err);
+                        self.append_failure = true;
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                warn!("failed to write to active segment: {:#?}", err);
+                self.append_failure = true;
+                return Err(err);
+            }
+        }
+
         self.size
             .store_active(self.active_segment.occupied_memory());
+        Ok(())
+    }
+
+    /// perform roll over.  This will perform
+    /// 1. close current segment by shrinking index and make it readable
+    /// 2. create new segment as active segment
+    /// 3. add old segment to prev segments
+    #[instrument(skip(self))]
+    async fn roll_over(&mut self) -> Result<()> {
+        info!(
+            partition = self.partition,
+            path = %self.option.base_dir.display(),
+            base_offset = self.active_segment.get_base_offset(),
+            end_offset = self.active_segment.get_end_offset(),
+            "rolling over active segment");
+        self.active_segment.close().await?;
+        let last_offset = self.active_segment.get_end_offset();
+        let new_segment = MutableSegment::create(last_offset, self.option.clone()).await?;
+        let old_mut_segment = mem::replace(&mut self.active_segment, new_segment);
+        let old_segment = old_mut_segment.as_segment().await?;
+        self.size.add_prev(old_segment.occupied_memory());
+        self.prev_segments.add_segment(old_segment).await;
         Ok(())
     }
 }
@@ -426,11 +510,14 @@ fn replica_dir_name<S: AsRef<str>>(topic_name: S, partition_index: Size) -> Stri
 }
 
 #[cfg(test)]
+#[cfg(feature = "fixture")]
 mod tests {
 
     use fluvio_future::fs::remove_dir_all;
     use fluvio_future::timer::sleep;
+    use futures_lite::AsyncWriteExt;
     use tracing::debug;
+    use tracing::info;
     use std::env::temp_dir;
     use std::fs;
     use std::fs::metadata;
@@ -439,6 +526,7 @@ mod tests {
     use std::time::Duration;
 
     use fluvio_spu_schema::Isolation;
+    use fluvio_protocol::link::ErrorCode;
     use fluvio_protocol::record::Batch;
     use fluvio_protocol::record::Offset;
     use fluvio_protocol::{Decoder, Encoder};
@@ -466,7 +554,7 @@ mod tests {
         base_offset: Offset,
         config: ReplicaConfig,
     ) -> FileReplica {
-        FileReplica::create_or_load(topic, 0, base_offset, config, storage_config())
+        FileReplica::create_or_load_inner(topic, 0, base_offset, config, storage_config())
             .await
             .expect("replica")
     }
@@ -611,7 +699,7 @@ mod tests {
     const TEST_OFFSET_DIR: &str = "test_offset";
 
     #[fluvio_future::test]
-    async fn test_replica_end_offset() {
+    async fn test_replica_load_end_offset_and_size() {
         let option = base_option(TEST_OFFSET_DIR);
 
         let mut rep_sink = create_replica("test", START_OFFSET, option.clone()).await;
@@ -627,7 +715,8 @@ mod tests {
 
         // open replica
         let replica2 = create_replica("test", 0, option).await;
-        assert_eq!(replica2.get_leo(), START_OFFSET + 4);
+        assert_eq!(replica2.get_leo(), START_OFFSET + 4); // should be 24 since we added 4 records
+        assert_eq!(replica2.size.get(), 158);
     }
 
     const TEST_REPLICA_DIR: &str = "test_replica";
@@ -638,10 +727,15 @@ mod tests {
     async fn test_rep_log_roll_over() {
         let option = rollover_option(TEST_REPLICA_DIR);
 
-        let mut replica =
-            FileReplica::create_or_load("test", 1, START_OFFSET, option.clone(), storage_config())
-                .await
-                .expect("create rep");
+        let mut replica = FileReplica::create_or_load_inner(
+            "test",
+            1,
+            START_OFFSET,
+            option.clone(),
+            storage_config(),
+        )
+        .await
+        .expect("create rep");
 
         // first batch
         debug!(">>>> sending first batch");
@@ -660,7 +754,7 @@ mod tests {
         assert_eq!(dir_contents.count(), 5, "should be 5 files");
 
         let seg2_file = replica_dir.join(TEST_SE2_NAME);
-        let bytes = read_bytes_from_file(&seg2_file).expect("file read");
+        let bytes = read_bytes_from_file(seg2_file).expect("file read");
 
         let batch =
             Batch::<MemoryRecords>::decode_from(&mut Cursor::new(bytes), 0).expect("decode");
@@ -692,7 +786,12 @@ mod tests {
         // record contains 2 batch
         assert_eq!(replica.get_hw(), 2);
 
+        // allow time for checkpoint to write
+        sleep(Duration::from_millis(1000)).await;
         drop(replica);
+
+        // wait until checkpoint is fully fully flushed
+        sleep(Duration::from_millis(1000)).await;
 
         // restore replica
         let replica = create_replica("test", 0, option).await;
@@ -829,9 +928,9 @@ mod tests {
     }
 
     #[fluvio_future::test]
-    async fn test_replica_limit_batch() {
+    async fn test_replica_limit_request_size() {
         let mut option = base_option("test_batch_limit");
-        option.max_batch_size = 100;
+        option.max_request_size = 100;
         option.update_hw = false;
 
         let mut replica = create_replica("test", START_OFFSET, option).await;
@@ -849,11 +948,12 @@ mod tests {
             .expect("batch")
             .records();
         assert!(largest_batch.write_size(0) > 100); // ensure we are writing more than 100
+        let err = replica
+            .write_recordset(&mut largest_batch, true)
+            .await
+            .unwrap_err();
         assert!(matches!(
-            replica
-                .write_recordset(&mut largest_batch, true)
-                .await
-                .unwrap_err(),
+            err.downcast_ref::<StorageError>().expect("downcast"),
             StorageError::BatchTooBig(_)
         ));
     }
@@ -942,10 +1042,15 @@ mod tests {
             .build()
             .expect("batch");
 
-        let mut new_replica =
-            FileReplica::create_or_load("test", 0, 0, option.clone(), Arc::new(storage_config))
-                .await
-                .expect("create");
+        let mut new_replica = FileReplica::create_or_load_inner(
+            "test",
+            0,
+            0,
+            option.clone(),
+            Arc::new(storage_config),
+        )
+        .await
+        .expect("create");
         let reader = new_replica.prev_segments.read().await;
         assert!(reader.len() == 0);
         drop(reader);
@@ -981,6 +1086,14 @@ mod tests {
         assert_eq!(reader.len(), 0);
         drop(reader);
 
+        assert!(matches!(
+            new_replica.read_records(1, None, 1024).await, //offset must not be available
+            Err(ErrorCode::OffsetEvicted {
+                offset: 1,
+                next_available: 4,
+            })
+        ));
+
         new_replica.remove().await.expect("remove");
         drop(new_replica);
         sleep(Duration::from_millis(300)).await; // clear should end
@@ -1001,7 +1114,7 @@ mod tests {
         option.max_partition_size = max_partition_size;
         option.segment_max_bytes = max_segment_size;
 
-        let mut replica = FileReplica::create_or_load(
+        let mut replica = FileReplica::create_or_load_inner(
             "test",
             0,
             START_OFFSET,
@@ -1025,14 +1138,115 @@ mod tests {
         let partition_size = replica.get_partition_size();
         assert!(
             partition_size < max_partition_size,
-            "replica size must not exceed max_partition_size config. Was {}",
-            partition_size
+            "replica size must not exceed max_partition_size config. Was {partition_size}"
         );
         let prev_segments = replica.prev_segments.read().await.len();
         assert_eq!(
             prev_segments, 3,
-            "segments must be removed to enforce size. Was {}",
-            prev_segments
+            "segments must be removed to enforce size. Was {prev_segments}"
         );
+    }
+
+    /// fix bad segment
+    #[fluvio_future::test]
+    async fn test_replica_repair_bad_header() {
+        let option = base_option("test_replica_repair_bad_header");
+
+        let mut replica = create_replica("test", START_OFFSET, option.clone()).await;
+
+        // write 2 batches
+        replica
+            .write_batch(&mut create_batch())
+            .await
+            .expect("write");
+        replica
+            .write_batch(&mut create_batch())
+            .await
+            .expect("write");
+
+        // make sure we can read
+        let orig_slice = replica
+            .read_all_uncommitted_records(FileReplica::PREFER_MAX_LEN)
+            .await
+            .expect("read");
+        let orig_slice_len = orig_slice.file_slice.unwrap().len();
+        info!(orig_slice_len, "original file slice len");
+        drop(replica);
+
+        let test_fs_path = option.base_dir.join("test-0").join(TEST_SEG_NAME);
+        debug!("using test  logfile: {:#?}", test_fs_path);
+
+        let original_fs_len = std::fs::metadata(&test_fs_path)
+            .expect("get metadata")
+            .len();
+
+        info!(original_fs_len, "original fs len");
+
+        let mut file = fluvio_future::fs::util::open_read_append(&test_fs_path)
+            .await
+            .expect("opening log file");
+        // add some junk
+        let bytes = vec![0x01, 0x02, 0x03];
+        file.write_all(&bytes).await.expect("write some junk");
+        file.flush().await.expect("flush");
+        drop(file);
+
+        let invalid_fs_len = std::fs::metadata(&test_fs_path)
+            .expect("get metadata")
+            .len();
+        assert_eq!(invalid_fs_len, original_fs_len + 3);
+
+        // reopen replica
+        let replica2 = create_replica("test", START_OFFSET, option.clone()).await;
+
+        // make sure we can read original batches
+        let slice = replica2
+            .read_all_uncommitted_records(FileReplica::PREFER_MAX_LEN)
+            .await
+            .expect("read");
+        assert_eq!(slice.file_slice.unwrap().len(), orig_slice_len);
+
+        drop(replica2);
+
+        let repaird_fs_len = std::fs::metadata(&test_fs_path)
+            .expect("get metadata")
+            .len();
+        assert_eq!(repaird_fs_len, original_fs_len);
+
+        // reopen replica
+    }
+
+    #[fluvio_future::test]
+    async fn test_replica_batch_exceeded_segment_size() {
+        let mut option = base_option("test_batch_limit");
+        option.segment_max_bytes = 100;
+        option.update_hw = false;
+
+        let mut replica = create_replica("test", START_OFFSET, option).await;
+
+        let mut small_batch = BatchProducer::builder().build().expect("batch").records();
+        assert!(small_batch.write_size(0) < 100); // ensure we are writing less than 100 bytes
+        replica
+            .write_recordset(&mut small_batch, true)
+            .await
+            .expect("writing records");
+
+        let mut largest_batch = BatchProducer::builder()
+            .per_record_bytes(200)
+            .build()
+            .expect("batch")
+            .records();
+        assert!(largest_batch.write_size(0) > 100); // ensure we are writing more than 100
+        let err = replica
+            .write_recordset(&mut largest_batch, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StorageError>().expect("downcast"),
+            StorageError::BatchExceededSegment {
+                batch_size: _,
+                max_segment_size: 100,
+            }
+        ));
     }
 }

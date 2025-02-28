@@ -8,33 +8,27 @@ use std::fmt::Debug;
 
 use fluvio_protocol::{Encoder, Decoder};
 
-use super::Message;
+use super::msg_type::Message;
 
-#[derive(Decoder, Encoder, Debug, Eq, PartialEq, Clone, Default)]
-pub struct Messages<S>
-where
-    S: Encoder + Decoder + Debug,
-{
+#[derive(Encoder, Decoder, Debug, Eq, PartialEq, Clone, Default)]
+pub struct Messages<S> {
     pub messages: Vec<Message<S>>,
 }
 
 impl<S> fmt::Display for Messages<S>
 where
-    S: Encoder + Decoder + Debug + Display,
+    S: Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "[")?;
         for sm in &self.messages {
-            write!(f, "{},", sm)?;
+            write!(f, "{sm},")?;
         }
         write!(f, "]")
     }
 }
 
-impl<S> Messages<S>
-where
-    S: Encoder + Decoder + Debug,
-{
+impl<S> Messages<S> {
     pub fn new(messages: Vec<Message<S>>) -> Self {
         Self { messages }
     }

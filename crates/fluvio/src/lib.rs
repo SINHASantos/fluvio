@@ -1,105 +1,28 @@
-//! The Rust client library for writing streaming applications with Fluvio
-//!
-//! Fluvio is a high performance, low latency data streaming platform built for developers.
-//!
-//! When writing streaming applications, two of your core behaviors are producing messages
-//! and consuming messages. When you produce a message, you send it to a Fluvio cluster
-//! where it is recorded and saved for later usage. When you consume a message, you are
-//! reading a previously-stored message from that same Fluvio cluster. Let's get started
-//! with a quick example where we produce and consume some messages.
-//!
-//! # Examples
-//!
-//! Fluvio's documentation provide a set of examples for Rust.
-//! You can visit the examples page [following this link](https://www.fluvio.io/api/official/rust/examples/).
-//!
-//! # Fluvio Echo
-//!
-//! The easiest way to see Fluvio in action is to produce some messages and to consume
-//! them right away. In this sense, we can use Fluvio to make an "echo service".
-//!
-//! All messages in Fluvio are sent in a sort of category called a `Topic`. You can think
-//! of a Topic as a named folder where you want to store some files, which would be your
-//! messages. If you're familiar with relational databases, you can think of a Topic as
-//! being similar to a database table, but for streaming.
-//!
-//! As the application developer, you get to decide what Topics you create and which
-//! messages you send to them. We need to set up a Topic before running our code. For the
-//! echo example, we'll call our topic `echo`.
-//!
-//! # Example
-//!
-//! The easiest way to create a Fluvio Topic is by using the [Fluvio CLI].
-//!
-//! ```bash
-//! $ fluvio topic create echo
-//! topic "echo" created
-//! ```
-//!
-//! There are convenience methods that let you get up-and-started quickly using default
-//! configurations. Later if you want to customize your setup, you can directly use the
-//! [`Fluvio`] client object.
-//!
-//! ```no_run
-//! # mod futures {
-//! #     pub use futures_util::stream::StreamExt;
-//! # }
-//! use std::time::Duration;
-//! use fluvio::{Offset, FluvioError, RecordKey};
-//! use futures::StreamExt;
-//!
-//! async_std::task::spawn(produce_records());
-//! if let Err(e) = async_std::task::block_on(consume_records()) {
-//!     println!("Error: {}", e);
-//! }
-//!
-//! async fn produce_records() -> Result<(), FluvioError> {
-//!     let producer = fluvio::producer("echo").await?;
-//!     for i in 0..10u8 {
-//!         producer.send(RecordKey::NULL, format!("Hello, Fluvio {}!", i)).await?;
-//!         async_std::task::sleep(Duration::from_secs(1)).await;
-//!     }
-//!     Ok(())
-//! }
-//!
-//! async fn consume_records() -> Result<(), FluvioError> {
-//!     let consumer = fluvio::consumer("echo", 0).await?;
-//!     let mut stream = consumer.stream(Offset::beginning()).await?;
-//!
-//!     while let Some(Ok(record)) = stream.next().await {
-//!         let key = record.key().map(|key| String::from_utf8_lossy(key).to_string());
-//!         let value = String::from_utf8_lossy(record.value()).to_string();
-//!         println!("Got record: key={:?}, value={}", key, value);
-//!     }
-//!     Ok(())
-//! }
-//! ```
-//!
-//! [Fluvio CLI]: https://nightly.fluvio.io/docs/cli/
-//! [`Fluvio`]: ./struct.Fluvio.html
 #![cfg_attr(
     feature = "nightly",
-    doc(include = "../../../website/kubernetes/INSTALL.md")
+    doc = include_str!("../../../DEVELOPER.md")
 )]
+#![doc = include_str!("../README.md")]
 
-mod error;
 mod admin;
+mod error;
 mod fluvio;
-pub mod consumer;
-mod producer;
 mod offset;
+mod producer;
 mod sync;
-pub mod spu;
-pub mod metrics;
-pub mod config;
 
-use fluvio_types::PartitionId;
-use tracing::instrument;
+pub mod config;
+pub mod consumer;
+pub mod metrics;
+pub mod spu;
+
 pub use error::FluvioError;
-pub use config::FluvioConfig;
+pub use config::{FluvioClusterConfig, FluvioConfig};
 pub use producer::{
-    TopicProducerConfigBuilder, TopicProducerConfig, TopicProducer, RecordKey, ProduceOutput,
-    FutureRecordMetadata, RecordMetadata, DeliverySemantic, RetryPolicy, RetryStrategy,
+    ProducerCallback, SharedProducerCallback, ProduceCompletionBatchEvent,
+    TopicProducerConfigBuilder, TopicProducerConfig, TopicProducer, TopicProducerPool, RecordKey,
+    ProduceOutput, FutureRecordMetadata, RecordMetadata, DeliverySemantic, RetryPolicy,
+    RetryStrategy, Partitioner, PartitionerConfig, ProducerError,
 };
 #[cfg(feature = "smartengine")]
 pub use producer::{SmartModuleChainBuilder, SmartModuleConfig, SmartModuleInitialData};
@@ -118,8 +41,12 @@ pub use crate::fluvio::Fluvio;
 
 pub use fluvio_compression::Compression;
 
+use fluvio_types::PartitionId;
+use tracing::instrument;
+
 /// The minimum VERSION of the Fluvio Platform that this client is compatible with.
 const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
+pub(crate) const VERSION: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/VERSION"));
 
 /// Creates a producer that sends records to the named topic
 ///
@@ -135,7 +62,7 @@ const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
 ///
 /// ```no_run
 /// # use fluvio::{FluvioError, RecordKey};
-/// # async fn do_produce() -> Result<(), FluvioError> {
+/// # async fn do_produce() -> anyhow::Result<()> {
 /// let producer = fluvio::producer("my-topic").await?;
 /// producer.send(RecordKey::NULL, "Hello, world!").await?;
 /// # Ok(())
@@ -151,7 +78,7 @@ const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
 ///
 /// ```no_run
 /// # use fluvio::FluvioError;
-/// # async fn do_produce() -> Result<(), FluvioError> {
+/// # async fn do_produce() -> anyhow::Result<()> {
 /// let producer = fluvio::producer("my-topic").await?;
 /// let key = "fluvio";
 /// let value = r#"
@@ -162,15 +89,35 @@ const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
 /// # }
 /// ```
 ///
+/// # Example: Flushing
+///
+/// Fluvio batches records by default, so it's important to flush the producer before terminating.
+///
+/// ```no_run
+///     # use fluvio::FluvioError;
+///     # use fluvio_protocol::record::RecordKey;
+///     # async fn produce_records() -> anyhow::Result<()> {
+///     let producer = fluvio::producer("echo").await?;
+///     for i in 0..10u8 {
+///         producer.send(RecordKey::NULL, format!("Hello, Fluvio {}!", i)).await?;
+///     }
+///     producer.flush().await?;
+///     # Ok(())
+///     # }
+/// ```
+///
+///
 /// [`Fluvio`]: ./struct.Fluvio.html
 #[instrument(skip(topic))]
-pub async fn producer<S: Into<String>>(topic: S) -> Result<TopicProducer, FluvioError> {
+pub async fn producer(
+    topic: impl Into<String>,
+) -> anyhow::Result<TopicProducer<spu::SpuSocketPool>> {
     let fluvio = Fluvio::connect().await?;
     let producer = fluvio.topic_producer(topic).await?;
     Ok(producer)
 }
 
-/// Creates a producer that receives events from the given topic and partition
+/// Creates a consumer that receives events from the given topic and partition
 ///
 /// This is a shortcut function that uses the current profile
 /// settings. If you need to specify any custom configurations,
@@ -183,25 +130,30 @@ pub async fn producer<S: Into<String>>(topic: S) -> Result<TopicProducer, Fluvio
 /// # mod futures {
 /// #     pub use futures_util::stream::StreamExt;
 /// # }
-/// #  async fn example() -> Result<(), FluvioError> {
+/// #  async fn example() -> anyhow::Result<()> {
 /// use futures::StreamExt;
 /// let consumer = fluvio::consumer("my-topic", 0).await?;
 /// let mut stream = consumer.stream(Offset::beginning()).await?;
 /// while let Some(Ok(record)) = stream.next().await {
-///     let key = record.key().map(|key| String::from_utf8_lossy(key).to_string());
-///     let value = String::from_utf8_lossy(record.value()).to_string();
-///     println!("Got record: key={:?}, value={}", key, value);
+///     let key_str = record.get_key().map(|key| key.as_utf8_lossy_string());
+///     let value_str = record.get_value().as_utf8_lossy_string();
+///     println!("Got record: key={:?}, value={}", key_str, value_str);
 /// }
 /// # Ok(())
 /// # }
 /// ```
 ///
 /// [`Fluvio`]: ./struct.Fluvio.html
+#[deprecated(
+    since = "0.21.8",
+    note = "use `Fluvio::consumer_with_config()` instead"
+)]
 #[instrument(skip(topic, partition))]
-pub async fn consumer<S: Into<String>>(
-    topic: S,
+#[allow(deprecated)]
+pub async fn consumer(
+    topic: impl Into<String>,
     partition: PartitionId,
-) -> Result<PartitionConsumer, FluvioError> {
+) -> anyhow::Result<PartitionConsumer> {
     let fluvio = Fluvio::connect().await?;
     let consumer = fluvio.partition_consumer(topic, partition).await?;
     Ok(consumer)
@@ -216,16 +168,8 @@ pub mod metadata {
         pub use fluvio_sc_schema::topic::*;
     }
 
-    pub mod connector {
-        pub use fluvio_sc_schema::connector::*;
-    }
-
     pub mod smartmodule {
         pub use fluvio_sc_schema::smartmodule::*;
-    }
-
-    pub mod derivedstream {
-        pub use fluvio_sc_schema::derivedstream::*;
     }
 
     pub mod customspu {

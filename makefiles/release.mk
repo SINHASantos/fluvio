@@ -1,5 +1,6 @@
 # Use the binary name produced by cargo
-PUBLISH_BINARIES=fluvio fluvio-run fluvio-channel fluvio-test smdk
+PUBLISH_BINARIES=fluvio fluvio-run fluvio-channel fluvio-test smdk fvm
+PUBLISH_BINARIES_HUB=cdk
 
 # CI has to set RELEASE=true to run commands that update public
 #RELEASE?=false
@@ -39,6 +40,12 @@ DOCKER_IMAGE_TAG?=$(REPO_VERSION)
 GH_TOKEN?=
 GH_RELEASE_TAG?=dev
 
+ifeq ($(PRE_RELEASE),true)
+GH_PRE_RELEASE_FLAG=--prerelease
+else
+GH_PRE_RELEASE_FLAG=
+endif
+
 # Allow using local `gh` auth token for local testing
 #ifeq ($(CI), true)
 #ifndef GH_TOKEN
@@ -51,6 +58,9 @@ TARGET?=
 PACKAGE?=
 ARTIFACT?=
 
+# Fluvio Cloud Version used to publish pkgsets
+FLUVIO_CLOUD_VERSION?=stable
+
 #### Testing only
 
 get-version:
@@ -60,7 +70,7 @@ get-tag:
 	echo $(DEV_VERSION_TAG)
 
 clean-publish:
-	rm -vf *.zip *.tgz *.exe 
+	rm -vf *.zip *.tgz *.exe
 	rm -vrf fluvio-* fluvio.* smdk-*
 	rm -vf /tmp/release_notes /tmp/cd_dev_latest.txt
 
@@ -102,7 +112,7 @@ docker-push-manifest-dev: docker-create-manifest-dev docker-push-manifest
 
 # Uses $(VERSION)
 curl-install-fluvio:
-	curl -fsS https://packages.fluvio.io/v1/install.sh | bash
+	curl -fsS https://hub.infinyon.cloud/install/install.sh?ctx=ci | bash
 
 install-fluvio-stable: VERSION=stable
 install-fluvio-stable: curl-install-fluvio
@@ -112,11 +122,16 @@ install-fluvio-latest: curl-install-fluvio
 
 install-fluvio-package: FLUVIO_BIN=$(HOME)/.fluvio/bin/fluvio
 install-fluvio-package:
-	$(FLUVIO_BIN) install fluvio-package
+	# temporarily remove deadlock on fluvio-package install
+	# $(FLUVIO_BIN) install fluvio-package
+	mkdir -p ${HOME}/.fluvio/extensions
+	curl https://packages.fluvio.io/v1/packages/fluvio/fluvio-package/0.1.9/x86_64-unknown-linux-musl/fluvio-package \
+	-o ${HOME}/.fluvio/extensions/fluvio-package
+	chmod +x ${HOME}/.fluvio/extensions/fluvio-package
 
 # Requires GH_TOKEN set or `gh auth login`
 download-fluvio-release:
-	gh release download $(GH_RELEASE_TAG) -R infinyon/fluvio --skip-existing
+	$(DRY_RUN_ECHO) gh release download $(GH_RELEASE_TAG) -R infinyon/fluvio --skip-existing
 
 unzip-gh-release-artifacts: download-fluvio-release
 	@echo "unzip stuff"
@@ -161,15 +176,34 @@ publish-artifacts: install-fluvio-package unzip-gh-release-artifacts
 			--package=$(subst .exe, ,$(subst -$(shell cat $(basename $(bin))/.target), ,$(basename $(bin)))) \
 			--version=$(PUBLIC_VERSION) \
 			--target=$$TARGET \
-			$$ARTIFACT; \
+			$$ARTIFACT || true; \
 	)
 
+publish-artifacts-hub: PUBLIC_VERSION=$(subst -$(GIT_COMMIT_SHA),+$(GIT_COMMIT_SHA),$(VERSION))
+publish-artifacts-hub: unzip-gh-release-artifacts
+	@echo "Publish to hub"
+	$(foreach bin, $(PUBLISH_BINARIES_HUB), \
+		$(foreach zipf, $(wildcard ${bin}*.zip), \
+			printf "\n"; \
+			export DIRNAME=$(basename $(zipf)); \
+			export TARGET=$(shell cat $(basename $(zipf))/.target); \
+			export PACKAGE=$(subst -$(shell cat $(basename $(zipf))/.target), ,$(basename $(zipf))); \
+			export ARTIFACT=$(abspath $$DIRNAME/$$PACKAGE); \
+			$(DRY_RUN_ECHO) actions/upload-bpkg.sh $$ARTIFACT $$TARGET ${CHANNEL}; \
+		) \
+	)
 
-publish-artifacts-stable: VERSION=$(REPO_VERSION)
-publish-artifacts-stable: publish-artifacts
+publish-artifacts-dev-hub: CHANNEL=latest
+publish-artifacts-dev-hub: publish-artifacts-hub
 
 publish-artifacts-dev: VERSION=$(DEV_VERSION_TAG)
-publish-artifacts-dev: publish-artifacts
+publish-artifacts-dev: publish-artifacts publish-artifacts-dev-hub
+
+publish-artifacts-stable-hub: CHANNEL=stable
+publish-artifacts-stable-hub: publish-artifacts-hub
+
+publish-artifacts-stable: VERSION=$(REPO_VERSION)
+publish-artifacts-stable: publish-artifacts publish-artifacts-stable-hub
 
 # Need to ensure that version is always a semver
 # Version convention is different here. Notice the `+`
@@ -184,13 +218,29 @@ bump-fluvio: install-fluvio-package
 		$(DRY_RUN_ECHO) $(FLUVIO_BIN) package tag $(bin):$(PUBLIC_VERSION) --allow-missing-targets --tag=$(CHANNEL_TAG) --force; \
 	)
 
+# publishes pkgset for stable e.g. 0.11.0
+# uses FLUVIO_CLOUD_VERSION
+publish-pkgset: PKGSET_NAME=${REPO_VERSION}
+publish-pkgset: FLUVIO_VERSION=${REPO_VERSION}
+publish-pkgset:
+	./actions/publish-pkgset.sh
+
 bump-fluvio-stable: CHANNEL_TAG=stable
 bump-fluvio-stable: VERSION=$(REPO_VERSION)
-bump-fluvio-stable: bump-fluvio
+# publishes pkgset for "stable"
+bump-fluvio-stable: PKGSET_NAME=stable
+bump-fluvio-stable: FLUVIO_VERSION=${VERSION}
+bump-fluvio-stable: bump-fluvio publish-pkgset
+	./actions/publish-pkgset.sh
 
 bump-fluvio-latest: CHANNEL_TAG=latest
 bump-fluvio-latest: VERSION=$(subst -$(GIT_COMMIT_SHA),+$(GIT_COMMIT_SHA),$(DEV_VERSION_TAG))
+# publishes pkgset for "latest"
+bump-fluvio-latest: PKGSET_NAME=latest
+bump-fluvio-latest: FLUVIO_VERSION=${VERSION}
+bump-fluvio-latest: FLUVIO_CLOUD_VERSION=latest
 bump-fluvio-latest: bump-fluvio
+	./actions/publish-pkgset.sh
 
 update-public-installer-script-s3:
 	$(DRY_RUN_ECHO) aws s3 cp ./install.sh s3://packages.fluvio.io/v1/install.sh --acl public-read
@@ -223,6 +273,7 @@ build-release-notes:
 
 create-gh-release: download-fluvio-release build-release-notes
 	$(DRY_RUN_ECHO) gh release create -R infinyon/fluvio \
+		$(GH_PRE_RELEASE_FLAG) \
 		--title="v$(VERSION)" \
 		-F /tmp/release_notes \
 		"v$(VERSION)" \

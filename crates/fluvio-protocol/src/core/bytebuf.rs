@@ -22,7 +22,7 @@ impl From<Bytes> for ByteBuf {
 impl From<Vec<u8>> for ByteBuf {
     fn from(bytes: Vec<u8>) -> Self {
         ByteBuf {
-            inner: Bytes::from_iter(bytes.into_iter()),
+            inner: Bytes::from_iter(bytes),
         }
     }
 }
@@ -75,8 +75,7 @@ impl Encoder for ByteBuf {
             return Err(Error::new(
                 ErrorKind::UnexpectedEof,
                 format!(
-                    "Not enough capacity for ByteBuf. Expected: {}, Remaining: {}",
-                    expected, remaining
+                    "Not enough capacity for ByteBuf. Expected: {expected}, Remaining: {remaining}"
                 ),
             ));
         }

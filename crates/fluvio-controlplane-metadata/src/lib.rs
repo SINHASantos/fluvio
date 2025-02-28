@@ -2,16 +2,21 @@ pub mod spu;
 pub mod topic;
 pub mod partition;
 pub mod spg;
-pub mod message;
-pub mod connector;
 pub mod smartmodule;
 pub mod tableformat;
-pub mod derivedstream;
+pub mod message;
+pub mod mirror;
+pub mod mirroring;
 
 pub use fluvio_stream_model::core;
 
 pub mod store {
     pub use fluvio_stream_model::store::*;
+}
+
+#[cfg(feature = "use_serde")]
+pub(crate) fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[cfg(feature = "k8")]
@@ -33,6 +38,7 @@ pub mod extended {
         SmartModule,
         TableFormat,
         DerivedStream,
+        Mirror,
     }
 
     pub trait SpecExt: Spec {

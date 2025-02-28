@@ -8,7 +8,9 @@ use fluvio_protocol::bytes::{Buf, BufMut};
 use fluvio_protocol::{Decoder, Encoder, Version};
 
 // manual encode
+#[derive(Default)]
 pub enum Mix {
+    #[default]
     A = 2,
     C = 3,
 }
@@ -39,12 +41,6 @@ impl Encoder for Mix {
     }
 }
 
-impl Default for Mix {
-    fn default() -> Mix {
-        Mix::A
-    }
-}
-
 impl Decoder for Mix {
     fn decode<T>(&mut self, src: &mut T, version: Version) -> Result<(), Error>
     where
@@ -62,7 +58,7 @@ impl Decoder for Mix {
             _ => {
                 return Err(Error::new(
                     ErrorKind::UnexpectedEof,
-                    format!("invalid value for Mix: {}", value),
+                    format!("invalid value for Mix: {value}"),
                 ))
             }
         }
@@ -73,13 +69,17 @@ impl Decoder for Mix {
 
 #[derive(Encoder, Debug)]
 pub enum UnitAndDataEnum {
+    #[fluvio(tag = 0)]
     UnitVariant,
+    #[fluvio(tag = 1)]
     DataVariant(i16),
 }
 
 #[derive(Encoder, Debug)]
 pub enum VariantEnum {
+    #[fluvio(tag = 0)]
     A(u16),
+    #[fluvio(tag = 1)]
     C(String),
 }
 
@@ -95,7 +95,9 @@ fn test_var_encode() {
 
 #[derive(Encoder, Decoder, Debug)]
 pub enum NamedEnum {
+    #[fluvio(tag = 0)]
     Apple { seeds: u16, color: String },
+    #[fluvio(tag = 1)]
     Banana { peel: bool },
 }
 
@@ -179,7 +181,9 @@ fn test_named_custom_tag_decode() {
 
 #[derive(Encoder, Decoder, Debug)]
 pub enum MultiUnnamedEnum {
+    #[fluvio(tag = 0)]
     Apple(u16, String),
+    #[fluvio(tag = 1)]
     Banana(bool),
 }
 
@@ -217,23 +221,23 @@ fn test_multi_unnamed_decode() {
 #[derive(Debug, Encoder, Decoder)]
 enum MultiUnnamedCustomTag {
     #[fluvio(tag = 7)]
-    RGB(u8, u8, u8),
+    Rgb(u8, u8, u8),
     #[fluvio(tag = 70)]
-    HSV(u8, u8, u8),
+    Hsv(u8, u8, u8),
     #[fluvio(tag = 77)]
     ColorName(String),
 }
 
 impl Default for MultiUnnamedCustomTag {
     fn default() -> Self {
-        Self::RGB(0, 0, 0)
+        Self::Rgb(0, 0, 0)
     }
 }
 
 #[test]
 fn test_multi_unnamed_custom_tag_encode() {
     let mut dest = vec![];
-    let value = MultiUnnamedCustomTag::HSV(22, 33, 44);
+    let value = MultiUnnamedCustomTag::Hsv(22, 33, 44);
     value.encode(&mut dest, 0).unwrap();
 
     let expected = vec![0x46, 0x16, 0x21, 0x2c];
@@ -247,22 +251,19 @@ fn test_multi_unnamed_custom_tag_decode() {
     value.decode(&mut std::io::Cursor::new(data), 0).unwrap();
 
     match value {
-        MultiUnnamedCustomTag::HSV(22, 33, 44) => (),
+        MultiUnnamedCustomTag::Hsv(22, 33, 44) => (),
         _ => panic!("failed decode"),
     }
 }
 
-#[derive(Encoder, Eq, PartialEq, Decoder, Debug)]
+#[derive(Default, Encoder, Eq, PartialEq, Decoder, Debug)]
 #[repr(u8)]
 pub enum EnumNoExprTest {
+    #[default]
+    #[fluvio(tag = 0)]
     A,
+    #[fluvio(tag = 1)]
     B,
-}
-
-impl Default for EnumNoExprTest {
-    fn default() -> EnumNoExprTest {
-        EnumNoExprTest::A
-    }
 }
 
 #[test]
@@ -298,17 +299,13 @@ fn test_enum_decode() {
 
 #[derive(Encoder, Decoder, Eq, PartialEq, Debug)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum EnumExprTest {
     #[fluvio(tag = 5)]
+    #[default]
     D = 5,
     #[fluvio(tag = 10)]
     E = 10,
-}
-
-impl Default for EnumExprTest {
-    fn default() -> EnumExprTest {
-        EnumExprTest::D
-    }
 }
 
 #[test]
@@ -336,17 +333,13 @@ fn test_enum_expr_decode() {
 #[repr(u16)]
 #[derive(Encoder, Decoder, Eq, PartialEq, Debug)]
 #[fluvio(encode_discriminant)]
+#[derive(Default)]
 pub enum WideEnum {
     #[fluvio(tag = 5)]
+    #[default]
     D = 5,
     #[fluvio(tag = 10)]
     E = 10,
-}
-
-impl Default for WideEnum {
-    fn default() -> WideEnum {
-        WideEnum::D
-    }
 }
 
 #[test]
@@ -448,16 +441,12 @@ fn test_simple_conversion() {
 #[repr(i16)]
 #[derive(Eq, PartialEq, Debug, Encoder, Decoder)]
 #[fluvio(encode_discriminant)]
+#[derive(Default)]
 pub enum TestErrorCode {
     // The server experienced an unexpected error when processing the request
     UnknownServerError = -1,
+    #[default]
     None = 0,
-}
-
-impl Default for TestErrorCode {
-    fn default() -> Self {
-        TestErrorCode::None
-    }
 }
 
 #[test]

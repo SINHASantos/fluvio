@@ -1,6 +1,6 @@
 pub mod batch;
 pub mod batch_header;
-mod checkpoint;
+pub mod checkpoint;
 mod error;
 pub mod records;
 mod index;
@@ -13,6 +13,8 @@ mod util;
 mod validator;
 mod file;
 pub mod config;
+#[cfg(feature = "iterators")]
+pub mod iterators;
 
 #[cfg(feature = "fixture")]
 pub mod fixture;
@@ -28,14 +30,15 @@ pub use inner::*;
 mod inner {
 
     use async_trait::async_trait;
+    use anyhow::Result;
 
     use fluvio_protocol::record::BatchRecords;
     use fluvio_protocol::link::ErrorCode;
     use fluvio_spu_schema::Isolation;
     use fluvio_protocol::record::{Offset, ReplicaKey, Size64};
     use fluvio_protocol::record::RecordSet;
-    use fluvio_controlplane_metadata::partition::Replica;
     use fluvio_future::file_slice::AsyncFileSlice;
+    use fluvio_controlplane::replica::Replica;
 
     #[derive(Debug, Clone, Eq, PartialEq)]
     pub struct OffsetInfo {
@@ -132,7 +135,7 @@ mod inner {
         async fn create_or_load(
             replica: &ReplicaKey,
             replica_config: Self::ReplicaConfig,
-        ) -> Result<Self, StorageError>;
+        ) -> Result<Self>;
 
         /// high water mark offset (records that has been replicated)
         fn get_hw(&self) -> Offset;
@@ -158,7 +161,7 @@ mod inner {
             &mut self,
             records: &mut RecordSet<R>,
             update_highwatermark: bool,
-        ) -> Result<usize, StorageError>;
+        ) -> Result<usize>;
 
         async fn update_high_watermark(&mut self, offset: Offset) -> Result<bool, StorageError>;
 

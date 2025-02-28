@@ -48,25 +48,45 @@ impl NamedProp {
         }
     }
 
-    pub fn version_check_token_stream(&self, field_stream: TokenStream) -> TokenStream {
+    pub fn version_check_token_stream(
+        &self,
+        field_stream: TokenStream,
+        trace: bool,
+    ) -> TokenStream {
         let min = self.attrs.min_version;
         let field_name = &self.field_name;
 
         if let Some(max) = self.attrs.max_version {
+            let trace = if trace {
+                quote! {
+                    else {
+                        tracing::trace!("Field: <{}> is skipped because version: {} is outside min: {}, max: {}",stringify!(#field_name),version,#min,#max);
+                    }
+                }
+            } else {
+                quote! {}
+            };
             quote! {
                 if (#min..=#max).contains(&version) {
                     #field_stream
-                } else {
-                    tracing::trace!("Field: <{}> is skipped because version: {} is outside min: {}, max: {}",stringify!(#field_name),version,#min,#max);
                 }
+                #trace
             }
         } else {
+            let trace = if trace {
+                quote! {
+                    else {
+                        tracing::trace!("Field: <{}> is skipped because version: {} is less than min: {}",stringify!(#field_name),version,#min);
+                    }
+                }
+            } else {
+                quote! {}
+            };
             quote! {
                 if version >= #min {
                     #field_stream
-                } else {
-                    tracing::trace!("Field: <{}> is skipped because version: {} is less than min: {}",stringify!(#field_name),version,#min);
                 }
+                #trace
             }
         }
     }
@@ -87,24 +107,46 @@ impl UnnamedProp {
         }
     }
 
-    pub fn version_check_token_stream(&self, field_stream: TokenStream) -> TokenStream {
+    pub fn version_check_token_stream(
+        &self,
+        field_stream: TokenStream,
+        trace: bool,
+    ) -> TokenStream {
         let min = self.attrs.min_version;
 
         if let Some(max) = self.attrs.max_version {
+            let trace = if trace {
+                quote! {
+                    else {
+                        tracing::trace!("Field from tuple struct:is skipped because version: {} is outside min: {}, max: {}",version,#min,#max);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
             quote! {
                 if (#min..=#max).contains(&version) {
                     #field_stream
-                } else {
-                    tracing::trace!("Field from tuple struct:is skipped because version: {} is outside min: {}, max: {}",version,#min,#max);
                 }
+                #trace
             }
         } else {
+            let trace = if trace {
+                quote! {
+                    else {
+                        tracing::trace!("Field from tuple struct: is skipped because version: {} is less than min: {}",version,#min);
+                    }
+                }
+            } else {
+                quote! {}
+            };
+
             quote! {
                 if version >= #min {
                     #field_stream
-                } else {
-                    tracing::trace!("Field from tuple struct: is skipped because version: {} is less than min: {}",version,#min);
                 }
+                #trace
             }
         }
     }
@@ -114,18 +156,16 @@ pub fn validate_versions(min: i16, max: Option<i16>, field: Option<&str>) -> Opt
     match (max, field) {
         // Print name in named fields
         (Some(max), Some(field)) if min > max => Some(format!(
-            "On {}, max version({}) is less than min({}).",
-            field, max, min
+            "On {field}, max version({max}) is less than min({min})."
         )),
         // No name to print in unnamed fields
         (Some(max), None) if min > max => {
-            Some(format!("Max version({}) is less than min({}).", max, min))
+            Some(format!("Max version({max}) is less than min({min})."))
         }
-        (None, Some(field)) if min < 0 => Some(format!(
-            "On {} min version({}) must be positive.",
-            field, min
-        )),
-        (None, None) if min < 0 => Some(format!("Min version({}) must be positive.", min)),
+        (None, Some(field)) if min < 0 => {
+            Some(format!("On {field} min version({min}) must be positive."))
+        }
+        (None, None) if min < 0 => Some(format!("Min version({min}) must be positive.")),
         _ => None,
     }
 }

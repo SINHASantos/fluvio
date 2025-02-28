@@ -6,29 +6,31 @@
 use std::sync::Arc;
 use std::fmt::Debug;
 
-use fluvio_smartengine::SmartEngine;
 use tracing::{debug, error, instrument};
 
-use fluvio_controlplane_metadata::partition::Replica;
 use fluvio_types::SpuId;
-use fluvio_storage::{ReplicaStorage};
+use fluvio_storage::ReplicaStorage;
 
 use crate::config::SpuConfig;
+use crate::control_plane::SharedMirrorStatusUpdate;
+use crate::control_plane::StatusMirrorMessageSink;
+use crate::kv::consumer::SharedConsumerOffsetStorages;
 use crate::replication::follower::FollowersState;
 use crate::replication::follower::SharedFollowersState;
 use crate::replication::leader::{
     SharedReplicaLeadersState, ReplicaLeadersState, FollowerNotifier, SharedSpuUpdates,
 };
-use crate::control_plane::{StatusMessageSink, SharedStatusUpdate};
+use crate::control_plane::{StatusLrsMessageSink, SharedLrsStatusUpdate};
 use crate::core::metrics::SpuMetrics;
+use crate::smartengine::SmartEngine;
 
 use super::leader_client::LeaderConnections;
+use super::mirror::MirrorLocalStore;
+use super::mirror::SharedMirrorLocalStore;
 use super::smartmodule::SmartModuleLocalStore;
-use super::derivedstream::DerivedStreamStore;
 use super::spus::SharedSpuLocalStore;
 use super::SharedReplicaLocalStore;
 use super::smartmodule::SharedSmartModuleLocalStore;
-use super::derivedstream::SharedStreamStreamLocalStore;
 use super::spus::SpuLocalStore;
 use super::replica::ReplicaStore;
 use super::SharedSpuConfig;
@@ -41,18 +43,20 @@ pub struct GlobalContext<S> {
     spu_localstore: SharedSpuLocalStore,
     replica_localstore: SharedReplicaLocalStore,
     smartmodule_localstore: SharedSmartModuleLocalStore,
-    derivedstream_localstore: SharedStreamStreamLocalStore,
     leaders_state: SharedReplicaLeadersState<S>,
     followers_state: SharedFollowersState<S>,
     spu_followers: SharedSpuUpdates,
-    status_update: SharedStatusUpdate,
+    lrs_status_update: SharedLrsStatusUpdate,
+    mirror_status_update: SharedMirrorStatusUpdate,
     sm_engine: SmartEngine,
     leaders: Arc<LeaderConnections>,
+    mirrors: SharedMirrorLocalStore,
     metrics: Arc<SpuMetrics>,
+    consumer_offset: SharedConsumerOffsetStorages,
 }
 
 // -----------------------------------
-// Global Contesxt - Implementation
+// Global Context - Implementation
 // -----------------------------------
 
 impl<S> GlobalContext<S>
@@ -72,15 +76,17 @@ where
             spu_localstore: spus.clone(),
             replica_localstore: replicas.clone(),
             smartmodule_localstore: SmartModuleLocalStore::new_shared(),
-            derivedstream_localstore: DerivedStreamStore::new_shared(),
             config: Arc::new(spu_config),
             leaders_state: ReplicaLeadersState::new_shared(),
             followers_state: FollowersState::new_shared(),
             spu_followers: FollowerNotifier::shared(),
-            status_update: StatusMessageSink::shared(),
+            lrs_status_update: StatusLrsMessageSink::shared(),
+            mirror_status_update: StatusMirrorMessageSink::shared(),
             sm_engine: SmartEngine::new(),
             leaders: LeaderConnections::shared(spus, replicas),
+            mirrors: MirrorLocalStore::new_shared(),
             metrics,
+            consumer_offset: SharedConsumerOffsetStorages::default(),
         }
     }
 
@@ -105,8 +111,12 @@ where
         &self.smartmodule_localstore
     }
 
-    pub fn derivedstream_store(&self) -> &DerivedStreamStore {
-        &self.derivedstream_localstore
+    pub fn mirrors_localstore(&self) -> &MirrorLocalStore {
+        &self.mirrors
+    }
+
+    pub fn mirrors_localstore_owned(&self) -> SharedMirrorLocalStore {
+        self.mirrors.clone()
     }
 
     pub fn leaders_state(&self) -> &ReplicaLeadersState<S> {
@@ -129,17 +139,30 @@ where
         self.config.clone()
     }
 
-    pub fn follower_notifier(&self) -> &FollowerNotifier {
+    pub fn follower_notifier(&self) -> &Arc<FollowerNotifier> {
         &self.spu_followers
     }
 
-    #[allow(unused)]
-    pub fn status_update(&self) -> &StatusMessageSink {
-        &self.status_update
+    pub fn follower_notifier_owned(&self) -> Arc<FollowerNotifier> {
+        self.spu_followers.clone()
     }
 
-    pub fn status_update_owned(&self) -> SharedStatusUpdate {
-        self.status_update.clone()
+    #[allow(unused)]
+    pub fn status_update(&self) -> &StatusLrsMessageSink {
+        &self.lrs_status_update
+    }
+
+    pub fn status_update_owned(&self) -> SharedLrsStatusUpdate {
+        self.lrs_status_update.clone()
+    }
+
+    #[allow(unused)]
+    pub fn mirror_status_update(&self) -> &StatusMirrorMessageSink {
+        &self.mirror_status_update
+    }
+
+    pub fn mirror_status_update_owned(&self) -> SharedMirrorStatusUpdate {
+        self.mirror_status_update.clone()
     }
 
     /// notify all follower handlers with SPU changes
@@ -162,14 +185,22 @@ where
     pub(crate) fn metrics(&self) -> Arc<SpuMetrics> {
         self.metrics.clone()
     }
+
+    pub(crate) fn consumer_offset(&self) -> &SharedConsumerOffsetStorages {
+        &self.consumer_offset
+    }
 }
 
 mod file_replica {
 
-    use fluvio_controlplane::{ReplicaRemovedRequest, UpdateReplicaRequest};
-    use fluvio_storage::{FileReplica, StorageError};
-    use flv_util::actions::Actions;
+    use fluvio_controlplane::{
+        sc_api::remove::ReplicaRemovedRequest, replica::Replica,
+        spu_api::update_replica::UpdateReplicaRequest,
+    };
     use tracing::{trace, warn};
+
+    use fluvio_storage::FileReplica;
+    use flv_util::actions::Actions;
 
     use crate::core::SpecChange;
 
@@ -178,7 +209,7 @@ mod file_replica {
     #[derive(Debug)]
     pub enum ReplicaChange {
         Remove(ReplicaRemovedRequest),
-        StorageError(StorageError),
+        StorageError(anyhow::Error),
     }
 
     impl GlobalContext<FileReplica> {
@@ -194,7 +225,12 @@ mod file_replica {
                 old_leader = old_replica.leader
             )
         )]
-        pub async fn promote(&self, new_replica: &Replica, old_replica: &Replica) {
+        pub async fn promote(
+            &self,
+            new_replica: &Replica,
+            old_replica: &Replica,
+        ) -> Vec<ReplicaChange> {
+            let mut outputs = Vec::new();
             if let Some(follower_replica) = self
                 .followers_state()
                 .remove_replica(old_replica.leader, &old_replica.id)
@@ -205,17 +241,24 @@ mod file_replica {
                     "old follower replica exists, promoting to leader"
                 );
 
-                self.leaders_state()
+                if let Err(err) = self
+                    .leaders_state()
                     .promote_follower(
                         self.config().into(),
                         follower_replica,
                         new_replica.clone(),
                         self.status_update_owned(),
+                        self,
                     )
-                    .await;
+                    .await
+                {
+                    error!("follower promotion failed: {err}");
+                    outputs.push(ReplicaChange::StorageError(err));
+                };
             } else {
                 error!("follower replica {} didn't exists!", old_replica.id);
             }
+            outputs
         }
 
         pub async fn apply_replica_update(
@@ -260,7 +303,11 @@ mod file_replica {
                             // we are leader
                             if let Err(err) = self
                                 .leaders_state()
-                                .add_leader_replica(self, new_replica, self.status_update.clone())
+                                .add_leader_replica(
+                                    self,
+                                    new_replica,
+                                    self.lrs_status_update.clone(),
+                                )
                                 .await
                             {
                                 outputs.push(ReplicaChange::StorageError(err));
@@ -302,7 +349,8 @@ mod file_replica {
                             // check for leader change
                             if new_replica.leader != old_replica.leader {
                                 if new_replica.leader == local_id {
-                                    self.promote(&new_replica, &old_replica).await
+                                    outputs
+                                        .append(&mut self.promote(&new_replica, &old_replica).await)
                                 } else {
                                     // we are follower
                                     // if we were leader before, we demote out self
@@ -344,6 +392,7 @@ mod file_replica {
         async fn remove_leader_replica(&self, replica: Replica) -> ReplicaRemovedRequest {
             // try to send message to leader controller if still exists
             if let Some(previous_state) = self.leaders_state().remove(&replica.id).await {
+                previous_state.signal_topic_deleted().await;
                 if let Err(err) = previous_state.remove().await {
                     error!("error: {} removing replica: {}", err, replica);
                 } else {

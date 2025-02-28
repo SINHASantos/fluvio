@@ -303,6 +303,7 @@ impl Offset {
 pub(crate) async fn fetch_offsets(
     client: &mut VersionedSerialSocket,
     replica: &ReplicaKey,
+    consumer_id: Option<String>,
 ) -> Result<FetchOffsetPartitionResponse, FluvioError> {
     debug!("fetching offset for replica: {}", replica);
 
@@ -310,6 +311,7 @@ pub(crate) async fn fetch_offsets(
         .send_receive(FetchOffsetsRequest::new(
             replica.topic.to_owned(),
             replica.partition,
+            consumer_id,
         ))
         .await?;
 
@@ -321,12 +323,12 @@ pub(crate) async fn fetch_offsets(
 
     match response.find_partition(replica) {
         Some(partition_response) => {
-            debug!("replica: {}, fetch offset: {}", replica, partition_response);
+            debug!("replica: {replica}, fetch offset: {partition_response}");
             Ok(partition_response)
         }
         None => Err(IoError::new(
             ErrorKind::InvalidData,
-            format!("no replica offset for: {}", replica),
+            format!("no replica offset for: {replica}"),
         )
         .into()),
     }

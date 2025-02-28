@@ -8,11 +8,10 @@ use tempfile::TempDir;
 use enum_display::EnumDisplay;
 use tracing::debug;
 use lib_cargo_crate::{Info, InfoOpts};
-use toml::Value;
 
-use fluvio_hub_util::HubAccess;
-use crate::hub::set_hubid;
-use crate::load::DEFAULT_META_LOCATION as SMARTMODULE_META_FILENAME;
+// Note: Cargo.toml.liquid files are changed by cargo-generate to Cargo.toml
+// this avoids the problem of cargo trying to parse Cargo.toml template files
+// and generating a lot of parsing errors
 
 static SMART_MODULE_TEMPLATE: Dir<'static> =
     include_dir!("$CARGO_MANIFEST_DIR/../../smartmodule/cargo_template");
@@ -27,21 +26,21 @@ pub struct GenerateCmd {
 
     /// SmartModule Project Group Name.
     /// Default to Hub ID, if set. Overrides Hub ID if provided.
-    #[clap(long, env = "SMDK_PROJECT_GROUP", value_name = "GROUP")]
+    #[arg(long, env = "SMDK_PROJECT_GROUP", value_name = "GROUP")]
     project_group: Option<String>,
 
     /// Local path to generate the SmartModule project.
     /// Default to directory with project name, created in current directory
-    #[clap(long, env = "SMDK_DESTINATION", value_name = "PATH")]
+    #[arg(long, env = "SMDK_DESTINATION", value_name = "PATH")]
     destination: Option<PathBuf>,
 
     /// Disable interactive prompt. Take all values from CLI flags. Fail if a value is missing.
-    #[clap(long, action, hide_short_help = true)]
+    #[arg(long, hide_short_help = true)]
     silent: bool,
 
     /// URL to git repo containing templates for generating SmartModule projects.
     /// Using this option is discouraged. The default value is recommended.
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("TemplateSourceGit"),
@@ -52,7 +51,7 @@ pub struct GenerateCmd {
     template_repo: Option<String>,
 
     /// An optional git branch to use with `--template-repo`
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("TemplateGit"),
@@ -63,7 +62,7 @@ pub struct GenerateCmd {
     template_repo_branch: Option<String>,
 
     /// An optional git tag to use with `--template-repo`
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("TemplateGit"),
@@ -75,7 +74,7 @@ pub struct GenerateCmd {
 
     /// Local filepath containing templates for generating SmartModule projects.
     /// Using this option is discouraged. The default value is recommended.
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("TemplateSourcePath"),
@@ -87,7 +86,7 @@ pub struct GenerateCmd {
 
     /// URL of git repo to include in generated Cargo.toml. Repo used for `fluvio-smartmodule` dependency.
     /// Using this option is discouraged. The default value is recommended.
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmCrateSourceGit"),
@@ -99,7 +98,7 @@ pub struct GenerateCmd {
     sm_crate_repo: Option<String>,
 
     /// An optional git branch to use with `--sm-crate-repo`
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmGit"),
@@ -110,7 +109,7 @@ pub struct GenerateCmd {
     sm_repo_branch: Option<String>,
 
     /// An optional git tag to use with `--sm-crate-repo`
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmGit"),
@@ -121,7 +120,7 @@ pub struct GenerateCmd {
     sm_repo_tag: Option<String>,
 
     /// An optional git rev to use with `--sm-crate-repo`
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmGit"),
@@ -133,7 +132,7 @@ pub struct GenerateCmd {
 
     /// Local filepath to include in generated Cargo.toml. Path used for fluvio-smartmodule dependency.
     /// Using this option is discouraged. The default value is recommended.
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmCrateSourcePath"),
@@ -145,7 +144,7 @@ pub struct GenerateCmd {
 
     /// Public version of `fluvio-smartmodule` from crates.io. Defaults to latest.
     /// Using this option is discouraged. The default value is recommended.
-    #[clap(
+    #[arg(
         long,
         hide_short_help = true,
         group("SmCrateSourceCratesIo"),
@@ -157,30 +156,30 @@ pub struct GenerateCmd {
 
     /// Type of SmartModule project to generate.
     /// Skip prompt if value given.
-    #[clap(long, value_enum, value_name = "TYPE", env = "SMDK_SM_TYPE")]
+    #[arg(long, value_enum, value_name = "TYPE", env = "SMDK_SM_TYPE")]
     sm_type: Option<SmartModuleType>,
 
     /// Visibility of SmartModule project to generate.
     /// Skip prompt if value given.
-    #[clap(long, value_enum, value_name = "PUBLIC", env = "SMDK_SM_PUBLIC")]
+    #[arg(long, value_enum, value_name = "PUBLIC", env = "SMDK_SM_PUBLIC")]
     sm_public: Option<bool>,
 
     /// Include SmartModule input parameters in generated SmartModule project.
     /// Skip prompt if value given.
-    #[clap(long, group("SmartModuleParams"), action, env = "SMDK_WITH_PARAMS")]
+    #[arg(long, group("SmartModuleParams"), env = "SMDK_WITH_PARAMS")]
     with_params: bool,
 
     /// No SmartModule input parameters in generated SmartModule project.
     /// Skip prompt if value given.
-    #[clap(long, group("SmartModuleParams"), action, env = "SMDK_NO_PARAMS")]
+    #[arg(long, group("SmartModuleParams"), env = "SMDK_NO_PARAMS")]
     no_params: bool,
 
     /// Set the remote URL for the hub
-    #[clap(long, env = "SMDK_HUB_REMOTE", hide_short_help = true)]
+    #[arg(long, env = "SMDK_HUB_REMOTE", hide_short_help = true)]
     hub_remote: Option<String>,
 
     /// Using this option will always choose the Fluvio repo as source for templates and dependencies
-    #[clap(long, action, env = "SMDK_DEVELOP", hide_short_help = true, conflicts_with_all =
+    #[arg(long, env = "SMDK_DEVELOP", hide_short_help = true, conflicts_with_all =
         &["TemplateSourceGit", "TemplateSourcePath",
         "SmCrateSourceGit", "SmCrateSourceCratesIo", "SmCrateSourcePath"],)]
     develop: bool,
@@ -190,27 +189,18 @@ impl GenerateCmd {
     pub(crate) fn process(self) -> Result<()> {
         // If a name isn't specified, you'll get prompted in wizard
         if let Some(ref name) = self.name {
-            println!("Generating new SmartModule project: {}", name);
+            println!("Generating new SmartModule project: {name}");
         }
 
-        // Figure out if there's a Hub ID set
-        let mut hub_config = HubAccess::default_load(&self.hub_remote)?;
+        let group = self.project_group.and_then(|g| {
+            debug!("Using user provided project group: \"{}\"", &g);
 
-        let group = if let Some(user_group) = self.project_group {
-            if user_group.is_empty() {
-                debug!("User requesting to be prompted for project group");
+            if g.is_empty() {
                 None
             } else {
-                debug!("Using user provided project group: {}", &user_group);
-                Some(user_group)
+                Some(g)
             }
-        } else if hub_config.hubid.is_empty() {
-            debug!("No project group value set");
-            None
-        } else {
-            debug!("Found project group: {}", hub_config.hubid.clone());
-            Some(hub_config.hubid.clone())
-        };
+        });
 
         let sm_params = match (self.with_params, self.no_params) {
             (true, false) => Some(true),
@@ -296,27 +286,7 @@ impl GenerateCmd {
             ..Default::default()
         };
 
-        let gen_dir = generate(args).map_err(Error::from)?;
-
-        // If group was empty, read it from the generated file
-        // and write it to disk
-        if group.is_none() {
-            let sm_toml_path = gen_dir.join(SMARTMODULE_META_FILENAME);
-
-            debug!("Extracting group from {}", sm_toml_path.display());
-
-            let sm_str = std::fs::read_to_string(sm_toml_path)?;
-
-            debug!("{:?}", &sm_str);
-
-            let sm_toml: Value = toml::from_str(&sm_str)?;
-
-            if let Value::Table(package) = &sm_toml["package"] {
-                if let Some(Value::String(groupname)) = package.get("group") {
-                    set_hubid(groupname, &mut hub_config)?;
-                }
-            }
-        }
+        generate(args)?;
 
         Ok(())
     }
@@ -335,19 +305,19 @@ impl std::fmt::Display for SmdkTemplateValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SmdkTemplateValue::SmCargoDependency(dependency) => {
-                write!(f, "fluvio-smartmodule-cargo-dependency={}", dependency)
+                write!(f, "fluvio-smartmodule-cargo-dependency={dependency}")
             }
             SmdkTemplateValue::SmType(sm_type) => {
-                write!(f, "smartmodule-type={}", sm_type)
+                write!(f, "smartmodule-type={sm_type}")
             }
             SmdkTemplateValue::UseParams(sm_params) => {
-                write!(f, "smartmodule-params={}", sm_params)
+                write!(f, "smartmodule-params={sm_params}")
             }
             SmdkTemplateValue::ProjectGroup(group) => {
-                write!(f, "project-group={}", group)
+                write!(f, "project-group={group}")
             }
             SmdkTemplateValue::SmPublic(public) => {
-                write!(f, "smartmodule-public={}", public)
+                write!(f, "smartmodule-public={public}")
             }
         }
     }
@@ -553,17 +523,17 @@ impl std::fmt::Display for CargoSmDependSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CargoSmDependSource::CratesIo(version) => {
-                write!(f, "\"{}\"", version)
+                write!(f, "\"{version}\"")
             }
-            CargoSmDependSource::Git(url) => write!(f, "{{ git = \"{}\" }}", url),
+            CargoSmDependSource::Git(url) => write!(f, "{{ git = \"{url}\" }}"),
             CargoSmDependSource::GitBranch { url, branch } => {
-                write!(f, "{{ git = \"{}\", branch = \"{}\" }}", url, branch)
+                write!(f, "{{ git = \"{url}\", branch = \"{branch}\" }}")
             }
             CargoSmDependSource::GitTag { url, tag } => {
-                write!(f, "{{ git = \"{}\", tag = \"{}\" }}", url, tag)
+                write!(f, "{{ git = \"{url}\", tag = \"{tag}\" }}")
             }
             CargoSmDependSource::GitRev { url, rev } => {
-                write!(f, "{{ git = \"{}\", rev = \"{}\" }}", url, rev)
+                write!(f, "{{ git = \"{url}\", rev = \"{rev}\" }}")
             }
             CargoSmDependSource::Path(path) => {
                 write!(f, "{{ path = \"{}\" }}", path.as_path().display())
@@ -583,6 +553,8 @@ mod test {
     use super::CargoSmDependSource;
     use super::FLUVIO_SMARTMODULE_REPO;
 
+    use crate::SMARTMODULE_TOML;
+
     #[test]
     fn test_default_template() {
         let template = SmdkTemplate::default().unwrap();
@@ -598,7 +570,7 @@ mod test {
 
         let mut temp_dir = temp_dir.unwrap();
         let smart_toml =
-            temp_dir.find(|entry| entry.as_ref().unwrap().file_name().eq("SmartModule.toml"));
+            temp_dir.find(|entry| entry.as_ref().unwrap().file_name().eq(SMARTMODULE_TOML));
 
         assert!(
             smart_toml.is_some(),
@@ -630,27 +602,27 @@ mod test {
         for value in test_template_values {
             match &value {
                 CargoSmDependSource::CratesIo(version) => {
-                    assert_eq!(value.to_string(), format!("\"{}\"", version))
+                    assert_eq!(value.to_string(), format!("\"{version}\""))
                 }
                 CargoSmDependSource::Git(url) => {
-                    assert_eq!(value.to_string(), format!("{{ git = \"{}\" }}", url))
+                    assert_eq!(value.to_string(), format!("{{ git = \"{url}\" }}"))
                 }
                 CargoSmDependSource::GitBranch { url, branch } => {
                     assert_eq!(
                         value.to_string(),
-                        format!("{{ git = \"{}\", branch = \"{}\" }}", url, branch)
+                        format!("{{ git = \"{url}\", branch = \"{branch}\" }}")
                     )
                 }
                 CargoSmDependSource::GitTag { url, tag } => {
                     assert_eq!(
                         value.to_string(),
-                        format!("{{ git = \"{}\", tag = \"{}\" }}", url, tag)
+                        format!("{{ git = \"{url}\", tag = \"{tag}\" }}")
                     )
                 }
                 CargoSmDependSource::GitRev { url, rev } => {
                     assert_eq!(
                         value.to_string(),
-                        format!("{{ git = \"{}\", rev = \"{}\" }}", url, rev)
+                        format!("{{ git = \"{url}\", rev = \"{rev}\" }}")
                     )
                 }
                 CargoSmDependSource::Path(path) => {

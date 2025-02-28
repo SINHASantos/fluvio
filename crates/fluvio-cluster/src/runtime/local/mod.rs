@@ -11,7 +11,7 @@ mod error {
 
     use std::io::Error as IoError;
 
-    use fluvio_command::{CommandError};
+    use fluvio_command::CommandError;
 
     #[derive(thiserror::Error, Debug)]
     pub enum LocalRuntimeError {
@@ -33,6 +33,7 @@ mod process {
 
     use std::{borrow::Cow, process::Command};
 
+    use anyhow::Result;
     use tracing::{info, instrument};
 
     use fluvio::config::{TlsConfig, TlsPaths};
@@ -43,12 +44,7 @@ mod process {
 
     pub trait FluvioLocalProcess {
         #[instrument(skip(self, cmd, tls, port))]
-        fn set_server_tls(
-            &self,
-            cmd: &mut Command,
-            tls: &TlsConfig,
-            port: u16,
-        ) -> Result<(), LocalRuntimeError> {
+        fn set_server_tls(&self, cmd: &mut Command, tls: &TlsConfig, port: u16) -> Result<()> {
             let paths: Cow<TlsPaths> = tls_config_to_cert_paths(tls)?;
 
             info!("starting SC with TLS options");
@@ -70,7 +66,7 @@ mod process {
                 .arg("--ca-cert")
                 .arg(ca_cert)
                 .arg("--bind-non-tls-public")
-                .arg(format!("0.0.0.0:{}", port));
+                .arg(format!("0.0.0.0:{port}"));
             Ok(())
         }
     }

@@ -20,7 +20,7 @@ spec:
           properties:
             spec:
               type: object
-              required: ["leader", "replicas"]
+              required: ["leader"]
               properties:
                 leader:
                   type: integer
@@ -28,6 +28,37 @@ spec:
                   type: array
                   items:
                     type: integer
+                mirror:
+                  type: object
+                  oneOf:
+                    - required: ["home"]
+                    - required: ["remote"]
+                  properties:
+                    home:
+                      type: object
+                      required: ["remoteCluster","remoteReplica"]
+                      properties:
+                        remoteReplica:
+                          type: string
+                        remoteCluster:
+                          type: string
+                        source:
+                          type: boolean
+                    remote:
+                      type: object
+                      required: ["homeCluster","homeSpuKey","homeSpuEndpoint","homeSpu"]
+                      properties:
+                        homeCluster:
+                          type: string
+                        homeSpuKey:
+                          type: string
+                        homeSpuEndpoint:
+                          type: string
+                        homeSpuId:
+                          type: integer
+                          minimum: 0
+                        target:
+                          type: boolean
                 cleanupPolicy:
                   type: object
                   properties:
@@ -53,6 +84,36 @@ spec:
                     - Gzip
                     - Snappy
                     - Lz4
+                    - Zstd
+                deduplication:
+                  type: object
+                  nullable: true  
+                  properties:
+                    filter: 
+                      type: object
+                      nullable: false   
+                      properties:
+                        transform:
+                          type: object
+                          properties:
+                            uses:
+                              type: string
+                              nullable: false  
+                            with:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                    bounds: 
+                      type: object
+                      nullable: false   
+                      properties:
+                        count:
+                          type: integer
+                          minimum: 0
+                        age:
+                          type: string
+                          nullable: true
+                system:
+                  type: boolean
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
@@ -86,6 +147,11 @@ spec:
         format: int64
         description: Leader High Watermark
         jsonPath: .status.leader.hw
+      - name: Base Offset
+        type: integer
+        format: int64
+        description: Base Offset
+        jsonPath: .status.baseOffset
       - name: EOF
         type: integer
         format: int64
@@ -99,4 +165,7 @@ spec:
         type: string
         description: Size
         jsonPath: .status.size
-    
+      - name: Deduplication Filter
+        type: string
+        description: Deduplication
+        jsonPath: .spec.deduplication.filter.transform.uses

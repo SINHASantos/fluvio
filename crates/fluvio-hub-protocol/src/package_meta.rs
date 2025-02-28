@@ -2,6 +2,7 @@ use std::default::Default;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, error};
+use url::Url;
 
 use fluvio_controlplane_metadata::smartmodule::FluvioSemVersion;
 use fluvio_controlplane_metadata::smartmodule::SmartModulePackageKey;
@@ -18,15 +19,14 @@ pub struct PackageMeta {
     pub name: String,
     pub version: String, // SemVer?, package version
     pub group: String,
-    // author: Option<String>,
     pub description: String,
     pub license: String,
+    pub manifest: Vec<String>, // Files in package, package-meta is implied, signature is omitted
+    pub repository_url: Option<Url>,
+    pub tags: Option<Vec<PkgTag>>,
 
     #[serde(default = "PackageMeta::visibility_if_missing")]
     pub visibility: PkgVisibility, // private is default if missing
-    pub manifest: Vec<String>, // Files in package, package-meta is implied, signature is omitted
-                               // repository: optional url
-                               // repository-commit: optional hash
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone)]
@@ -35,6 +35,12 @@ pub enum PkgVisibility {
     #[default]
     Private,
     Public,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone)]
+pub struct PkgTag {
+    pub tag: String,
+    pub value: String,
 }
 
 impl Default for PackageMeta {
@@ -48,6 +54,8 @@ impl Default for PackageMeta {
             license: "e.g. Apache2".into(),
             visibility: PkgVisibility::Private,
             manifest: Vec::new(),
+            tags: None,
+            repository_url: None,
         }
     }
 }
@@ -131,8 +139,8 @@ impl PackageMeta {
 
         packagename_validate(&spk.name)?;
 
-        self.name = spk.name.clone();
-        self.group = spk.group.clone();
+        self.name.clone_from(&spk.name);
+        self.group.clone_from(&spk.group);
         self.version = spk.version.to_string();
         self.description = spk.description.clone().unwrap_or_default();
         self.visibility = PkgVisibility::from(&spk.visibility);
@@ -160,8 +168,43 @@ impl PackageMeta {
             Ok(())
         }
     }
+
+    pub fn tag_add(&mut self, tagname: &str, tagval: &str) {
+        let pkgtag = PkgTag::new(tagname, tagval);
+        if let Some(ref mut tagvec) = self.tags {
+            tagvec.push(pkgtag)
+        } else {
+            self.tags = Some(vec![pkgtag]);
+        }
+    }
+
+    pub fn tag_get(&self, tagname: &str) -> Option<Vec<PkgTag>> {
+        if let Some(ref tags) = self.tags {
+            let out = tags
+                .iter()
+                .filter_map(|tv| {
+                    if tv.tag == tagname {
+                        Some(tv.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Some(out)
+        } else {
+            None
+        }
+    }
 }
 
+impl PkgTag {
+    pub fn new(tag: &str, val: &str) -> Self {
+        PkgTag {
+            tag: tag.to_string(),
+            value: val.to_string(),
+        }
+    }
+}
 pub fn packagename_validate(pkgname: &str) -> Result<()> {
     let mut advice = String::new();
 
@@ -193,10 +236,10 @@ pub fn validate_lowercase(val: &str, name: &str) -> String {
 pub fn validate_allowedchars(val: &str, name: &str) -> String {
     let good_chars = val
         .chars()
-        .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_'));
+        .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | ':' | '-' | '_'));
 
     if !good_chars {
-        format!("{name} {val} should be alphanumeric, '-' or '_'\n")
+        format!("{name} {val} should be alphanumeric, ':', '-' or '_'\n")
     } else {
         String::new()
     }
@@ -223,7 +266,7 @@ impl From<&SmartModuleVisibility> for PkgVisibility {
 
 #[test]
 fn builds_obj_key_from_package_name() {
-    let pkg_names = vec![
+    let pkg_names = [
         "infinyon/example@0.0.1",
         "infinyon/example-sm@0.1.0",
         "infinyon/json-sql@0.0.2",
@@ -232,7 +275,7 @@ fn builds_obj_key_from_package_name() {
         "infinyon/test-cli@0.1.0",
         "infinyon/regex@0.0.1",
     ];
-    let obj_paths = vec![
+    let obj_paths = [
         "infinyon/example-0.0.1.ipkg",
         "infinyon/example-sm-0.1.0.ipkg",
         "infinyon/json-sql-0.0.2.ipkg",
@@ -257,7 +300,7 @@ impl std::fmt::Display for PkgVisibility {
             PkgVisibility::Private => "private",
             PkgVisibility::Public => "public",
         };
-        write!(f, "{}", lbl)
+        write!(f, "{lbl}")
     }
 }
 
@@ -355,4 +398,30 @@ fn hub_packagemeta_naming_check() {
         let res = pm.naming_check();
         assert!(res.is_err(), "Denied an valid package meta config {pm:?}");
     }
+}
+
+#[test]
+fn hub_packagemeta_tags() {
+    let mut pm = PackageMeta {
+        group: "infinyon".into(),
+        name: "example".into(),
+        version: "0.0.1".into(),
+        manifest: ["module.wasm".into()].to_vec(),
+        ..PackageMeta::default()
+    };
+
+    assert_eq!(pm.tag_get("atag"), None);
+    pm.tag_add("atag", "present");
+
+    let atag = pm.tag_get("atag");
+    assert!(atag.is_some());
+    let atag = atag.unwrap();
+    assert_eq!(atag.len(), 1);
+
+    // pkgmeta tags are not unique
+    pm.tag_add("atag", "value2");
+    let atag = pm.tag_get("atag");
+    assert!(atag.is_some());
+    let atag = atag.unwrap();
+    assert_eq!(atag.len(), 2);
 }

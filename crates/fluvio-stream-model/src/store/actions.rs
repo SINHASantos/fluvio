@@ -7,6 +7,7 @@ use crate::store::*;
 
 /// changes that will be applied to store
 /// add/update has same effect
+#[derive(Debug)]
 pub enum LSUpdate<S, C>
 where
     S: Spec,
@@ -52,10 +53,7 @@ where
     S::Status: PartialEq,
     C: MetadataItem,
 {
-    pub fn add<K>(value: K) -> Self
-    where
-        K: Into<MetadataStoreObject<S, C>>,
-    {
+    pub fn add(value: impl Into<MetadataStoreObject<S, C>>) -> Self {
         LSChange::Add(value.into())
     }
 

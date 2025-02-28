@@ -1,15 +1,12 @@
 mod spec;
 mod status;
 
-pub mod store;
 pub use self::spec::*;
 pub use self::status::*;
 pub use custom_metadata::CustomSpuKey;
 
 #[cfg(feature = "k8")]
 mod k8;
-#[cfg(feature = "k8")]
-pub use k8::*;
 
 mod metadata {
 
@@ -44,7 +41,6 @@ mod metadata {
 
         impl K8ExtendedSpec for SpuSpec {
             type K8Spec = Self;
-            type K8Status = Self::Status;
 
             fn convert_from_k8(
                 k8_obj: K8Obj<Self::K8Spec>,
@@ -52,6 +48,14 @@ mod metadata {
             ) -> Result<MetadataStoreObject<Self, K8MetaItem>, K8ConvertError<Self::K8Spec>>
             {
                 default_convert_from_k8(k8_obj, multi_namespace_context)
+            }
+
+            fn convert_status_from_k8(status: Self::Status) -> Self::Status {
+                status
+            }
+
+            fn into_k8(self) -> Self::K8Spec {
+                self
             }
         }
     }
@@ -103,8 +107,8 @@ mod custom_metadata {
     impl fmt::Display for CustomSpuKey {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             match self {
-                Self::Name(name) => write!(f, "{}", name),
-                Self::Id(id) => write!(f, "{}", id),
+                Self::Name(name) => write!(f, "{name}"),
+                Self::Id(id) => write!(f, "{id}"),
             }
         }
     }
@@ -187,7 +191,7 @@ mod custom_metadata {
                 // Unexpected type
                 _ => Err(Error::new(
                     ErrorKind::InvalidData,
-                    format!("invalid spec type {}", typ),
+                    format!("invalid spec type {typ}"),
                 )),
             }
         }

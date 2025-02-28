@@ -15,7 +15,7 @@ use fluvio_auth::{AuthContext, TypeAction};
 use fluvio_controlplane_metadata::extended::SpecExt;
 
 #[instrument(skip(filters, auth, object_ctx))]
-pub(crate) async fn fetch_smart_modules<AC: AuthContext, M>(
+pub(crate) async fn fetch_smart_modules<AC, M>(
     filters: Vec<ListFilter>,
     summary: bool,
     auth: &AC,
@@ -25,7 +25,7 @@ where
     AC: AuthContext,
     M: MetadataItem + Debug,
 {
-    debug!("fetching list of smart modules");
+    debug!("fetching list of smartmodules");
 
     if let Ok(authorized) = auth
         .allow_type_action(SmartModuleSpec::OBJECT_TYPE, TypeAction::Read)
@@ -63,7 +63,7 @@ where
                     .count()
                     > 0
             {
-                debug!("found matching smart module: {:#?}", value.spec);
+                debug!("found matching smartmodule: {:#?}", value.spec);
                 if summary {
                     Some(Metadata {
                         name: value.key().clone(),
@@ -90,15 +90,12 @@ mod test {
 
     use std::sync::Arc;
 
+    use fluvio_auth::root::RootAuthContext;
     use fluvio_stream_dispatcher::store::StoreContext;
     use fluvio_stream_model::fixture::TestMeta;
     use fluvio_stream_model::store::{MetadataStoreObject, LocalStore};
     use fluvio_controlplane_metadata::smartmodule::{
         SmartModuleSpec, SmartModuleMetadata, SmartModulePackage, FluvioSemVersion,
-    };
-
-    use crate::{
-        services::auth::{RootAuthContext},
     };
 
     use super::fetch_smart_modules;

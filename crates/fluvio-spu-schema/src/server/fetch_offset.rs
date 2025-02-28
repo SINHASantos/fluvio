@@ -11,6 +11,7 @@ use fluvio_protocol::record::ReplicaKey;
 
 use fluvio_types::PartitionId;
 
+use crate::COMMON_VERSION;
 use crate::errors::ErrorCode;
 use super::SpuServerApiKey;
 
@@ -23,17 +24,20 @@ use super::SpuServerApiKey;
 pub struct FetchOffsetsRequest {
     /// Each topic in the request.
     pub topics: Vec<FetchOffsetTopic>,
+
+    #[fluvio(min_version = 23)]
+    pub consumer_id: Option<String>,
 }
 
 impl Request for FetchOffsetsRequest {
     const API_KEY: u16 = SpuServerApiKey::FetchOffsets as u16;
-    const DEFAULT_API_VERSION: i16 = 0;
+    const DEFAULT_API_VERSION: i16 = COMMON_VERSION;
     type Response = FetchOffsetsResponse;
 }
 
 impl FetchOffsetsRequest {
     /// create request with a single topic and partition
-    pub fn new(topic: String, partition: u32) -> Self {
+    pub fn new(topic: String, partition: u32, consumer_id: Option<String>) -> Self {
         Self {
             topics: vec![FetchOffsetTopic {
                 name: topic,
@@ -41,6 +45,7 @@ impl FetchOffsetsRequest {
                     partition_index: partition,
                 }],
             }],
+            consumer_id,
         }
     }
 }

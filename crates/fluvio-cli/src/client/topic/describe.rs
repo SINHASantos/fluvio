@@ -5,13 +5,14 @@
 //!
 
 use std::sync::Arc;
+
 use tracing::debug;
 use clap::Parser;
+use anyhow::Result;
 
 use fluvio::Fluvio;
 use fluvio::metadata::topic::TopicSpec;
 
-use crate::Result;
 use crate::common::output::Terminal;
 use crate::common::OutputFormat;
 
@@ -22,7 +23,7 @@ use crate::common::OutputFormat;
 #[derive(Debug, Parser)]
 pub struct DescribeTopicsOpt {
     /// The name of the Topic to describe
-    #[clap(value_name = "name")]
+    #[arg(value_name = "name")]
     topic: String,
 
     #[clap(flatten)]
@@ -47,6 +48,7 @@ mod display {
 
     use fluvio::metadata::topic::ReplicaSpec;
     use comfy_table::Row;
+    use humantime::format_duration;
     use serde::Serialize;
 
     use fluvio::metadata::objects::Metadata;
@@ -142,7 +144,26 @@ mod display {
                     ));
                     */
                 }
+                ReplicaSpec::Mirror(_config) => {}
             }
+
+            if let Some(dedup) = spec.get_deduplication() {
+                key_values.push((
+                    "Deduplication Filter".to_owned(),
+                    Some(dedup.filter.transform.uses.clone()),
+                ));
+                key_values.push((
+                    "Deduplication Count Bound".to_owned(),
+                    Some(dedup.bounds.count)
+                        .filter(|c| *c != 0)
+                        .as_ref()
+                        .map(ToString::to_string),
+                ));
+                key_values.push((
+                    "Deduplication Age Bound".to_owned(),
+                    dedup.bounds.age.map(|a| format_duration(a).to_string()),
+                ));
+            };
 
             key_values.push((
                 "Status".to_owned(),

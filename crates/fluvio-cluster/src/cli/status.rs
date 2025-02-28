@@ -1,9 +1,12 @@
 use clap::Parser;
 use colored::Colorize;
-use fluvio::{Fluvio, FluvioAdmin, FluvioConfig};
+use anyhow::{Result, anyhow};
+
+use fluvio::{Fluvio, FluvioAdmin, FluvioClusterConfig};
 use fluvio::config::ConfigFile;
 use fluvio_controlplane_metadata::partition::PartitionSpec;
 use fluvio_controlplane_metadata::{spu::SpuSpec, topic::TopicSpec};
+use fluvio_extension_common::installation::InstallationType;
 use fluvio_sc_schema::objects::Metadata;
 use tracing::debug;
 
@@ -14,7 +17,7 @@ use crate::{cli::ClusterCliError, cli::ClusterTarget};
 use crate::progress::ProgressBarFactory;
 
 #[derive(Debug, Parser)]
-pub struct StatusOpt {}
+pub struct StatusOpt;
 
 macro_rules! pad_format {
     ( $e:expr ) => {
@@ -23,27 +26,27 @@ macro_rules! pad_format {
 }
 
 impl StatusOpt {
-    pub async fn process(self, target: ClusterTarget) -> Result<(), ClusterCliError> {
+    pub async fn process(self, target: ClusterTarget) -> Result<()> {
         let pb_factory = ProgressBarFactory::new(false);
 
         let pb = match pb_factory.create() {
             Ok(pb) => pb,
-            Err(_) => {
-                return Err(ClusterCliError::Other(
-                    "Failed to create progress bar".to_string(),
-                ))
-            }
+            Err(_) => return Err(anyhow!("Failed to create progress bar")),
         };
 
         let fluvio_config = target.load()?;
         let config_file = ConfigFile::load_default_or_new()?;
+        let installation_type = InstallationType::load(config_file.config().current_cluster()?);
+        debug!(?installation_type);
 
         pb_factory.println(format!(
             "📝 Running cluster status checks with profile {}",
             Self::profile_name(&config_file).italic()
         ));
 
-        Self::check_k8s_cluster(&pb).await?;
+        if let InstallationType::K8 | InstallationType::LocalK8 = installation_type {
+            let _ = Self::check_k8s_cluster(&pb).await;
+        }
         Self::check_sc(&pb, &fluvio_config, &config_file).await?;
         Self::check_spus(&pb, &fluvio_config).await?;
         Self::check_topics(&pb, &fluvio_config).await?;
@@ -53,7 +56,7 @@ impl StatusOpt {
         Ok(())
     }
 
-    async fn check_k8s_cluster(pb: &ProgressRenderer) -> Result<(), ClusterCliError> {
+    async fn check_k8s_cluster(pb: &ProgressRenderer) -> Result<()> {
         let k8s_cluster_check = Box::new(ActiveKubernetesCluster);
 
         pb.set_message(pad_format!(format!(
@@ -76,19 +79,17 @@ impl StatusOpt {
                     k8s_cluster_check.label().italic(),
                 )));
 
-                Err(ClusterCliError::Other(err.to_string()))
+                Err(ClusterCliError::Other(err.to_string()).into())
             }
-            _ => Err(ClusterCliError::Other(
-                "Should not be reachable".to_string(),
-            )),
+            _ => Err(ClusterCliError::Other("Should not be reachable".to_string()).into()),
         }
     }
 
     async fn check_sc(
         pb: &ProgressRenderer,
-        fluvio_config: &FluvioConfig,
+        fluvio_config: &FluvioClusterConfig,
         config_file: &ConfigFile,
-    ) -> Result<(), ClusterCliError> {
+    ) -> Result<()> {
         pb.set_message(pad_format!(format!("{} Checking {}", "📝".bold(), "SC")));
 
         match Fluvio::connect_with_config(fluvio_config).await {
@@ -103,15 +104,12 @@ impl StatusOpt {
                     Self::profile_name(config_file).italic(),
                 )));
 
-                Err(ClusterCliError::Other(err.to_string()))
+                Err(ClusterCliError::Other(err.to_string()).into())
             }
         }
     }
 
-    async fn check_spus(
-        pb: &ProgressRenderer,
-        fluvio_config: &FluvioConfig,
-    ) -> Result<(), ClusterCliError> {
+    async fn check_spus(pb: &ProgressRenderer, fluvio_config: &FluvioClusterConfig) -> Result<()> {
         pb.set_message(pad_format!(format!("{} Checking {}", "📝".bold(), "SPUs")));
 
         match FluvioAdmin::connect_with_config(fluvio_config).await {
@@ -151,7 +149,7 @@ impl StatusOpt {
                     "❌".bold(),
                 )));
 
-                Err(ClusterCliError::ClientError(e))
+                Err(e)
             }
         }
     }
@@ -166,8 +164,8 @@ impl StatusOpt {
 
     async fn check_topics(
         pb: &ProgressRenderer,
-        fluvio_config: &FluvioConfig,
-    ) -> Result<(), ClusterCliError> {
+        fluvio_config: &FluvioClusterConfig,
+    ) -> Result<()> {
         pb.set_message(pad_format!(format!(
             "{} Checking {}",
             "📝".bold(),
@@ -201,14 +199,12 @@ impl StatusOpt {
                     "❌".bold(),
                 )));
 
-                Err(ClusterCliError::ClientError(e))
+                Err(e)
             }
         }
     }
 
-    async fn total_cluster_storage(
-        partitions: &Vec<Metadata<PartitionSpec>>,
-    ) -> Result<i64, ClusterCliError> {
+    async fn total_cluster_storage(partitions: &Vec<Metadata<PartitionSpec>>) -> Result<i64> {
         let mut cluster_total = 0;
         for partition in partitions {
             let follower_count = partition.status.replicas.len() as i64;
@@ -222,12 +218,12 @@ impl StatusOpt {
         Ok(cluster_total)
     }
 
-    fn partition_size(partition: &Metadata<PartitionSpec>) -> Result<i64, ClusterCliError> {
+    fn partition_size(partition: &Metadata<PartitionSpec>) -> Result<i64> {
         match partition.status.size {
             size if size < 0 => Err(ClusterCliError::Other(format!(
-                "A partition has an invalid size: {}",
-                size
-            ))),
+                "A partition has an invalid size: {size}"
+            ))
+            .into()),
             size => Ok(size),
         }
     }

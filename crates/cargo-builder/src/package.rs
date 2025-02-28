@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use cargo_metadata::{CargoOpt, MetadataCommand, Package};
 
+use crate::WASM_TARGET;
+
 #[derive(Debug)]
 pub struct PackageOption {
     pub release: String,
     pub package_name: Option<String>,
+    pub target: String,
 }
 
 #[derive(Debug)]
@@ -20,6 +23,8 @@ pub struct PackageInfo {
     package_path: PathBuf,
     /// The package/project target folder
     target_dir: PathBuf,
+    /// Target platform for the package
+    arch_target: String,
     /// Profile used in build, e.g. release, release-lto, etc.
     profile: String,
 }
@@ -33,6 +38,7 @@ impl PackageInfo {
         let metadata = MetadataCommand::new()
             .manifest_path(&current_project)
             .features(CargoOpt::AllFeatures)
+            .verbose(true)
             .exec()
             .context(format!(
                 "Failed to load cargo project at {}",
@@ -76,6 +82,7 @@ impl PackageInfo {
         Ok(PackageInfo {
             package,
             package_path,
+            arch_target: options.target.clone(),
             target_dir: metadata.target_directory.into(),
             profile: options.release.clone(),
         })
@@ -90,14 +97,17 @@ impl PackageInfo {
     }
 
     pub fn package_relative_path<P: AsRef<Path>>(&self, child: P) -> PathBuf {
-        let mut package_path = self.package_path().to_path_buf();
-        package_path.push(child);
-        package_path
+        self.package_path().join(child)
+    }
+
+    pub fn arch_target(&self) -> &str {
+        &self.arch_target
     }
 
     /// path to package's bin target
     pub fn target_bin_path(&self) -> anyhow::Result<PathBuf> {
         let mut path = self.target_dir.clone();
+        path.push(&self.arch_target);
         path.push(&self.profile);
         path.push(self.target_name()?);
         Ok(path)
@@ -108,18 +118,27 @@ impl PackageInfo {
         let mut path = self.target_dir.clone();
         path.push("wasm32-unknown-unknown");
         path.push(&self.profile);
-        path.push(self.target_name()?);
+        path.push(self.target_name()?.replace('-', "_"));
+        path.set_extension("wasm");
+        Ok(path)
+    }
+
+    /// path to package's wasm32-wasip1 target
+    pub fn target_wasm32_wasi_path(&self) -> anyhow::Result<PathBuf> {
+        let mut path = self.target_dir.clone();
+        path.push(WASM_TARGET);
+        path.push(&self.profile);
+        path.push(self.target_name()?.replace('-', "_"));
         path.set_extension("wasm");
         Ok(path)
     }
 
     pub fn target_name(&self) -> anyhow::Result<&str> {
-        Ok(&self
-            .package
+        self.package
             .targets
-            .get(0)
-            .ok_or_else(|| anyhow!("package does not have any targets"))?
-            .name)
+            .first()
+            .map(|target| target.name.as_str())
+            .ok_or_else(|| anyhow!("package does not have any targets"))
     }
 }
 /// Finds the closest Cargo.toml in the tree, starting from the current directory
@@ -130,7 +149,6 @@ pub fn get_current_project_path() -> anyhow::Result<Option<PathBuf>> {
     for path in parents {
         if let Some(filename) = read_dir(path)
             .context("failed to read directory")?
-            .into_iter()
             .map(|p| p.unwrap().file_name())
             .find(|p| p.eq(&OsString::from("Cargo.toml")))
         {
@@ -143,6 +161,7 @@ pub fn get_current_project_path() -> anyhow::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WASM_TARGET;
 
     #[test]
     fn test_package_info() {
@@ -150,6 +169,7 @@ mod tests {
         let opt = PackageOption {
             release: "release-lto".into(),
             package_name: None,
+            target: "x86_64-unknown-linux-gnu".into(),
         };
 
         //when
@@ -160,14 +180,18 @@ mod tests {
         assert!(package_info
             .package_path()
             .ends_with("crates/cargo-builder"));
-        assert_eq!(package_info.target_name().unwrap(), "cargo-builder");
+        assert_eq!(package_info.target_name().unwrap(), "cargo_builder");
         assert!(package_info
             .target_bin_path()
             .unwrap()
-            .ends_with("release-lto/cargo-builder"));
+            .ends_with("x86_64-unknown-linux-gnu/release-lto/cargo_builder"));
         assert!(package_info
             .target_wasm32_path()
             .unwrap()
-            .ends_with("wasm32-unknown-unknown/release-lto/cargo-builder.wasm"));
+            .ends_with("wasm32-unknown-unknown/release-lto/cargo_builder.wasm"));
+        assert!(package_info
+            .target_wasm32_wasi_path()
+            .unwrap()
+            .ends_with(format!("{WASM_TARGET}/release-lto/cargo_builder.wasm")));
     }
 }

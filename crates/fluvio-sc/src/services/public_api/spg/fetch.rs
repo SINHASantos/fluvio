@@ -1,6 +1,8 @@
 use std::io::{Error, ErrorKind};
 
+use fluvio_stream_model::core::MetadataItem;
 use tracing::{debug, trace, instrument};
+use anyhow::Result;
 
 use fluvio_sc_schema::objects::{ListResponse, Metadata, ListFilters};
 use fluvio_sc_schema::spg::SpuGroupSpec;
@@ -11,10 +13,10 @@ use fluvio_controlplane_metadata::extended::SpecExt;
 use crate::services::auth::AuthServiceContext;
 
 #[instrument(skip(filters, auth_ctx))]
-pub async fn handle_fetch_spu_groups_request<AC: AuthContext>(
+pub async fn handle_fetch_spu_groups_request<AC: AuthContext, C: MetadataItem>(
     filters: ListFilters,
-    auth_ctx: &AuthServiceContext<AC>,
-) -> Result<ListResponse<SpuGroupSpec>, Error> {
+    auth_ctx: &AuthServiceContext<AC, C>,
+) -> Result<ListResponse<SpuGroupSpec>> {
     debug!("fetching spu groups");
 
     if let Ok(authorized) = auth_ctx
@@ -28,7 +30,7 @@ pub async fn handle_fetch_spu_groups_request<AC: AuthContext>(
             return Ok(ListResponse::new(vec![]));
         }
     } else {
-        return Err(Error::new(ErrorKind::Interrupted, "authorization io error"));
+        return Err(Error::new(ErrorKind::Interrupted, "authorization io error").into());
     }
 
     let spgs: Vec<Metadata<SpuGroupSpec>> = auth_ctx

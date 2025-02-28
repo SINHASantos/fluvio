@@ -6,8 +6,8 @@ use tracing::{debug, info, instrument};
 
 use fluvio_controlplane_metadata::spu::{Endpoint, IngressAddr, IngressPort, SpuSpec, SpuType};
 
-use fluvio_command::{CommandExt};
-use fluvio::config::{TlsPolicy};
+use fluvio_command::CommandExt;
+use fluvio::config::TlsPolicy;
 use fluvio_types::SpuId;
 
 use crate::runtime::spu::{SpuClusterManager, SpuTarget};
@@ -81,8 +81,8 @@ impl SpuTarget for LocalSpuProcess {
 
 const BASE_PORT: u16 = 9010;
 const BASE_SPU: u16 = 5001;
-/// manage spu process cluster
 
+/// Manage SPU Process Cluster
 pub struct LocalSpuProcessClusterManager {
     pub log_dir: PathBuf,
     pub launcher: Option<PathBuf>,
@@ -133,12 +133,12 @@ impl SpuClusterManager for LocalSpuProcessClusterManager {
     }
 
     fn terminate_spu(&self, id: SpuId) -> AnyResult<()> {
-        let kill_arg = format!("fluvio-run spu -i {}", id);
+        let kill_arg = format!("fluvio-run spu -i {id}");
         Command::new("pkill")
             .arg("-f")
             .arg(kill_arg)
             .output()
-            .map_err(|err| anyhow!("failed to terminate: {}", err))
+            .map_err(|err| anyhow!("failed to terminate: {err}"))
             .map(|_| ())
     }
 }

@@ -1,13 +1,16 @@
-use clap::Parser;
 use anyhow::Result;
+use cargo_builder::package::PackageOption;
+use clap::Parser;
+use fluvio_cli_common::version_cmd::BasicVersionCmd;
 
-use crate::build::BuildCmd;
+use crate::build::{BuildCmd, BUILD_TARGET};
 use crate::generate::GenerateCmd;
 use crate::test::TestCmd;
 use crate::load::LoadCmd;
 use crate::publish::PublishCmd;
 use crate::hub::HubCmd;
 use crate::set_public::SetPublicOpt;
+use crate::clean::CleanCmd;
 
 /// SmartModule Development Kit utility
 #[derive(Debug, Parser)]
@@ -21,11 +24,15 @@ pub enum SmdkCommand {
     /// Publish SmartModule to Hub
     Publish(PublishCmd),
     /// Hub options
-    #[clap(subcommand, hide = true)]
+    #[command(subcommand, hide = true)]
     Hub(HubCmd),
     /// Set package as public
-    #[clap(name = "set-public")]
+    #[command(name = "set-public")]
     SetPublic(SetPublicOpt),
+    /// Print smdk version information
+    Version(BasicVersionCmd),
+    /// Cleans the current directory
+    Clean(CleanCmd),
 }
 
 impl SmdkCommand {
@@ -38,6 +45,29 @@ impl SmdkCommand {
             SmdkCommand::Publish(opt) => opt.process(),
             SmdkCommand::Hub(opt) => opt.process(),
             SmdkCommand::SetPublic(opt) => opt.process(),
+            SmdkCommand::Clean(opt) => opt.process(),
+            SmdkCommand::Version(opt) => opt.process("SMDK"),
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+pub(crate) struct PackageCmd {
+    /// Release profile name
+    #[arg(long, default_value = "release-lto")]
+    pub release: String,
+
+    /// Optional package/project name
+    #[arg(long, short)]
+    pub package_name: Option<String>,
+}
+
+impl PackageCmd {
+    pub(crate) fn as_opt(&self) -> PackageOption {
+        PackageOption {
+            release: self.release.clone(),
+            package_name: self.package_name.clone(),
+            target: BUILD_TARGET.to_string(),
         }
     }
 }

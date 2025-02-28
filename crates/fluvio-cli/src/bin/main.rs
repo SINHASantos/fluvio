@@ -1,20 +1,21 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
-use color_eyre::eyre::Result;
+use anyhow::Result;
+
 use fluvio_cli::{Root, HelpOpt};
 use fluvio_future::task::run_block_on;
 
 fn main() -> Result<()> {
     fluvio_future::subscriber::init_tracer(None);
-    color_eyre::config::HookBuilder::blank()
-        .display_env_section(false)
-        .install()?;
+
     print_help_hack()?;
     let root: Root = Root::parse();
 
     // If the CLI comes back with an error, attempt to handle it
     if let Err(e) = run_block_on(root.process()) {
-        let user_error = e.get_user_error()?;
-        eprintln!("{}", user_error);
+        eprintln!("{e}");
         std::process::exit(1);
     }
 
@@ -28,7 +29,7 @@ fn print_help_hack() -> Result<()> {
         std::process::exit(0);
     } else if let Some(first_arg) = args.nth(1) {
         // We pick help up here as a courtesy
-        if vec!["-h", "--help", "help"].contains(&first_arg.as_str()) {
+        if ["-h", "--help", "help"].contains(&first_arg.as_str()) {
             HelpOpt {}.process()?;
             std::process::exit(0);
         }

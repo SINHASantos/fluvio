@@ -1,126 +1,119 @@
 use std::sync::Arc;
-use std::io::Error as IoError;
-use std::io::ErrorKind;
 
-use fluvio_sc_schema::AdminSpec;
+use fluvio_stream_model::core::MetadataItem;
+use fluvio_stream_model::store::ChangeListener;
 use tracing::{debug, trace, error, instrument};
+use anyhow::{anyhow, Result};
 
+use fluvio_sc_schema::{AdminSpec, TryEncodableFrom};
 use fluvio_types::event::StickyEvent;
 use fluvio_socket::ExclusiveFlvSink;
 use fluvio_protocol::{Encoder, Decoder};
 use fluvio_protocol::api::{RequestMessage, RequestHeader, ResponseMessage};
 use fluvio_sc_schema::objects::{
     ObjectApiWatchRequest, WatchResponse, Metadata, MetadataUpdate, ObjectApiWatchResponse,
+    WatchRequest,
 };
 
 use fluvio_controlplane_metadata::partition::PartitionSpec;
 use fluvio_controlplane_metadata::spu::SpuSpec;
 use fluvio_controlplane_metadata::topic::TopicSpec;
-use fluvio_controlplane_metadata::connector::ManagedConnectorSpec;
 use fluvio_controlplane_metadata::smartmodule::SmartModuleSpec;
 use fluvio_controlplane_metadata::tableformat::TableFormatSpec;
 
 use crate::services::auth::AuthServiceContext;
-use crate::stores::{StoreContext, K8ChangeListener};
+use crate::stores::StoreContext;
 use fluvio_controlplane_metadata::spg::SpuGroupSpec;
 
 /// handle watch request by spawning watch controller for each store
 #[instrument(skip(request, auth_ctx, sink, end_event))]
-pub fn handle_watch_request<AC>(
+pub fn handle_watch_request<AC, C: MetadataItem + 'static>(
     request: RequestMessage<ObjectApiWatchRequest>,
-    auth_ctx: &AuthServiceContext<AC>,
+    auth_ctx: &AuthServiceContext<AC, C>,
     sink: ExclusiveFlvSink,
     end_event: Arc<StickyEvent>,
-) -> Result<(), IoError> {
+) -> Result<()> {
     let (header, req) = request.get_header_request();
     debug!("handling watch header: {:#?}, request: {:#?}", header, req);
 
-    match req {
-        ObjectApiWatchRequest::Topic(_) => WatchController::<TopicSpec>::update(
+    if (req.downcast()? as Option<WatchRequest<TopicSpec>>).is_some() {
+        WatchController::<TopicSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.topics().clone(),
             header,
             false,
-        ),
-        ObjectApiWatchRequest::Spu(_) => WatchController::<SpuSpec>::update(
+        )
+    } else if (req.downcast()? as Option<WatchRequest<SpuSpec>>).is_some() {
+        WatchController::<SpuSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.spus().clone(),
             header,
             false,
-        ),
-        ObjectApiWatchRequest::SpuGroup(_) => WatchController::<SpuGroupSpec>::update(
+        )
+    } else if (req.downcast()? as Option<WatchRequest<SpuGroupSpec>>).is_some() {
+        WatchController::<SpuGroupSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.spgs().clone(),
             header,
             false,
-        ),
-        ObjectApiWatchRequest::Partition(_) => WatchController::<PartitionSpec>::update(
+        )
+    } else if (req.downcast()? as Option<WatchRequest<PartitionSpec>>).is_some() {
+        WatchController::<PartitionSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.partitions().clone(),
             header,
             false,
-        ),
-        ObjectApiWatchRequest::ManagedConnector(_) => {
-            WatchController::<ManagedConnectorSpec>::update(
-                sink,
-                end_event,
-                auth_ctx.global_ctx.managed_connectors().clone(),
-                header,
-                false,
-            )
-        }
-        ObjectApiWatchRequest::SmartModule(sm_req) => WatchController::<SmartModuleSpec>::update(
+        )
+    } else if let Some(req) = req.downcast()? as Option<WatchRequest<SmartModuleSpec>> {
+        WatchController::<SmartModuleSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.smartmodules().clone(),
             header,
-            sm_req.summary,
-        ),
-        ObjectApiWatchRequest::TableFormat(_) => WatchController::<TableFormatSpec>::update(
+            req.summary,
+        )
+    } else if (req.downcast()? as Option<WatchRequest<TableFormatSpec>>).is_some() {
+        WatchController::<TableFormatSpec, C>::update(
             sink,
             end_event,
             auth_ctx.global_ctx.tableformats().clone(),
             header,
             false,
-        ),
-        _ => {
-            debug!("Invalid Watch Req {:?}", req);
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "Not Valid Watch Request",
-            ));
-        }
+        )
+    } else {
+        debug!("Invalid Watch Req {:?}", req);
+        return Err(anyhow!("Not Valid Watch Request",));
     }
 
     Ok(())
 }
 
 /// Watch controller for each object.  Note that return type may or not be the same as the object hence two separate spec
-struct WatchController<S: AdminSpec> {
+struct WatchController<S: AdminSpec, C: MetadataItem> {
     response_sink: ExclusiveFlvSink,
-    store: StoreContext<S>,
+    store: StoreContext<S, C>,
     header: RequestHeader,
     summary: bool,
     end_event: Arc<StickyEvent>,
 }
 
-impl<S> WatchController<S>
+impl<S, C> WatchController<S, C>
 where
+    C: MetadataItem + 'static,
     S: AdminSpec + 'static,
     S: Encoder + Decoder + Send + Sync,
     S::Status: Encoder + Decoder + Send + Sync,
     S::IndexKey: ToString + Send + Sync,
-    ObjectApiWatchResponse: From<WatchResponse<S>>,
 {
     /// start watch controller
     fn update(
         response_sink: ExclusiveFlvSink,
         end_event: Arc<StickyEvent>,
-        store: StoreContext<S>,
+        store: StoreContext<S, C>,
         header: RequestHeader,
         summary: bool,
     ) {
@@ -176,7 +169,7 @@ where
     /// sync with store and send out changes to send response
     /// if can't send, then signal end and return false
     #[instrument(skip(self, listener))]
-    async fn sync_and_send_changes(&mut self, listener: &mut K8ChangeListener<S>) -> bool {
+    async fn sync_and_send_changes(&mut self, listener: &mut ChangeListener<S, C>) -> bool {
         use fluvio_controlplane_metadata::message::*;
 
         if !listener.has_change() {
@@ -219,7 +212,15 @@ where
         };
 
         let response: WatchResponse<S> = WatchResponse::new(updates);
-        let res: ObjectApiWatchResponse = response.into();
+        let res = match ObjectApiWatchResponse::try_encode_from(response, self.header.api_version())
+        {
+            Ok(res) => res,
+            Err(err) => {
+                error!("error encoding watch response: {}", err);
+                return false;
+            }
+        };
+
         let resp_msg = ResponseMessage::from_header(&self.header, res);
 
         // try to send response, if it fails then we need to end

@@ -2,10 +2,14 @@ use std::fs::File;
 use std::io::{ErrorKind, Error as IoError};
 use std::path::{Path, PathBuf};
 use tracing::{debug, instrument};
+
 use semver::Version;
-use fluvio_index::{HttpAgent, PackageId, Target, WithVersion, PackageVersion};
+use anyhow::{anyhow, Result};
+
+use fluvio_index::{HttpAgent, PackageId, Target, WithVersion, Package, PackageVersion};
+
 use crate::FLUVIO_EXTENSIONS_DIR;
-use crate::error::{Result, CliError};
+use crate::error::PackageNotFound;
 
 pub const FLUVIO_DIR: &str = "FLUVIO_DIR";
 
@@ -61,7 +65,7 @@ pub fn get_extensions() -> Result<Vec<PathBuf>> {
     use std::fs;
     let mut extensions = Vec::new();
     let fluvio_dir = fluvio_extensions_dir()?;
-    if let Ok(entries) = fs::read_dir(&fluvio_dir) {
+    if let Ok(entries) = fs::read_dir(fluvio_dir) {
         for entry in entries.flatten() {
             let is_plugin = entry.file_name().to_string_lossy().starts_with("fluvio-");
             if is_plugin {
@@ -84,19 +88,13 @@ pub async fn fetch_latest_version<T>(
     prerelease: bool,
 ) -> Result<Version> {
     let request = agent.request_package(id)?;
-    debug!(
-        uri = %request.uri(),
-        "Requesting package manifest:",
-    );
-    let response = crate::http::execute(request).await?;
-    let body = crate::http::read_to_end(response).await?;
-    let package = agent.package_from_response(&body).await?;
-    let latest_release = package.latest_release_for_target(target, prerelease)?;
-    debug!(release = ?latest_release, "Latest release for package:");
-    if !latest_release.target_exists(target) {
-        return Err(fluvio_index::Error::MissingTarget(target.clone()).into());
-    }
-    Ok(latest_release.version.clone())
+    let uri = request.uri().to_string();
+    let body = crate::http::get_simple(&uri).await?;
+    debug!(%uri, %body, "uri parsing version");
+    let package: Package = serde_json::from_str(&body)?;
+    let rel = package.latest_release_for_target(target, false)?;
+    let ver = rel.version.clone();
+    Ok(ver)
 }
 
 /// Downloads and verifies a package file via it's versioned ID and target
@@ -113,43 +111,39 @@ pub async fn fetch_package_file(
     let version = match id.version() {
         PackageVersion::Semver(version) => version.clone(),
         PackageVersion::Tag(tag) => {
-            let tag_request = agent.request_tag(id, tag)?;
-            let tag_response = crate::http::execute(tag_request).await?;
-            let body = crate::http::read_to_end(tag_response).await?;
-            agent.tag_version_from_response(tag, &body).await?
+            let req = agent.request_tag(id, tag)?;
+            let tag_response = crate::http::get_bytes_req(&req).await?;
+            agent.tag_version_from_response(tag, &tag_response).await?
         }
-        _ => {
-            return Err(
-                fluvio_index::Error::Other("unknown PackageVersion type".to_string()).into(),
-            )
-        }
+        _ => return Err(anyhow!("unknown PackageVersion type")),
     };
 
     // Download the package file from the package registry
     let download_request = agent.request_release_download(id, &version, target)?;
-    debug!(uri = %download_request.uri(), "Requesting package download:");
-    let response = crate::http::execute(download_request).await?;
-    if !response.status().is_success() {
-        return Err(CliError::PackageNotFound {
-            package: id.clone().into_unversioned(),
-            version: version.clone(),
-            target: target.clone(),
-        });
-    }
-
-    let package_file = crate::http::read_to_end(response).await?;
+    debug!(uri = ?download_request.uri(), "Requesting package download:");
+    let package_file = crate::http::get_bytes_req(&download_request)
+        .await
+        .map_err(|e| {
+            debug!("returning PackageNotFound due to err {e}");
+            PackageNotFound {
+                package: id.clone().into_unversioned(),
+                version: version.clone(),
+                target: target.clone(),
+            }
+        })?;
 
     // Download the package checksum from the package registry
-    let checksum_request = agent.request_release_checksum(id, &version, target)?;
-    let response = crate::http::execute(checksum_request).await?;
-    let body = crate::http::read_to_end(response).await?;
-    let package_checksum = String::from_utf8_lossy(&body);
+    let checksum_request = agent
+        .request_release_checksum(id, &version, target)?
+        .uri()
+        .to_string();
+    let package_checksum = crate::http::get_simple(&checksum_request).await?;
 
     if !verify_checksum(&package_file, &package_checksum) {
         return Err(fluvio_index::Error::ChecksumError.into());
     }
     debug!(hex = %package_checksum, "Verified checksum");
-    Ok(package_file)
+    Ok(package_file.to_vec())
 }
 
 fn verify_checksum<B: AsRef<[u8]>>(buffer: B, checksum: &str) -> bool {
@@ -176,7 +170,9 @@ pub fn install_bin<P: AsRef<Path>, B: AsRef<[u8]>>(bin_path: P, bytes: B) -> Res
     std::fs::create_dir_all(parent)?;
 
     // Create a temporary dir to write file to
-    let tmp_dir = tempdir::TempDir::new_in(parent, "fluvio-tmp")?;
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("fluvio-tmp")
+        .tempdir_in(parent)?;
 
     // Write bin to temporary file
     let tmp_path = tmp_dir.path().join("fluvio-exe-tmp");

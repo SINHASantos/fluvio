@@ -1,11 +1,11 @@
-use std::{
-    collections::BTreeMap,
-    fmt::{self, Display},
-    path::PathBuf,
-    fs::File,
-    io::Read,
-    ops::Deref,
-};
+use std::collections::BTreeMap;
+use std::fmt::{self, Display};
+use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::ops::Deref;
+use std::time::Duration;
+
 use serde::{
     Deserialize, Serialize, Deserializer,
     de::{Visitor, self, SeqAccess, MapAccess},
@@ -17,7 +17,7 @@ pub struct TransformationConfig {
 }
 
 impl TransformationConfig {
-    pub fn from_file<P: Into<PathBuf>>(path: P) -> Result<Self, anyhow::Error> {
+    pub fn from_file(path: impl Into<PathBuf>) -> Result<Self, anyhow::Error> {
         let mut file = File::open(path.into())?;
         let mut content = Vec::new();
         file.read_to_end(&mut content)?;
@@ -49,13 +49,24 @@ impl<T: Deref<Target = str>> TryFrom<Vec<T>> for TransformationConfig {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct TransformationStep {
     pub uses: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback: Option<Lookback>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub with: BTreeMap<String, JsonString>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct Lookback {
+    #[serde(default)]
+    pub last: u64,
+    #[serde(default, with = "humantime_serde")]
+    pub age: Option<Duration>,
+}
+
 impl Display for TransformationStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -64,6 +75,21 @@ impl TryFrom<&str> for TransformationStep {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         serde_json::from_str(value)
+    }
+}
+
+impl From<Lookback> for fluvio_smartmodule::dataplane::smartmodule::Lookback {
+    fn from(value: Lookback) -> Self {
+        match value.age {
+            Some(age) => Self {
+                age: Some(age),
+                last: value.last,
+            },
+            None => Self {
+                age: None,
+                last: value.last,
+            },
+        }
     }
 }
 
@@ -79,6 +105,12 @@ impl From<JsonString> for String {
 impl From<&str> for JsonString {
     fn from(str: &str) -> Self {
         Self(str.into())
+    }
+}
+
+impl AsRef<str> for JsonString {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
     }
 }
 
@@ -116,7 +148,7 @@ impl<'de> Deserialize<'de> for JsonString {
                 let json: serde_json::Value =
                     Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
                 serde_json::to_string(&json).map(JsonString).map_err(|err| {
-                    de::Error::custom(format!("unable to serialize map to json: {}", err))
+                    de::Error::custom(format!("unable to serialize map to json: {err}"))
                 })
             }
 
@@ -127,7 +159,7 @@ impl<'de> Deserialize<'de> for JsonString {
                 let json: serde_json::Value =
                     Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
                 serde_json::to_string(&json).map(JsonString).map_err(|err| {
-                    de::Error::custom(format!("unable to serialize seq to json: {}", err))
+                    de::Error::custom(format!("unable to serialize seq to json: {err}"))
                 })
             }
         }
@@ -158,20 +190,30 @@ mod tests {
             .expect("config file");
 
         //then
-        assert_eq!(config.transforms.len(), 2);
+        assert_eq!(config.transforms.len(), 3);
         assert_eq!(
             config,
             TransformationConfig {
                 transforms: vec![
                     TransformationStep {
-                        uses: "infinyon/jolt@0.1.0".to_string(),
+                        uses: "infinyon/jolt@0.4.1".to_string(),
+                        lookback: Some(Lookback{ last: 0, age: Some(Duration::from_secs(3600 * 24 * 7)) }),
                         with: BTreeMap::from([(
                             "spec".to_string(),
                             JsonString("[{\"operation\":\"shift\",\"spec\":{\"payload\":{\"device\":\"device\"}}},{\"operation\":\"default\",\"spec\":{\"device\":{\"type\":\"mobile\"}}}]".to_string())
                         )])
                     },
                     TransformationStep {
-                        uses: "infinyon/json-sql@0.1.0".to_string(),
+                        uses: "infinyon/jolt@0.4.1".to_string(),
+                        lookback: Some(Lookback{ last: 1, age: None }),
+                        with: BTreeMap::from([(
+                            "spec".to_string(),
+                            JsonString("[{\"operation\":\"shift\",\"spec\":{\"payload\":{\"device\":\"device\"}}},{\"operation\":\"default\",\"spec\":{\"device\":{\"type\":\"mobile\"}}}]".to_string())
+                        )])
+                    },
+                    TransformationStep {
+                        uses: "infinyon/json-sql@0.2.1".to_string(),
+                        lookback: Some(Lookback{ last: 10, age: Some(Duration::from_secs(12)) }),
                         with: BTreeMap::from([(
                             "mapping".to_string(),
                             JsonString("{\"map-columns\":{\"device_id\":{\"json-key\":\"device.device_id\",\"value\":{\"default\":\"0\",\"required\":true,\"type\":\"int\"}},\"record\":{\"json-key\":\"$\",\"value\":{\"required\":true,\"type\":\"jsonb\"}}},\"table\":\"topic_message_demo\"}".to_string())
@@ -197,8 +239,8 @@ mod tests {
     fn test_from_vec() {
         //given
         let vec = vec![
-            r#"{"uses":"infinyon/jolt@0.1.0","invoke":"insert","with":{"spec":"[{\"operation\":\"remove\",\"spec\":{\"length\":\"\"}}]"}}"#,
-            r#"{"uses":"infinyon/json-sql@0.1.0","invoke":"insert","with":{"mapping":"{\"table\":\"topic_message_demo\",\"map-columns\":{\"fact\":{\"json-key\":\"fact\",\"value\":{\"type\":\"text\",\"required\":true}},\"record\":{\"json-key\":\"$\",\"value\":{\"type\":\"jsonb\",\"required\":true}}}}"}}"#,
+            r#"{"uses":"infinyon/jolt@0.4.1","invoke":"insert","with":{"spec":"[{\"operation\":\"remove\",\"spec\":{\"length\":\"\"}}]"}}"#,
+            r#"{"uses":"infinyon/json-sql@0.2.1","invoke":"insert","with":{"mapping":"{\"table\":\"topic_message_demo\",\"map-columns\":{\"fact\":{\"json-key\":\"fact\",\"value\":{\"type\":\"text\",\"required\":true}},\"record\":{\"json-key\":\"$\",\"value\":{\"type\":\"jsonb\",\"required\":true}}}}"}}"#,
         ];
 
         //when
@@ -206,7 +248,7 @@ mod tests {
 
         //then
         assert_eq!(config.transforms.len(), 2);
-        assert_eq!(config.transforms[0].uses, "infinyon/jolt@0.1.0");
+        assert_eq!(config.transforms[0].uses, "infinyon/jolt@0.4.1");
         assert_eq!(
             config.transforms[0].with,
             BTreeMap::from([(
@@ -215,7 +257,7 @@ mod tests {
             )])
         );
 
-        assert_eq!(config.transforms[1].uses, "infinyon/json-sql@0.1.0");
+        assert_eq!(config.transforms[1].uses, "infinyon/json-sql@0.2.1");
         assert_eq!(
             config.transforms[1].with,
             BTreeMap::from([(

@@ -113,10 +113,7 @@ mod common {
             Self::new_with_client(api_key, "dummy".to_owned())
         }
 
-        pub fn new_with_client<T>(api_key: u16, client_id: T) -> Self
-        where
-            T: Into<String>,
-        {
+        pub fn new_with_client(api_key: u16, client_id: impl Into<String>) -> Self {
             RequestHeader {
                 api_key,
                 api_version: 1,
@@ -167,21 +164,17 @@ mod common {
         }
     }
 
-    #[derive(Debug, Clone, Eq, PartialEq, Encoder, Decoder)]
+    #[derive(Debug, Default, Clone, Eq, PartialEq, Encoder, Decoder)]
     #[non_exhaustive]
     pub enum RequestKind {
+        #[default]
+        #[fluvio(tag = 0)]
         Produce,
-    }
-
-    impl Default for RequestKind {
-        fn default() -> Self {
-            RequestKind::Produce
-        }
     }
 
     impl Display for RequestKind {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{:?}", self)
+            write!(f, "{self:?}")
         }
     }
 }

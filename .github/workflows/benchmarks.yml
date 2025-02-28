@@ -21,13 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust Cargo files
         uses: Swatinem/rust-cache@v2
@@ -36,7 +33,7 @@ jobs:
           key: benches-${{ runner.os }}-unit_fluvio_protocol-rust
 
       - name: Cache Benchmark data
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         if: github.ref == 'refs/heads/master'
         with:
           path: ./benches_cache
@@ -55,8 +52,8 @@ jobs:
           output-file-path: fluvio_protocol_benches.txt
           # GitHub API token to make a commit comment
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Leave a commit comment comparing the current branch with the previous
-          comment-always: true
+          # Leave a job summary with benchmark result comparison
+          summary-always: true
           # Where the previous data file is stored
           external-data-json-path: ./benches_cache/benchmark-data.json
           # Mention @infinyon/developers in the commit comment
@@ -67,13 +64,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust Cargo files
         uses: Swatinem/rust-cache@v2
@@ -82,7 +76,7 @@ jobs:
           key: benches-${{ runner.os }}-unit_fluvio_smartmodule-rust
 
       - name: Cache Benchmark data
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         if: github.ref == 'refs/heads/master'
         with:
           path: ./benches_cache
@@ -101,8 +95,8 @@ jobs:
           output-file-path: fluvio_smartmodule_benches.txt
           # GitHub API token to make a commit comment
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Leave a commit comment comparing the current branch with the previous
-          comment-always: true
+          # Leave a job summary with benchmark result comparison
+          summary-always: true
           # Where the previous data file is stored
           external-data-json-path: ./benches_cache/benchmark-data.json
           # Mention @infinyon/developers in the commit comment

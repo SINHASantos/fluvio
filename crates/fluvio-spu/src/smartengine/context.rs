@@ -1,253 +1,105 @@
-use fluvio_smartengine::SmartModuleChainInstance;
-use tracing::{debug, error};
+use std::sync::Arc;
+use std::time::Duration;
 
-use fluvio_controlplane_metadata::derivedstream::{DerivedStreamInputRef, DerivedStreamStep};
+use async_lock::RwLock;
+use chrono::Utc;
 use fluvio_protocol::link::ErrorCode;
-use fluvio_spu_schema::server::{
-    stream_fetch::DerivedStreamInvocation,
-    smartmodule::{
-        SmartModuleInvocation, SmartModuleKind, SmartModuleContextData, SmartModuleInvocationWasm,
-    },
-};
-use fluvio::{ConsumerConfig};
-use futures_util::{StreamExt, stream::BoxStream};
-use fluvio_protocol::record::ConsumerRecord;
+use fluvio_smartmodule::Record;
+use fluvio_spu_schema::server::smartmodule::{SmartModuleInvocation, SmartModuleInvocationWasm};
+use fluvio_storage::ReplicaStorage;
+use fluvio_storage::iterators::{FileBatch, FileBatchIterator, FileRecordIterator, RecordItem};
+use fluvio_types::Timestamp;
+use tracing::{debug, trace, error};
 
-use crate::core::DefaultSharedGlobalContext;
+use crate::core::GlobalContext;
+use crate::core::metrics::SpuMetrics;
+use crate::replication::leader::LeaderReplicaState;
+
 use crate::smartengine::chain;
+use crate::smartengine::Lookback;
+use crate::smartengine::SmartModuleChainBuilder;
+use crate::smartengine::SmartModuleChainInstance;
+use crate::smartengine::Version;
 
+#[derive(Debug)]
 pub struct SmartModuleContext {
-    pub chain: SmartModuleChainInstance,
-    pub right_consumer_stream:
-        Option<BoxStream<'static, Result<fluvio::consumer::Record, ErrorCode>>>,
+    chain: SmartModuleChainInstance,
+    version: Version,
+    spu_metrics: Arc<SpuMetrics>,
 }
 
+pub type SharedSmartModuleContext = Arc<RwLock<SmartModuleContext>>;
+
 impl SmartModuleContext {
-    pub async fn try_from(
+    pub async fn try_from<R: ReplicaStorage>(
         smartmodule: Vec<SmartModuleInvocation>,
-        derivedstream: Option<DerivedStreamInvocation>,
         version: i16,
-        ctx: &DefaultSharedGlobalContext,
+        ctx: &GlobalContext<R>,
     ) -> Result<Option<Self>, ErrorCode> {
-        match derivedstream {
-            Some(ss_inv) => {
-                let derived_stream_invocation = derivedstream_to_invocation(ss_inv, ctx).await?;
-                Self::build_smartmodule_context(vec![derived_stream_invocation], version, ctx).await
-            }
-            None => Self::build_smartmodule_context(smartmodule, version, ctx).await,
-        }
+        Self::build_smartmodule_context(smartmodule, version, ctx).await
+    }
+
+    pub fn chain_mut(&mut self) -> &mut SmartModuleChainInstance {
+        &mut self.chain
+    }
+
+    pub async fn look_back<R: ReplicaStorage>(
+        &mut self,
+        replica: &LeaderReplicaState<R>,
+    ) -> Result<(), ErrorCode> {
+        self.chain
+            .look_back(
+                |lookback| read_records(replica, lookback, self.version),
+                self.spu_metrics.chain_metrics(),
+            )
+            .await
+            .map_err(|err| {
+                error!("look_back chain error: {err:#}");
+                ErrorCode::SmartModuleLookBackError(err.root_cause().to_string())
+            })
     }
 
     /// given SmartModule invocation and context, generate execution context
-    async fn build_smartmodule_context(
+    async fn build_smartmodule_context<R: ReplicaStorage>(
         invocations: Vec<SmartModuleInvocation>,
-        version: i16,
-        ctx: &DefaultSharedGlobalContext,
+        version: Version,
+        ctx: &GlobalContext<R>,
     ) -> Result<Option<Self>, ErrorCode> {
         if invocations.is_empty() {
             return Ok(None);
         }
-        // check for right consumer stream exists, this only happens for join type
-        let mut right_consumer_stream = None;
+
         let mut fetched_invocations = Vec::with_capacity(invocations.len());
         for invocation in invocations {
-            let next_right_stream = extract_right_stream(&invocation, ctx).await?;
-            match (&mut right_consumer_stream, next_right_stream) {
-                (Some(_), Some(_)) => return Err(ErrorCode::DerivedStreamAlreadyExists),
-                (Some(_), None) => {}
-                (current, next) => *current = next,
-            }
             fetched_invocations.push(resolve_invocation(invocation, ctx)?)
         }
+        let mut chain_builder = SmartModuleChainBuilder::default();
+        chain_builder.set_store_memory_limit(ctx.config().smart_engine.store_max_memory);
+
+        let chain = chain::build_chain(
+            chain_builder,
+            fetched_invocations,
+            version,
+            ctx.smartengine_owned(),
+        )?;
 
         Ok(Some(Self {
-            chain: chain::build_chain(fetched_invocations, version, ctx.smartengine_owned())?,
-            right_consumer_stream,
+            chain,
+            version,
+            spu_metrics: ctx.metrics(),
         }))
     }
 }
 
-async fn derivedstream_to_invocation(
-    invocation: DerivedStreamInvocation,
-    ctx: &DefaultSharedGlobalContext,
-) -> Result<SmartModuleInvocation, ErrorCode> {
-    let name = invocation.stream;
-    debug!(%name,"extracting derivedstream");
-    let params = invocation.params;
-    let ss_list = ctx.derivedstream_store().all_keys();
-    debug!("derivedstreams: {:#?}", ss_list);
-    if let Some(derivedstream) = ctx.derivedstream_store().spec(&name) {
-        let spec = derivedstream.spec;
-        if derivedstream.valid {
-            let mut steps = spec.steps.steps;
-            if steps.is_empty() {
-                debug!(name = %name,"no steps in derivedstream");
-                Err(ErrorCode::DerivedStreamInvalid(name))
-            } else {
-                // for now, only perform a single step
-                let step = steps.pop().expect("first one");
-                let sm = match step {
-                    DerivedStreamStep::Aggregate(module) => SmartModuleInvocation {
-                        wasm: SmartModuleInvocationWasm::Predefined(module.module),
-                        kind: SmartModuleKind::Aggregate {
-                            accumulator: vec![],
-                        },
-                        params,
-                    },
-                    DerivedStreamStep::Map(module) => SmartModuleInvocation {
-                        wasm: SmartModuleInvocationWasm::Predefined(module.module),
-                        kind: SmartModuleKind::Map,
-                        params,
-                    },
-                    DerivedStreamStep::FilterMap(module) => SmartModuleInvocation {
-                        wasm: SmartModuleInvocationWasm::Predefined(module.module),
-                        kind: SmartModuleKind::FilterMap,
-                        params,
-                    },
-                    DerivedStreamStep::Filter(module) => SmartModuleInvocation {
-                        wasm: SmartModuleInvocationWasm::Predefined(module.module),
-                        kind: SmartModuleKind::Filter,
-                        params,
-                    },
-                    DerivedStreamStep::Join(module) => match module.right {
-                        DerivedStreamInputRef::Topic(ref topic) => SmartModuleInvocation {
-                            wasm: SmartModuleInvocationWasm::Predefined(module.module),
-                            kind: SmartModuleKind::Join(topic.name.to_owned()),
-                            params,
-                        },
-                        DerivedStreamInputRef::DerivedStream(ref smart_stream) => {
-                            let join_target_name = smart_stream.name.to_owned();
-                            // ensure derivedstream exists
-                            if let Some(ctx) = ctx.derivedstream_store().spec(&join_target_name) {
-                                let target_input = ctx.spec.input;
-                                // check target input, we can only do 1 level recursive definition now.
-                                match target_input {
-                                    DerivedStreamInputRef::Topic(topic_target) => {
-                                        SmartModuleInvocation {
-                                            wasm: SmartModuleInvocationWasm::Predefined(
-                                                module.module,
-                                            ),
-                                            kind: SmartModuleKind::JoinStream {
-                                                topic: topic_target.name,
-                                                derivedstream: join_target_name.to_owned(),
-                                            },
-                                            params,
-                                        }
-                                    }
-
-                                    DerivedStreamInputRef::DerivedStream(child_child_target) => {
-                                        return Err(ErrorCode::DerivedStreamRecursion(
-                                            join_target_name,
-                                            child_child_target.name,
-                                        ));
-                                    }
-                                }
-                            } else {
-                                return Err(ErrorCode::DerivedStreamNotFound(join_target_name));
-                            }
-                        }
-                    },
-                };
-
-                Ok(sm)
-            }
-        } else {
-            debug!(%name, "invalid DerivedStream");
-            Err(ErrorCode::DerivedStreamInvalid(name))
-        }
-    } else {
-        Err(ErrorCode::DerivedStreamNotFound(name))
-    }
-}
-
-async fn extract_right_stream<'a, 'b>(
-    invocation: &'a SmartModuleInvocation,
-    ctx: &'b DefaultSharedGlobalContext,
-) -> Result<Option<BoxStream<'static, Result<ConsumerRecord, ErrorCode>>>, ErrorCode> {
-    let right_consumer_stream = match invocation.kind {
-        // for join, create consumer stream
-        SmartModuleKind::Join(ref topic)
-        | SmartModuleKind::Generic(SmartModuleContextData::Join(ref topic)) => {
-            let consumer = ctx.leaders().partition_consumer(topic.to_owned(), 0).await;
-
-            Some(
-                consumer
-                    .stream(fluvio::Offset::beginning())
-                    .await
-                    .map_err(|err| {
-                        error!("error fetching join data {}", err);
-                        ErrorCode::DerivedStreamJoinFetchError
-                    })?
-                    .boxed(),
-            )
-        }
-        SmartModuleKind::JoinStream {
-            topic: ref _topic,
-            derivedstream: ref derivedstream_name,
-        }
-        | SmartModuleKind::Generic(SmartModuleContextData::JoinStream {
-            topic: ref _topic,
-            derivedstream: ref derivedstream_name,
-        }) => {
-            // first ensure derivedstream exists
-            if let Some(derivedstream) = ctx.derivedstream_store().spec(derivedstream_name) {
-                // find input which has topic
-                match derivedstream.spec.input {
-                    DerivedStreamInputRef::Topic(topic) => {
-                        let consumer = ctx
-                            .leaders()
-                            .partition_consumer(topic.name.to_owned(), 0)
-                            .await;
-                        // need to build stream arg
-                        let mut builder = ConsumerConfig::builder();
-
-                        builder.derivedstream(Some(DerivedStreamInvocation {
-                            stream: derivedstream_name.to_owned(),
-                            params: invocation.params.clone(),
-                        }));
-
-                        let consume_config = builder.build().map_err(|err| {
-                            error!("error building consumer config {}", err);
-                            ErrorCode::Other(format!("error building consumer config {}", err))
-                        })?;
-                        Some(
-                            consumer
-                                .stream_with_config(fluvio::Offset::beginning(), consume_config)
-                                .await
-                                .map_err(|err| {
-                                    error!("error fetching join data {}", err);
-                                    ErrorCode::DerivedStreamJoinFetchError
-                                })?
-                                .boxed(),
-                        )
-                    }
-                    DerivedStreamInputRef::DerivedStream(child_smart) => {
-                        return Err(ErrorCode::DerivedStreamRecursion(
-                            derivedstream_name.to_owned(),
-                            child_smart.name,
-                        ));
-                    }
-                }
-            } else {
-                return Err(ErrorCode::DerivedStreamNotFound(
-                    derivedstream_name.to_owned(),
-                ));
-            }
-        }
-        _ => None,
-    };
-    Ok(right_consumer_stream)
-}
-
-fn resolve_invocation(
+fn resolve_invocation<R: ReplicaStorage>(
     invocation: SmartModuleInvocation,
-    ctx: &DefaultSharedGlobalContext,
+    ctx: &GlobalContext<R>,
 ) -> Result<SmartModuleInvocation, ErrorCode> {
     if let SmartModuleInvocationWasm::Predefined(name) = invocation.wasm {
         if let Some(smartmodule) = ctx
             .smartmodule_localstore()
             .find_by_pk_key(&name)
-            .map_err(|err| ErrorCode::Other(format!("error parsing SmartModule name: {}", err)))?
+            .map_err(|err| ErrorCode::Other(format!("error parsing SmartModule name: {err}")))?
         {
             Ok(SmartModuleInvocation {
                 wasm: SmartModuleInvocationWasm::AdHoc(smartmodule.spec.wasm.payload.into()),
@@ -259,4 +111,130 @@ fn resolve_invocation(
     } else {
         Ok(invocation)
     }
+}
+
+async fn read_records<R: ReplicaStorage>(
+    replica: &LeaderReplicaState<R>,
+    lookback: Lookback,
+    version: Version,
+) -> anyhow::Result<Vec<Record>> {
+    let iter = lookback_iterator(replica, lookback, version).await?;
+
+    let result: Vec<Record> = iter.collect::<Result<Vec<Record>, std::io::Error>>()?;
+    debug!("read {} records", result.len());
+    trace!(?result);
+    Ok(result)
+}
+
+async fn lookback_iterator<R: ReplicaStorage>(
+    replica: &LeaderReplicaState<R>,
+    lookback: Lookback,
+    version: Version,
+) -> anyhow::Result<Box<dyn Iterator<Item = Result<Record, std::io::Error>>>> {
+    let iter = match lookback {
+        Lookback::Last(last) => lookback_last_iterator(replica, last, version).await,
+        Lookback::Age { age, last } => lookback_age_iterator(replica, age, last, version).await,
+    }?;
+    let iter = iter.map(|it| it.map(|res| res.record));
+    Ok(Box::new(iter))
+}
+
+async fn lookback_last_iterator<R: ReplicaStorage>(
+    replica: &LeaderReplicaState<R>,
+    last: u64,
+    version: Version,
+) -> anyhow::Result<Box<dyn Iterator<Item = Result<RecordItem, std::io::Error>>>> {
+    let (start_offset, hw) = replica.start_offset_info().await;
+
+    let offset = (hw - (TryInto::<i64>::try_into(last)?)).max(0);
+
+    let offset = offset.clamp(start_offset, hw);
+    debug!(offset, "reading last {last} records for look_back");
+
+    let slice = replica
+        .read_records(offset, u32::MAX, fluvio::Isolation::ReadCommitted)
+        .await?;
+
+    let Some(file_slice) = slice.file_slice else {
+        trace!(?slice);
+        return Ok(Box::new(std::iter::empty()));
+    };
+
+    let batch_iter = FileBatchIterator::from_raw_slice(file_slice);
+    let records_iter = FileRecordIterator::new(batch_iter, version);
+
+    Ok(Box::new(records_iter.filter(move |r| match r {
+        Ok(item) => item.offset >= offset,
+        Err(_) => true,
+    })))
+}
+
+async fn lookback_age_iterator<R: ReplicaStorage>(
+    replica: &LeaderReplicaState<R>,
+    age: Duration,
+    last: u64,
+    version: Version,
+) -> anyhow::Result<Box<dyn Iterator<Item = Result<RecordItem, std::io::Error>>>> {
+    let min_timestamp: Timestamp = Utc::now()
+        .timestamp_millis()
+        .checked_sub(i64::try_from(age.as_millis())?)
+        .ok_or_else(|| anyhow::anyhow!("timestamp overflow"))?;
+
+    debug!(?age, last, min_timestamp, "iterating for lookback");
+
+    let records_iter = if last > 0 {
+        lookback_last_iterator(replica, last, version).await?
+    } else {
+        let batches = read_batches_by_age(replica, min_timestamp).await?;
+        Box::new(FileRecordIterator::new(
+            batches.into_iter().map(Ok),
+            version,
+        ))
+    };
+    Ok(Box::new(records_iter.filter(move |i| match i {
+        Ok(item) => item.timestamp >= min_timestamp,
+        Err(_) => true,
+    })))
+}
+
+async fn read_batches_by_age<R: ReplicaStorage>(
+    replica: &LeaderReplicaState<R>,
+    min_timestamp: Timestamp,
+) -> anyhow::Result<Vec<FileBatch>> {
+    let mut result = Vec::new();
+    let mut offset = replica.hw() - 1;
+    loop {
+        if offset.is_negative() {
+            break;
+        }
+        trace!(offset, "reading next batch");
+        let slice = replica
+            .read_records(offset - 1, u32::MAX, fluvio::Isolation::ReadCommitted)
+            .await?;
+        let Some(file_slice) = slice.file_slice else {
+            trace!(?slice);
+            break;
+        };
+        let mut batch_iter = FileBatchIterator::from_raw_slice(file_slice);
+        let Some(batch) = batch_iter.next() else {
+            break;
+        };
+        let batch = batch?;
+        trace!(?batch.batch, "next file batch");
+
+        if batch.batch.header.max_time_stamp < min_timestamp {
+            break;
+        } else {
+            trace!(offset, "added batch");
+            offset = batch.batch.base_offset - 1;
+            result.push(batch);
+        }
+    }
+    result.reverse();
+    debug!(
+        min_timestamp,
+        "read {} batches older than min_timestamp",
+        result.len()
+    );
+    Ok(result)
 }

@@ -9,9 +9,9 @@
 //! To install a basic Fluvio cluster, just do the following:
 //!
 //! ```
-//! use fluvio_cluster::{ClusterInstaller, ClusterConfig, ClusterError};
+//! use fluvio_cluster::{ClusterInstaller, ClusterConfig};
 //! use semver::Version;
-//! # async fn example() -> Result<(), ClusterError> {
+//! # async fn example() -> anyhow::Result<()> {
 //! let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap()).build()?;
 //! let installer = ClusterInstaller::from_config(config)?;
 //! installer.install_fluvio().await?;
@@ -34,6 +34,7 @@ mod delete;
 mod error;
 mod progress;
 pub mod runtime;
+mod process;
 
 /// extensions
 #[cfg(feature = "cli")]
@@ -48,6 +49,7 @@ pub use check::{ClusterChecker, CheckStatus, CheckStatuses, CheckResult, CheckRe
 pub use check::{RecoverableCheck, UnrecoverableCheckStatus, CheckSuggestion};
 pub use delete::*;
 pub use fluvio::config as fluvio_config;
+pub use fluvio_extension_common::installation::InstallationType;
 
 pub(crate) const DEFAULT_NAMESPACE: &str = "default";
 
@@ -56,9 +58,10 @@ pub use common::*;
 mod common {
 
     use std::{path::PathBuf, borrow::Cow};
-    use std::io::Error as IoError;
 
+    use anyhow::Result;
     use fluvio::config::{TlsPaths, TlsConfig};
+    use serde::{Serialize, Deserialize};
 
     /// The result of a successful startup of a Fluvio cluster
     ///
@@ -89,7 +92,7 @@ mod common {
     }
 
     /// User configuration chart location
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum UserChartLocation {
         /// Local charts must be located at a valid filesystem path.
         Local(PathBuf),
@@ -97,7 +100,7 @@ mod common {
         Remote(String),
     }
 
-    pub fn tls_config_to_cert_paths(config: &TlsConfig) -> Result<Cow<TlsPaths>, IoError> {
+    pub fn tls_config_to_cert_paths(config: &TlsConfig) -> Result<Cow<TlsPaths>> {
         use std::fs::write;
         use rand::distributions::Alphanumeric;
         use std::iter;

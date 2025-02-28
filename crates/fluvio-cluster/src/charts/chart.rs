@@ -1,5 +1,6 @@
-use std::path::{PathBuf};
+use std::path::PathBuf;
 
+use anyhow::Result;
 use tracing::{info, debug, instrument};
 use derive_builder::Builder;
 
@@ -63,7 +64,7 @@ impl ChartConfig {
 
 impl ChartConfigBuilder {
     /// Validates all builder options and constructs a `SysConfig`
-    pub fn build(&self) -> Result<ChartConfig, ChartInstallError> {
+    pub fn build(&self) -> Result<ChartConfig> {
         let config = self
             .build_impl()
             .map_err(|err| ChartInstallError::MissingRequiredConfig(err.to_string()))?;
@@ -71,13 +72,13 @@ impl ChartConfigBuilder {
     }
 
     /// The local chart location to install sys charts from
-    pub fn local<P: Into<PathBuf>>(&mut self, path: P) -> &mut Self {
+    pub fn local(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.location = Some(ChartLocation::Local(path.into()));
         self
     }
 
     /// The remote chart location to install charts from
-    pub fn remote<S: Into<String>>(&mut self, location: S) -> &mut Self {
+    pub fn remote(&mut self, location: impl Into<String>) -> &mut Self {
         self.location = Some(ChartLocation::Remote(location.into()));
         self
     }
@@ -120,7 +121,7 @@ pub struct ChartInstaller {
 
 impl ChartInstaller {
     /// Create a new `SysInstaller` using the given config
-    pub fn from_config(config: ChartConfig) -> Result<Self, ChartInstallError> {
+    pub fn from_config(config: ChartConfig) -> Result<Self> {
         debug!("using config: {:#?}", config);
         let helm_client = HelmClient::new()?;
         Ok(Self {
@@ -130,17 +131,17 @@ impl ChartInstaller {
     }
 
     /// Install the Fluvio System chart on the configured cluster
-    pub fn install(&self) -> Result<(), ChartInstallError> {
+    pub fn install(&self) -> Result<()> {
         self.process(false)
     }
 
     /// Upgrade the Fluvio System chart on the configured cluster
-    pub fn upgrade(&self) -> Result<(), ChartInstallError> {
+    pub fn upgrade(&self) -> Result<()> {
         self.process(true)
     }
 
     /// Tells whether a chart is installed the configured details is already installed
-    pub fn is_installed(&self) -> Result<bool, ChartInstallError> {
+    pub fn is_installed(&self) -> Result<bool> {
         let installed_charts = self
             .helm_client
             .get_installed_chart_by_name(&self.config.name, None)?;
@@ -149,13 +150,13 @@ impl ChartInstaller {
 
     /// install or upgrade
     #[instrument(skip(self))]
-    pub fn process(&self, upgrade: bool) -> Result<(), ChartInstallError> {
+    pub fn process(&self, upgrade: bool) -> Result<()> {
         let chart_setup = self
             .config
             .location
             .setup(&self.config.name, &self.helm_client)?;
 
-        let mut args = InstallArg::new(&self.config.name, &chart_setup.location())
+        let mut args = InstallArg::new(&self.config.name, chart_setup.location())
             .namespace(&self.config.namespace)
             .opts(self.config.string_values.to_owned())
             .values(self.config.values.to_owned())

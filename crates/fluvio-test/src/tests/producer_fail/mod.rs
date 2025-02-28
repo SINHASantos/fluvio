@@ -1,12 +1,15 @@
-use fluvio::{RecordKey, TopicProducer, TopicProducerConfigBuilder, FluvioAdmin, FluvioError};
-use fluvio_controlplane_metadata::partition::PartitionSpec;
 use clap::Parser;
+
+use anyhow::Result;
+
+use fluvio::{TopicProducerPool, FluvioAdmin, RecordKey, TopicProducerConfigBuilder};
+use fluvio_controlplane_metadata::partition::PartitionSpec;
 
 use fluvio_test_derive::fluvio_test;
 use fluvio_test_case_derive::MyTestCase;
 
 #[derive(Debug, Clone, Parser, Default, Eq, PartialEq, MyTestCase)]
-#[clap(name = "Fluvio Producer Batch Test")]
+#[command(name = "Fluvio Producer Batch Test")]
 pub struct ProduceBatchTestOption {}
 
 #[fluvio_test(topic = "batch", async)]
@@ -22,7 +25,7 @@ pub async fn produce_batch(
         .build()
         .expect("failed to build config");
 
-    let producer: TopicProducer = test_driver
+    let producer: TopicProducerPool = test_driver
         .create_producer_with_config(&topic_name, config)
         .await;
 
@@ -35,7 +38,7 @@ pub async fn produce_batch(
         test_topic.spec.leader
     };
 
-    println!("Found leader {}", leader);
+    println!("Found leader {leader}");
 
     let cluster_manager = test_driver
         .get_cluster()
@@ -46,7 +49,7 @@ pub async fn produce_batch(
     println!("Got cluster manager");
 
     let value = "a".repeat(5000);
-    let result: Result<_, FluvioError> = (|| async move {
+    let result: Result<_> = async move {
         let mut results = Vec::new();
         for _ in 0..1000 {
             let result = producer.send(RecordKey::NULL, value.clone()).await?;
@@ -83,7 +86,7 @@ pub async fn produce_batch(
         producer.flush().await?;
 
         Ok(())
-    })()
+    }
     .await;
 
     // Ensure that one of the calls returned a failure

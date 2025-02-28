@@ -7,6 +7,7 @@ DEFAULT_ITERATION?=1000
 SPU_DELAY?=5
 SC_AUTH_CONFIG?=./crates/fluvio-sc/test-data/auth_config
 EXTRA_ARG?=
+KUBECTL_ARG_NAMESPACE=$(if $(K8_NAMESPACE),-n ${K8_NAMESPACE},)
 
 # Test env
 TEST_ENV_AUTH_POLICY=
@@ -38,7 +39,7 @@ clean_cluster:
 else
 clean_cluster:
 	echo "clean up previous installation"
-	$(FLUVIO_BIN) cluster delete
+	$(FLUVIO_BIN) cluster delete --force
 endif
 
 test-setup:	build-test-ci clean_cluster
@@ -121,6 +122,13 @@ reconnection-test: REPL=1
 reconnection-test: test-setup
 	$(TEST_BIN) reconnection  ${TEST_ARG_COMMON}
 
+consumer-offsets-test: TEST_ARG_EXTRA=--local $(EXTRA_ARG)
+consumer-offsets-test: DEFAULT_SPU=1
+consumer-offsets-test: REPL=1
+consumer-offsets-test: test-setup
+	$(TEST_BIN) consumer_offsets  ${TEST_ARG_COMMON} --partition 1 --topic-name consumer-offset-single
+	$(TEST_BIN) consumer_offsets  ${TEST_ARG_COMMON} --partition 5 --topic-name consumer-offset-multiple
+
 # test rbac with user1 who doesn't have topic creation permission
 # assumes cluster is set
 SC_HOST=localhost
@@ -148,15 +156,15 @@ smoke-test-k8-tls: TEST_ARG_TABLE_FORMAT_CONFIG=--table-format-config ./tests/te
 smoke-test-k8-tls: build_k8_image smoke-test
 
 smoke-test-k8-tls-policy-setup:
-	kubectl delete configmap authorization --ignore-not-found
-	kubectl create configmap authorization --from-file=POLICY=${SC_AUTH_CONFIG}/policy.json --from-file=SCOPES=${SC_AUTH_CONFIG}/scopes.json
+	kubectl ${KUBECTL_ARG_NAMESPACE} delete configmap authorization --ignore-not-found
+	kubectl ${KUBECTL_ARG_NAMESPACE} create configmap authorization --from-file=POLICY=${SC_AUTH_CONFIG}/policy.json --from-file=SCOPES=${SC_AUTH_CONFIG}/scopes.json
 smoke-test-k8-tls-policy: TEST_ENV_FLV_SPU_DELAY=FLV_SPU_DELAY=$(SPU_DELAY)
 smoke-test-k8-tls-policy: TEST_ARG_EXTRA=--tls --authorization-config-map authorization $(EXTRA_ARG)
 smoke-test-k8-tls-policy: TEST_ARG_TABLE_FORMAT_CONFIG=--table-format-config ./tests/test-table-format-config.yaml
 smoke-test-k8-tls-policy: build_k8_image smoke-test
 
 test-permission-k8:	SC_HOST=$(shell kubectl get node -o json | jq '.items[].status.addresses[0].address' | tr -d '"' )
-test-permission-k8:	SC_PORT=$(shell kubectl get svc fluvio-sc-public -o json | jq '.spec.ports[0].nodePort' )
+test-permission-k8:	SC_PORT=$(shell kubectl ${KUBECTL_ARG_NAMESPACE} get svc fluvio-sc-public -o json | jq '.spec.ports[0].nodePort' )
 test-permission-k8:	test-permission-user1
 
 # run auth policy without setup, UNCLEAN must not be set
@@ -167,16 +175,29 @@ smoke-test-k8-tls-root: smoke-test-k8-tls-policy-setup smoke-test-k8-tls-policy 
 
 install-test-k8-port-forwarding: build_k8_image
 install-test-k8-port-forwarding:
-	$(FLUVIO_BIN) cluster start --develop --use-k8-port-forwarding
+	$(FLUVIO_BIN) cluster start --k8 --develop --use-k8-port-forwarding
 
 ifeq (${CI},true)
 # In CI, we expect all artifacts to already be built and loaded for the script
 upgrade-test:
 	./tests/upgrade-test.sh
+else ifeq (${FLUVIO_MODE},local)
+upgrade-test: build-cli
+	./tests/upgrade-test.sh
 else
 # When not in CI (i.e. development), load the dev k8 image before running test
 upgrade-test: build-cli build_k8_image
 	./tests/upgrade-test.sh
+endif
+
+ifeq (${CI},true)
+# In CI, we expect all artifacts to already be built and loaded for the script
+resume-test:
+	./tests/local-resume-test.sh
+else
+# When not in CI (i.e. development), load the dev k8 image before running test
+resume-test: build-cli
+	./tests/local-resume-test.sh
 endif
 
 # When running in development, might need to run `cargo clean` to ensure correct fluvio binary is used
@@ -193,34 +214,67 @@ longevity-test: build-test
 	$(TEST_BIN) longevity --expect-timeout -- $(VERBOSE_FLAG) --runtime-seconds=60
 endif
 
+sm-target:
+	rustup target add wasm32-wasip1
+
+cli-backward-compatibility-test:
+	./tests/cli/cli-backward-compatibility.bash
+
 cli-platform-cross-version-test:
 	bats -t ./tests/cli/cli-platform-cross-version.bats
 
+cli-partition-test-multiple-partitions:
+	bats ./tests/cli/partition_test/multiple_partitions.bats
+
 cli-fluvio-smoke:
-	bats $(shell ls -1 ./tests/cli/fluvio_smoke_tests/*.bats | sort -R)
+	bats -x $(shell ls -1 ./tests/cli/fluvio_smoke_tests/*.bats | sort -R)
+	bats ./tests/cli/fluvio_smoke_tests/non-concurrent/local-resume.bats
 	bats ./tests/cli/fluvio_smoke_tests/non-concurrent/cluster-delete.bats
 
-cli-smdk-smoke:
+cli-fluvio-read-only-smoke:
+	bats $(shell ls -1 ./tests/cli/fluvio_read_only/*.bats | sort -R)
+
+cli-fluvio-mirroring-smoke:
+	bats $(shell ls -1 ./tests/cli/mirroring_smoke_tests/*.bats | sort -R)
+
+cli-fluvio-mirroring-smoke-e2e:
+	bats $(shell ls -1 ./tests/cli/mirroring_smoke_tests/e2e/*.bats | sort -R)
+
+cli-smdk-smoke: sm-target
 	bats $(shell ls -1 ./tests/cli/smdk_smoke_tests/*.bats | sort -R)
+
+cli-cdk-smoke:
+	bats $(shell ls -1 ./tests/cli/cdk_smoke_tests/*.bats | sort -R)
+
+cli-fvm-smoke:
+	bats $(shell ls -1 ./tests/cli/fvm_smoke_tests/*.bats | sort -R)
 
 cli-basic-test:
 	bats ./tests/cli/fluvio_smoke_tests/e2e-basic.bats
 
-cli-smartmodule-all-test:
-	bats  ./tests/cli/fluvio_smoke_tests/e2e-smartmodule-basic.bats
+cli-smartmodule-all-test: sm-target
+	bats ./tests/cli/fluvio_smoke_tests/e2e-smartmodule-basic.bats
 
-cli-smartmodule-aggregate-test:
-	bats  -f aggregate  ./tests/cli/fluvio_smoke_tests/e2e-smartmodule-basic.bats
+cli-smartmodule-aggregate-test: sm-target
+	bats -f aggregate ./tests/cli/fluvio_smoke_tests/e2e-smartmodule-basic.bats
 
+cli-smartmodule-basic-test: sm-target
+	bats ./tests/cli/fluvio_smoke_tests/smartmodule-basic.bats
 
-cli-smartmodule-basic-test:
-	bats   ./tests/cli/fluvio_smoke_tests/smartmodule-basic.bats
+cli-producer-smartmodule-test: sm-target
+	bats ./tests/cli/fluvio_smoke_tests/producer-smartmodule.bats
 
 stats-test:
 	$(TEST_BIN) stats -- $(VERBOSE_FLAG) --tolerance=5
 
-cli-smdk-basic-test:
+cli-smdk-basic-test: sm-target
 	SMDK_BIN=$(shell readlink -f $(SMDK_BIN)) bats   ./tests/cli/smdk_smoke_tests/smdk-basic.bats
+
+cli-cdk-basic-test:
+	CDK_BIN=$(shell readlink -f $(CDK_BIN)) bats   ./tests/cli/cdk_smoke_tests/cdk-basic.bats
+
+cli-fvm-basic-test:
+	FVM_BIN=$(shell readlink -f $(FVM_BIN)) bats   ./tests/cli/fvm_smoke_tests/fvm-basic.bats
 
 # test rbac
 #

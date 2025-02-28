@@ -1,19 +1,25 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::io::Error;
 use std::io::ErrorKind;
+use std::ops::Deref;
 use std::str::Utf8Error;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use content_inspector::{inspect, ContentType};
-use fluvio_types::PartitionId;
 use tracing::{trace, warn};
 use once_cell::sync::Lazy;
 
 use bytes::Buf;
 use bytes::BufMut;
+
+use fluvio_types::{PartitionId, Timestamp};
+
+#[cfg(feature = "compress")]
+use fluvio_compression::CompressionError;
 
 use crate::{Encoder, Decoder};
 use crate::DecoderVarInt;
@@ -23,12 +29,11 @@ use crate::Version;
 use super::batch::BatchRecords;
 use super::batch::MemoryRecords;
 use super::batch::NO_TIMESTAMP;
-use super::batch::RawRecords;
 use super::batch::Batch;
 use super::Offset;
 
-use fluvio_compression::CompressionError;
-use fluvio_types::Timestamp;
+#[cfg(feature = "compress")]
+use super::batch::RawRecords;
 
 /// maximum text to display
 static MAX_STRING_DISPLAY: Lazy<usize> = Lazy::new(|| {
@@ -98,11 +103,15 @@ impl<K: Into<Vec<u8>>> From<K> for RecordKey {
 #[derive(Clone, Default, Eq, PartialEq, Hash)]
 pub struct RecordData(Bytes);
 
-impl RecordData {
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
+impl Deref for RecordData {
+    type Target = Bytes;
 
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl RecordData {
     /// Check if value is binary content
     pub fn is_binary(&self) -> bool {
         matches!(inspect(&self.0), ContentType::BINARY)
@@ -113,13 +122,22 @@ impl RecordData {
         if self.is_binary() {
             format!("binary: ({} bytes)", self.len())
         } else {
-            format!("text: '{}'", self)
+            format!("text: '{self}'")
         }
     }
 
     // as string slice
     pub fn as_str(&self) -> Result<&str, Utf8Error> {
         std::str::from_utf8(self.as_ref())
+    }
+
+    // as lossy utf8
+    pub fn as_utf8_lossy_string(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(self.as_ref())
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0.into()
     }
 }
 
@@ -219,6 +237,7 @@ pub struct RecordSet<R = MemoryRecords> {
     pub batches: Vec<Batch<R>>,
 }
 
+#[cfg(feature = "compress")]
 impl TryFrom<RecordSet> for RecordSet<RawRecords> {
     type Error = CompressionError;
     fn try_from(set: RecordSet) -> Result<Self, Self::Error> {
@@ -388,6 +407,10 @@ impl RecordHeader {
     pub fn add_base_offset(&mut self, relative_base_offset: Offset) {
         self.offset_delta += relative_base_offset;
     }
+
+    pub fn get_timestamp_delta(&self) -> Timestamp {
+        self.timestamp_delta
+    }
 }
 
 #[derive(Default, Clone)]
@@ -436,21 +459,14 @@ impl<B: Default> Record<B> {
 }
 
 impl Record {
-    pub fn new<V>(value: V) -> Self
-    where
-        V: Into<RecordData>,
-    {
+    pub fn new(value: impl Into<RecordData>) -> Self {
         Record {
             value: value.into(),
             ..Default::default()
         }
     }
 
-    pub fn new_key_value<K, V>(key: K, value: V) -> Self
-    where
-        K: Into<RecordKey>,
-        V: Into<RecordData>,
-    {
+    pub fn new_key_value(key: impl Into<RecordKey>, value: impl Into<RecordData>) -> Self {
         let key = key.into().into_option();
         Record {
             key,
@@ -461,6 +477,10 @@ impl Record {
 
     pub fn timestamp_delta(&self) -> Timestamp {
         self.preamble.timestamp_delta
+    }
+
+    pub fn offset_delta(&self) -> Offset {
+        self.preamble.offset_delta
     }
 }
 
@@ -545,21 +565,19 @@ where
     }
 }
 
-use Record as DefaultRecord;
-
 /// Record that can be used by Consumer which needs access to metadata
-pub struct ConsumerRecord<B = DefaultRecord> {
+pub struct ConsumerRecord {
     /// The offset of this Record into its partition
     pub offset: i64,
     /// The partition where this Record is stored
     pub partition: PartitionId,
     /// The Record contents
-    pub record: B,
+    pub record: Record<RecordData>,
     /// Timestamp base of batch in which the records is present
     pub(crate) timestamp_base: Timestamp,
 }
 
-impl<B> ConsumerRecord<B> {
+impl ConsumerRecord {
     /// The offset from the initial offset for a given stream.
     pub fn offset(&self) -> i64 {
         self.offset
@@ -571,26 +589,36 @@ impl<B> ConsumerRecord<B> {
     }
 
     /// Returns the inner representation of the Record
-    pub fn into_inner(self) -> B {
+    pub fn into_inner(self) -> Record<RecordData> {
         self.record
     }
 
     /// Returns a ref to the inner representation of the Record
-    pub fn inner(&self) -> &B {
+    #[inline(always)]
+    pub fn inner(&self) -> &Record {
         &self.record
     }
-}
 
-impl ConsumerRecord<DefaultRecord> {
-    /// Returns the contents of this Record's key, if it exists
+    /// Returns record key
+    pub fn get_key(&self) -> Option<&RecordData> {
+        self.inner().key()
+    }
+
+    /// Returns record value
+    pub fn get_value(&self) -> &RecordData {
+        self.inner().value()
+    }
+
+    /// Returns the contents of this Record's key as a byte slice
     pub fn key(&self) -> Option<&[u8]> {
-        self.record.key().map(|it| it.as_ref())
+        self.inner().key().map(|it| it.as_ref())
     }
 
-    /// Returns the contents of this Record's value
+    /// Returns the contents of this Record's value as a byte slice
     pub fn value(&self) -> &[u8] {
-        self.record.value().as_ref()
+        self.inner().value().as_ref()
     }
+
     /// Return the timestamp of the Record
     pub fn timestamp(&self) -> Timestamp {
         if self.timestamp_base <= 0 {
@@ -601,7 +629,7 @@ impl ConsumerRecord<DefaultRecord> {
     }
 }
 
-impl AsRef<[u8]> for ConsumerRecord<DefaultRecord> {
+impl AsRef<[u8]> for ConsumerRecord {
     fn as_ref(&self) -> &[u8] {
         self.value()
     }
@@ -742,7 +770,7 @@ mod test {
 
     #[test]
     fn test_consumer_record_no_timestamp() {
-        let record = ConsumerRecord::<Record<RecordData>> {
+        let record = ConsumerRecord {
             timestamp_base: NO_TIMESTAMP,
             offset: 0,
             partition: 0,
@@ -750,7 +778,7 @@ mod test {
         };
 
         assert_eq!(record.timestamp(), NO_TIMESTAMP);
-        let record = ConsumerRecord::<Record<RecordData>> {
+        let record = ConsumerRecord {
             timestamp_base: 0,
             offset: 0,
             partition: 0,
@@ -761,7 +789,7 @@ mod test {
 
     #[test]
     fn test_consumer_record_timestamp() {
-        let record = ConsumerRecord::<Record<RecordData>> {
+        let record = ConsumerRecord {
             timestamp_base: 1_000_000_000,
             offset: 0,
             partition: 0,
@@ -771,7 +799,7 @@ mod test {
         assert_eq!(record.timestamp(), 1_000_000_000);
         let mut memory_record = Record::<RecordData>::default();
         memory_record.preamble.timestamp_delta = 800;
-        let record = ConsumerRecord::<Record<RecordData>> {
+        let record = ConsumerRecord {
             timestamp_base: 1_000_000_000,
             record: memory_record,
             offset: 0,

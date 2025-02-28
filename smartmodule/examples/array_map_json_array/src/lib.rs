@@ -27,16 +27,16 @@
 //! ```text
 //! $ cd smartmodule/examples
 //! $ cargo build --release
-//! $ fluvio consume array-map-array -B --array-map=target/wasm32-unknown-unknown/release/fluvio_wasm_array_map_array.wasm
+//! $ fluvio consume array-map-array -B --array-map=target/wasm32-wasip1/release/fluvio_wasm_array_map_array.wasm
 //! "Apple"
 //! "Banana"
 //! "Cranberry"
 //! ```
 
-use fluvio_smartmodule::{smartmodule, Record, RecordData, Result};
+use fluvio_smartmodule::{smartmodule, SmartModuleRecord, RecordData, Result};
 
 #[smartmodule(array_map)]
-pub fn array_map(record: &Record) -> Result<Vec<(Option<RecordData>, RecordData)>> {
+pub fn array_map(record: &SmartModuleRecord) -> Result<Vec<(Option<RecordData>, RecordData)>> {
     // Deserialize a JSON array with any kind of values inside
     let array: Vec<serde_json::Value> = serde_json::from_slice(record.value.as_ref())?;
 

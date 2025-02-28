@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use async_lock::{RwLock};
+use async_lock::RwLock;
 use tracing::{debug, info, instrument, error, trace};
 
 use fluvio_protocol::record::ReplicaKey;
@@ -18,83 +18,64 @@ use fluvio_socket::VersionedSerialSocket;
 use crate::spu::SpuPool;
 use crate::TopicProducerConfig;
 
-use super::ProducerError;
+use super::{
+    PartitionProducerParams, ProduceCompletionBatchEvent, SharedProducerCallback, ProducerError,
+};
 use super::accumulator::{BatchEvents, BatchesDeque};
 use super::event::EventHandler;
 
 /// Struct that is responsible for sending produce requests to the SPU in a given partition.
-pub(crate) struct PartitionProducer {
+pub(crate) struct PartitionProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
     config: Arc<TopicProducerConfig>,
     replica: ReplicaKey,
-    spu_pool: Arc<SpuPool>,
+    spu_pool: Arc<S>,
     batches_lock: Arc<BatchesDeque>,
     batch_events: Arc<BatchEvents>,
     last_error: Arc<RwLock<Option<ProducerError>>>,
     metrics: Arc<ClientMetrics>,
+    callback: Option<SharedProducerCallback>,
 }
 
-impl PartitionProducer {
+impl<S> PartitionProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
     fn new(
-        config: Arc<TopicProducerConfig>,
+        params: PartitionProducerParams<S>,
         replica: ReplicaKey,
-        spu_pool: Arc<SpuPool>,
-        batches_lock: Arc<BatchesDeque>,
-        batch_events: Arc<BatchEvents>,
         last_error: Arc<RwLock<Option<ProducerError>>>,
-        metrics: Arc<ClientMetrics>,
     ) -> Self {
         Self {
-            config,
+            config: params.config,
             replica,
-            spu_pool,
-            batches_lock,
-            batch_events,
+            spu_pool: params.spu_pool,
+            batches_lock: params.batches_deque,
+            batch_events: params.batch_events,
             last_error,
-            metrics,
+            metrics: params.client_metric,
+            callback: params.callback,
         }
     }
 
     pub fn shared(
-        config: Arc<TopicProducerConfig>,
+        params: PartitionProducerParams<S>,
         replica: ReplicaKey,
-        spu_pool: Arc<SpuPool>,
-        batches: Arc<BatchesDeque>,
-        batch_events: Arc<BatchEvents>,
         error: Arc<RwLock<Option<ProducerError>>>,
-        metrics: Arc<ClientMetrics>,
     ) -> Arc<Self> {
-        Arc::new(PartitionProducer::new(
-            config,
-            replica,
-            spu_pool,
-            batches,
-            batch_events,
-            error,
-            metrics,
-        ))
+        Arc::new(PartitionProducer::new(params, replica, error))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        config: Arc<TopicProducerConfig>,
-        replica: ReplicaKey,
-        spu_pool: Arc<SpuPool>,
-        batches: Arc<BatchesDeque>,
-        batch_events: Arc<BatchEvents>,
+        params: PartitionProducerParams<S>,
         error: Arc<RwLock<Option<ProducerError>>>,
         end_event: Arc<StickyEvent>,
         flush_event: (Arc<EventHandler>, Arc<EventHandler>),
-        metrics: Arc<ClientMetrics>,
+        replica: ReplicaKey,
     ) {
-        let producer = PartitionProducer::shared(
-            config,
-            replica,
-            spu_pool,
-            batches,
-            batch_events,
-            error,
-            metrics,
-        );
+        let producer = PartitionProducer::shared(params, replica, error);
         fluvio_future::task::spawn(async move {
             producer.run(end_event, flush_event).await;
         });
@@ -162,7 +143,6 @@ impl PartitionProducer {
     async fn current_leader(&self) -> Result<SpuId> {
         let partition_spec = self
             .spu_pool
-            .metadata
             .partitions()
             .lookup_by_key(&self.replica)
             .await?
@@ -191,7 +171,7 @@ impl PartitionProducer {
             let mut batches = self.batches_lock.batches.lock().await;
             while !batches.is_empty() {
                 let ready = force
-                    || batches.front().map_or(false, |batch| {
+                    || batches.front().is_some_and(|batch| {
                         batch.is_full() || batch.elapsed() as u128 >= self.config.linger.as_millis()
                     });
                 if ready {
@@ -215,27 +195,47 @@ impl PartitionProducer {
 
         let mut batch_notifiers = vec![];
 
+        let mut events_to_callback = vec![];
+
         for p_batch in batches_ready {
             let mut partition_request = DefaultPartitionRequest {
                 partition_index: self.replica.partition,
                 ..Default::default()
             };
             let notify = p_batch.notify.clone();
+            let metadata = p_batch.metadata().clone();
             let batch = p_batch.batch();
 
             let raw_batch: Batch<RawRecords> = batch.try_into()?;
 
             let producer_metrics = self.metrics.producer_client();
-            producer_metrics.add_records(raw_batch.records_len() as u64);
-            producer_metrics.add_bytes(raw_batch.batch_len() as u64);
+            let records_len = raw_batch.records_len() as u64;
+            let bytes_size = raw_batch.batch_len() as u64;
+            producer_metrics.add_records(records_len);
+            producer_metrics.add_bytes(bytes_size);
 
             partition_request.records.batches.push(raw_batch);
             batch_notifiers.push(notify);
             topic_request.partitions.push(partition_request);
+
+            if self.callback.is_some() {
+                let created_at = metadata.created_at;
+                let elapsed = created_at.elapsed();
+                let event = ProduceCompletionBatchEvent {
+                    created_at,
+                    partition: self.replica.partition,
+                    bytes_size,
+                    records_len,
+                    elapsed,
+                };
+
+                events_to_callback.push(event);
+            }
         }
 
         request.isolation = self.config.isolation;
         request.timeout = self.config.timeout;
+        request.smartmodules.clone_from(&self.config.smartmodules);
         request.topics.push(topic_request);
 
         let (response, _) = self.send_to_socket(spu_socket, request).await?;
@@ -245,6 +245,14 @@ impl PartitionProducer {
         {
             if let Err(_e) = batch_notifier.send(partition_response_fut).await {
                 trace!("Failed to notify produce result because receiver was dropped");
+            }
+        }
+
+        if let Some(callback) = self.callback.clone() {
+            for event in events_to_callback {
+                if let Err(e) = callback.finished(event).await {
+                    error!("Failed to send event to callback: {}", e);
+                }
             }
         }
 
@@ -279,11 +287,6 @@ impl PartitionProducer {
                 let mut futures = Vec::with_capacity(partition_count);
                 for topic in produce_response.responses.into_iter() {
                     for partition in topic.partitions {
-                        if partition.error_code.is_error() {
-                            return Err(FluvioError::from(ProducerError::from(
-                                partition.error_code,
-                            )));
-                        }
                         futures.push(ProducePartitionResponseFuture::ready(
                             partition.base_offset,
                             partition.error_code,

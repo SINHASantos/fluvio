@@ -1,18 +1,21 @@
 use std::io::Error as IoError;
 use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::prelude::AsRawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::path::PathBuf;
 use std::path::Path;
 use std::fmt;
-use std::time::{Instant};
+use std::time::Instant;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use tracing::info;
 use tracing::instrument;
 use tracing::{debug, trace};
 use futures_lite::io::AsyncWriteExt;
 use async_channel::Sender;
+use anyhow::Result;
 
 use fluvio_protocol::record::BatchRecords;
 use fluvio_future::fs::File;
@@ -25,10 +28,9 @@ use fluvio_protocol::Encoder;
 use crate::config::SharedReplicaConfig;
 use crate::mut_index::MutLogIndex;
 use crate::util::generate_file_name;
-use crate::validator::validate;
 use crate::validator::LogValidationError;
-use crate::StorageError;
 use crate::records::FileRecords;
+use crate::validator::LogValidator;
 
 pub const MESSAGE_LOG_EXTENSION: &str = "log";
 
@@ -78,17 +80,18 @@ fn get_flush_policy_from_config(option: &SharedReplicaConfig) -> FlushPolicy {
 }
 
 impl MutFileRecords {
+    #[instrument(skip(option))]
     pub async fn create(
         base_offset: Offset,
         option: Arc<SharedReplicaConfig>,
     ) -> Result<MutFileRecords, BoundedFileSinkError> {
         let log_path = generate_file_name(&option.base_dir, base_offset, MESSAGE_LOG_EXTENSION);
-        let max_len = option.segment_max_bytes.get() as u32;
-        debug!(log_path = ?log_path, max_len = "creating log at");
+        let max_len = option.segment_max_bytes.get();
+        info!(log_path = ?log_path, max_len = "creating log file");
         let file = fluvio_future::fs::util::open_read_append(log_path.clone()).await?;
         let metadata = file.metadata().await?;
         let len = metadata.len() as u32;
-        debug!(len, "log created");
+        info!(len, "log file created");
         Ok(MutFileRecords {
             base_offset,
             file,
@@ -106,13 +109,15 @@ impl MutFileRecords {
         self.base_offset
     }
 
-    pub async fn validate(
-        &mut self,
-        index: &MutLogIndex,
-        skip_errors: bool,
-        verbose: bool,
-    ) -> Result<Offset, LogValidationError> {
-        validate(&self.path, Some(index), skip_errors, verbose).await
+    /// readjust to new length
+    pub(crate) async fn set_len(&mut self, len: u32) -> Result<()> {
+        self.file.set_len(len as u64).await?;
+        self.len = len;
+        Ok(())
+    }
+
+    pub(crate) async fn validate(&mut self, index: &MutLogIndex) -> Result<LogValidator> {
+        LogValidator::default_validate(&self.path, Some(index)).await
     }
 
     /// get current file position
@@ -127,10 +132,13 @@ impl MutFileRecords {
     pub async fn write_batch<R: BatchRecords>(
         &mut self,
         batch: &Batch<R>,
-    ) -> Result<(bool, usize, u32), StorageError> {
+    ) -> Result<(bool, usize, u32)> {
         trace!("start sending using batch {:#?}", batch.get_header());
         if batch.base_offset < self.base_offset {
-            return Err(StorageError::LogValidation(LogValidationError::BaseOff));
+            return Err(LogValidationError::InvalidBaseOffsetMinimum {
+                invalid_batch_offset: batch.base_offset,
+            }
+            .into());
         }
 
         let batch_len = batch.write_size(0);
@@ -315,7 +323,7 @@ impl FileRecords for MutFileRecords {
         let reslice = AsyncFileSlice::new(
             self.file.as_raw_fd(),
             start as u64,
-            (self.len - start as u32) as u64,
+            (self.len - start) as u64,
         );
         Ok(reslice)
     }
@@ -326,7 +334,7 @@ impl FileRecords for MutFileRecords {
     }
 
     fn file(&self) -> File {
-        unsafe { File::from_raw_fd(self.file.as_raw_fd()) }
+        unsafe { File::from(<OwnedFd as FromRawFd>::from_raw_fd(self.file.as_raw_fd())) }
     }
 }
 
@@ -375,6 +383,7 @@ impl FlushPolicy {
 }
 
 #[cfg(test)]
+#[cfg(feature = "fixture")]
 mod tests {
 
     // use std::time::{Duration, Instant};
@@ -555,7 +564,7 @@ mod tests {
 
         let bytes = read_bytes_from_file(&test_file).expect("read bytes final");
         let nbytes = write_size * NUM_WRITES as usize;
-        assert_eq!(bytes.len(), nbytes, "should be {} bytes", nbytes);
+        assert_eq!(bytes.len(), nbytes, "should be {nbytes} bytes");
 
         let old_msg_sink = MutFileRecords::create(OFFSET, options)
             .await
@@ -644,7 +653,7 @@ mod tests {
         // assert_eq!(flush_count + 1, msg_sink.flush_count());
         let bytes = read_bytes_from_file(&test_file).expect("read bytes final");
         let nbytes = write_size * 2;
-        assert_eq!(bytes.len(), nbytes, "should be {} bytes", nbytes);
+        assert_eq!(bytes.len(), nbytes, "should be {nbytes} bytes");
 
         debug!("check multi write delayed flush: wait for flush");
         let flush_count = msg_sink.flush_count();
@@ -660,7 +669,7 @@ mod tests {
 
         let bytes = read_bytes_from_file(&test_file).expect("read bytes final");
         let nbytes = write_size * 4;
-        assert_eq!(bytes.len(), nbytes, "should be {} bytes", nbytes);
+        assert_eq!(bytes.len(), nbytes, "should be {nbytes} bytes");
 
         // this drop and await is useful to verify the flush task exits the
         // drop drops the mutrecords struct, and the await allows a scheduling

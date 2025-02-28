@@ -89,10 +89,10 @@ where
         Self::response_with_header(&self.header, response)
     }
 
-    pub fn response_with_header<H>(header: H, response: R::Response) -> ResponseMessage<R::Response>
-    where
-        H: Into<i32>,
-    {
+    pub fn response_with_header(
+        header: impl Into<i32>,
+        response: R::Response,
+    ) -> ResponseMessage<R::Response> {
         ResponseMessage::new(header.into(), response)
     }
 
@@ -193,14 +193,10 @@ mod test {
     #[repr(u16)]
     #[derive(Eq, PartialEq, Debug, Clone, Copy, Encoder, Decoder)]
     #[fluvio(encode_discriminant)]
+    #[derive(Default)]
     pub enum TestApiKey {
+        #[default]
         ApiVersion = 0,
-    }
-
-    impl Default for TestApiKey {
-        fn default() -> TestApiKey {
-            TestApiKey::ApiVersion
-        }
     }
 
     #[derive(Decoder, Encoder, Debug, Default)]
@@ -229,14 +225,10 @@ mod test {
     #[repr(u16)]
     #[derive(Eq, PartialEq, Debug, Encoder, Decoder, Clone, Copy)]
     #[fluvio(encode_discriminant)]
+    #[derive(Default)]
     pub enum TestApiEnum {
+        #[default]
         ApiVersion = 18,
-    }
-
-    impl Default for TestApiEnum {
-        fn default() -> TestApiEnum {
-            TestApiEnum::ApiVersion
-        }
     }
 
     #[test]

@@ -15,13 +15,13 @@
         "SpuGroup": [
             "All"
         ],
-        "ManagedConnector": [
-            "All"
-        ],
         "SmartModule": [
             "All"
         ],
         "TableFormat": [
+            "All"
+        ],
+        "Mirror": [
             "All"
         ]
     },
@@ -48,6 +48,9 @@
             "All"
         ],
         "TableFormat": [
+            "All"
+        ],
+        "Mirror": [
             "All"
         ]
     }

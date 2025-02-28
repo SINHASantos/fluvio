@@ -5,31 +5,32 @@
 //!
 use std::sync::Arc;
 
+use fluvio_sc_schema::mirror::MirrorSpec;
+use fluvio_stream_model::core::MetadataItem;
+
 use crate::config::ScConfig;
 use crate::stores::spu::*;
 use crate::stores::partition::*;
 use crate::stores::topic::*;
 use crate::stores::spg::*;
-use crate::stores::connector::*;
 use crate::stores::smartmodule::*;
 use crate::stores::tableformat::*;
-use crate::stores::derivedstream::*;
 use crate::stores::*;
 
-pub type SharedContext = Arc<Context>;
+pub type SharedContext<C> = Arc<Context<C>>;
+pub type K8SharedContext = Arc<Context<K8MetaItem>>;
 
 /// Global Context for SC
 /// This is where we store globally accessible data
 #[derive(Debug)]
-pub struct Context {
-    spus: StoreContext<SpuSpec>,
-    partitions: StoreContext<PartitionSpec>,
-    topics: StoreContext<TopicSpec>,
-    spgs: StoreContext<SpuGroupSpec>,
-    managed_connectors: StoreContext<ManagedConnectorSpec>,
-    smartmodules: StoreContext<SmartModuleSpec>,
-    tableformats: StoreContext<TableFormatSpec>,
-    smart_streams: StoreContext<DerivedStreamSpec>,
+pub struct Context<C: MetadataItem> {
+    spus: StoreContext<SpuSpec, C>,
+    partitions: StoreContext<PartitionSpec, C>,
+    topics: StoreContext<TopicSpec, C>,
+    spgs: StoreContext<SpuGroupSpec, C>,
+    smartmodules: StoreContext<SmartModuleSpec, C>,
+    tableformats: StoreContext<TableFormatSpec, C>,
+    mirrors: StoreContext<MirrorSpec, C>,
     health: SharedHealthCheck,
     config: ScConfig,
 }
@@ -38,7 +39,7 @@ pub struct Context {
 // ScMetadata - Implementation
 // -----------------------------------
 
-impl Context {
+impl<C: MetadataItem> Context<C> {
     pub fn shared_metadata(config: ScConfig) -> Arc<Self> {
         Arc::new(Self::new(config))
     }
@@ -50,48 +51,43 @@ impl Context {
             partitions: StoreContext::new(),
             topics: StoreContext::new(),
             spgs: StoreContext::new(),
-            managed_connectors: StoreContext::new(),
             smartmodules: StoreContext::new(),
             tableformats: StoreContext::new(),
-            smart_streams: StoreContext::new(),
+            mirrors: StoreContext::new(),
             health: HealthCheck::shared(),
             config,
         }
     }
 
     /// reference to spus
-    pub fn spus(&self) -> &StoreContext<SpuSpec> {
+    pub fn spus(&self) -> &StoreContext<SpuSpec, C> {
         &self.spus
     }
 
     /// reference to partitions
-    pub fn partitions(&self) -> &StoreContext<PartitionSpec> {
+    pub fn partitions(&self) -> &StoreContext<PartitionSpec, C> {
         &self.partitions
     }
 
     /// reference to topics
-    pub fn topics(&self) -> &StoreContext<TopicSpec> {
+    pub fn topics(&self) -> &StoreContext<TopicSpec, C> {
         &self.topics
     }
 
-    pub fn spgs(&self) -> &StoreContext<SpuGroupSpec> {
+    pub fn spgs(&self) -> &StoreContext<SpuGroupSpec, C> {
         &self.spgs
     }
 
-    pub fn managed_connectors(&self) -> &StoreContext<ManagedConnectorSpec> {
-        &self.managed_connectors
-    }
-
-    pub fn smartmodules(&self) -> &StoreContext<SmartModuleSpec> {
+    pub fn smartmodules(&self) -> &StoreContext<SmartModuleSpec, C> {
         &self.smartmodules
     }
 
-    pub fn tableformats(&self) -> &StoreContext<TableFormatSpec> {
+    pub fn tableformats(&self) -> &StoreContext<TableFormatSpec, C> {
         &self.tableformats
     }
 
-    pub fn derivedstreams(&self) -> &StoreContext<DerivedStreamSpec> {
-        &self.smart_streams
+    pub fn mirrors(&self) -> &StoreContext<MirrorSpec, C> {
+        &self.mirrors
     }
 
     /// spu health channel

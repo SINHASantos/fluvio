@@ -1,4 +1,5 @@
 use std::fmt;
+use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize, Deserializer, Serializer};
 use url::Url;
 use crate::Error;
@@ -24,15 +25,12 @@ impl Registry {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref DEFAULT_REGISTRY: Registry = {
-        let url = url::Url::parse("https://packages.fluvio.io/v1/").unwrap();
-        Registry::from(url)
-    };
-    static ref DEFAULT_GROUP: GroupName = {
-        "fluvio".parse().unwrap()
-    };
-}
+static DEFAULT_REGISTRY: Lazy<Registry> = Lazy::new(|| {
+    let url = url::Url::parse("https://packages.fluvio.io/v1/").unwrap();
+    Registry::from(url)
+});
+
+static DEFAULT_GROUP: Lazy<GroupName> = Lazy::new(|| GroupName("fluvio".to_owned()));
 
 impl fmt::Display for Registry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -159,8 +157,8 @@ pub type MaybeVersion = Option<PackageVersion>;
 /// formatting and parsing rules.
 ///
 /// 1) A `PackageId<WithVersion>` represents a fully-qualified package
-/// name that also refers to a specific version of the package. It is
-/// rendered (and parsed) as a string in the following form:
+///    name that also refers to a specific version of the package. It is
+///    rendered (and parsed) as a string in the following form:
 ///
 /// ```text
 /// <registry>/<group>/<name>:<version>
@@ -176,11 +174,11 @@ pub type MaybeVersion = Option<PackageVersion>;
 /// embedded in it, which can be accessed via `.version()`.
 ///
 /// 2) A `PackageId` (i.e. `PackageId<MaybeVersion>`) might or might not contain a
-/// version, and will parse a package string that does OR does not have a version
-/// in it. This is the type you should use if you don't need a version or if you
-/// want to do something different based on whether or not a version is given. An
-/// example of this might be installing a specific version of a package if a
-/// version is given, or defaulting to the latest version if not given.
+///    version, and will parse a package string that does OR does not have a version
+///    in it. This is the type you should use if you don't need a version or if you
+///    want to do something different based on whether or not a version is given. An
+///    example of this might be installing a specific version of a package if a
+///    version is given, or defaulting to the latest version if not given.
 ///
 /// Valid forms that will parse into a `PackageId` include:
 ///
@@ -231,7 +229,7 @@ impl<T> PackageId<T> {
     pub fn pretty(&self) -> impl fmt::Display {
         let prefix = match (self.registry.as_ref(), self.group.as_ref()) {
             (Some(reg), _) => format!("{}{}/", reg, self.group()),
-            (None, Some(group)) => format!("{}/", group),
+            (None, Some(group)) => format!("{group}/"),
             (None, None) => "".to_string(),
         };
         format!("{}{}", prefix, self.name)
@@ -407,8 +405,8 @@ impl fmt::Display for PackageId<MaybeVersion> {
         let version = self
             .version
             .as_ref()
-            .map(|it| format!(":{}", it))
-            .unwrap_or_else(|| "".to_string());
+            .map(|it| format!(":{it}"))
+            .unwrap_or_default();
         write!(
             f,
             "{registry}{group}/{name}{version}",
@@ -432,7 +430,7 @@ impl<'de> Deserialize<'de> for PackageId<WithVersion> {
                 use serde::de::{Unexpected, Error as DeserializeError};
                 return Err(DeserializeError::invalid_value(
                     Unexpected::Other("Invalid PackageId"),
-                    &&*format!("A PackageId, <registry>/<group>/<name>:<version>, where <registry> is optional: {}", e),
+                    &&*format!("A PackageId, <registry>/<group>/<name>:<version>, where <registry> is optional: {e}"),
                 ));
             }
         };
@@ -452,7 +450,7 @@ impl<'de> Deserialize<'de> for PackageId<MaybeVersion> {
                 use serde::de::{Unexpected, Error as DeserializeError};
                 return Err(DeserializeError::invalid_value(
                     Unexpected::Other("Invalid PackageId"),
-                    &&*format!("A PackageId, <registry>/<group>/<name>:<version>, where <registry> is optional: {}", e),
+                    &&*format!("A PackageId, <registry>/<group>/<name>:<version>, where <registry> is optional: {e}"),
                 ));
             }
         };
@@ -527,7 +525,7 @@ mod tests {
     #[test]
     fn test_parse_package_id_custom_registry() {
         let registry_url = "https://other.registry.io/v2/";
-        let package_id: PackageId<WithVersion> = format!("{}/fluvio.io/fluvio:0.6.0", registry_url)
+        let package_id: PackageId<WithVersion> = format!("{registry_url}/fluvio.io/fluvio:0.6.0")
             .parse()
             .unwrap();
         assert_eq!(package_id.registry(), &registry_url.parse().unwrap());
@@ -568,21 +566,21 @@ mod tests {
             .unwrap();
         assert_eq!(
             "fluvio/fluvio:1.2.3-alpha",
-            format!("{}", package_id_with_version)
+            format!("{package_id_with_version}")
         );
 
         let package_id_maybe_with_version: PackageId<MaybeVersion> =
             "fluvio/fluvio:3.4.5-beta".parse().unwrap();
         assert_eq!(
             "fluvio/fluvio:3.4.5-beta",
-            format!("{}", package_id_maybe_with_version)
+            format!("{package_id_maybe_with_version}")
         );
 
         let package_id_maybe_without_version =
             PackageId::new_unversioned("fluvio".parse().unwrap(), "fluvio".parse().unwrap());
         assert_eq!(
             "fluvio/fluvio",
-            format!("{}", package_id_maybe_without_version)
+            format!("{package_id_maybe_without_version}")
         );
     }
 

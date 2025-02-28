@@ -4,51 +4,50 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use fluvio_sc_schema::message::MsgType;
 use tracing::{error, debug, instrument};
 use event_listener::{Event, EventListener};
 use futures_util::stream::StreamExt;
+use anyhow::Result;
 
 use fluvio_protocol::Encoder;
 use fluvio_protocol::Decoder;
 use fluvio_socket::AsyncResponse;
-use fluvio_sc_schema::objects::{
-    Metadata, MetadataUpdate, ObjectApiWatchRequest, ObjectApiWatchResponse, WatchResponse,
-};
-use fluvio_sc_schema::AdminSpec;
+use fluvio_sc_schema::objects::{Metadata, MetadataUpdate, ObjectApiWatchRequest, WatchResponse};
+use fluvio_sc_schema::{AdminSpec, TryEncodableFrom};
 
 use super::StoreContext;
 use super::CacheMetadataStoreObject;
 use crate::metadata::store::actions::LSUpdate;
-use fluvio_sc_schema::message::MsgType;
 
-pub struct SimpleEvent {
+pub(crate) struct SimpleEvent {
     flag: AtomicBool,
     event: Event,
 }
 
 impl SimpleEvent {
-    pub fn shared() -> Arc<Self> {
+    pub(crate) fn shared() -> Arc<Self> {
         Arc::new(Self {
             flag: AtomicBool::new(false),
             event: Event::new(),
         })
     }
     // is flag set
-    pub fn is_set(&self) -> bool {
+    pub(crate) fn is_set(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
 
-    pub fn listen(&self) -> EventListener {
+    pub(crate) fn listen(&self) -> EventListener {
         self.event.listen()
     }
 
-    pub fn notify(&self) {
+    pub(crate) fn notify(&self) {
         self.event.notify(usize::MAX);
     }
 }
 
 /// Synchronize metadata from SC
-pub struct MetadataSyncController<S: AdminSpec> {
+pub(crate) struct MetadataSyncController<S: AdminSpec> {
     store: StoreContext<S>,
     shutdown: Arc<SimpleEvent>,
 }
@@ -60,12 +59,10 @@ where
     S: Encoder + Decoder + Send + Sync,
     S::Status: Sync + Send + Encoder + Decoder,
     S::IndexKey: Display + Sync + Send,
-    <WatchResponse<S> as TryFrom<ObjectApiWatchResponse>>::Error: Display + Send,
     CacheMetadataStoreObject<S>: TryFrom<Metadata<S>>,
-    WatchResponse<S>: TryFrom<ObjectApiWatchResponse>,
     <Metadata<S> as TryInto<CacheMetadataStoreObject<S>>>::Error: Display,
 {
-    pub fn start(
+    pub(crate) fn start(
         store: StoreContext<S>,
         watch_response: AsyncResponse<ObjectApiWatchRequest>,
         shutdown: Arc<SimpleEvent>,
@@ -106,11 +103,15 @@ where
 
                     match item {
                         Some(Ok(watch_response)) => {
-                            let update_result: Result<WatchResponse<S>,_> = watch_response.try_into();
+                            let update_result = watch_response.downcast() as Result<Option<WatchResponse<S>>>;
                             match update_result {
-                                Ok(update) => {
-                                    if let Err(err) = self.sync_metadata(update.inner()).await {
-                                        error!("Processing updates: {}", err);
+                                Ok(update_opt) => {
+                                    if let Some(update) = update_opt {
+                                        if let Err(err) = self.sync_metadata(update.inner()).await {
+                                            error!("Processing updates: {}", err);
+                                        }
+                                    } else {
+                                        error!("invalid update type: {s}", s = S::LABEL);
                                     }
                                 },
                                 Err(err) => {
@@ -160,7 +161,7 @@ where
                     Err(err) => {
                         return Err(IoError::new(
                             ErrorKind::InvalidData,
-                            format!("problem converting: {}", err),
+                            format!("problem converting: {err}"),
                         ));
                     }
                 }
@@ -175,7 +176,7 @@ where
                 count = updates.changes.len(),
                 "Received partial sync, updating store objects:"
             );
-            let changes = updates
+            let changes: Vec<_> = updates
                 .changes
                 .into_iter()
                 .map(|msg| {
@@ -185,7 +186,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
-                    IoError::new(ErrorKind::InvalidData, format!("problem converting: {}", e))
+                    IoError::new(ErrorKind::InvalidData, format!("problem converting: {e}"))
                 })?
                 .into_iter()
                 // .map(|it| LSUpdate::Mod(it))
@@ -193,7 +194,7 @@ where
                     MsgType::UPDATE => LSUpdate::Mod(obj),
                     MsgType::DELETE => LSUpdate::Delete(obj.key),
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             self.store.store().apply_changes(changes).await;
             return Ok(());

@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use tracing::error;
 
-use crate::k8_types::{Spec as K8Spec, Status as K8Status, ObjectMeta, K8Obj};
-use crate::store::{MetadataStoreObject};
+use crate::k8_types::{Spec as K8Spec, ObjectMeta, K8Obj};
+use crate::store::MetadataStoreObject;
 use crate::core::{Spec, MetadataItem, MetadataContext};
 
 pub type K8MetadataContext = MetadataContext<K8MetaItem>;
@@ -21,6 +21,7 @@ pub type K8MetadataContext = MetadataContext<K8MetaItem>;
 pub struct K8MetaItem {
     revision: u64,
     inner: ObjectMeta,
+    owner: Option<Box<K8MetaItem>>,
 }
 
 /// for sake of comparison, we only care about couple of fields in the metadata
@@ -44,6 +45,7 @@ impl K8MetaItem {
         Self {
             revision: 0,
             inner: ObjectMeta::new(name, name_space),
+            owner: Default::default(),
         }
     }
 
@@ -53,29 +55,6 @@ impl K8MetaItem {
 
     pub fn revision(&self) -> u64 {
         self.revision
-    }
-
-    /// create owner if exists, only worry about first references
-    pub fn owner_owned(&self) -> Option<Self> {
-        if self.inner.owner_references.is_empty() {
-            None
-        } else {
-            if self.inner.owner_references.len() > 1 {
-                error!("too many owners: {:#?}", self.inner);
-            }
-
-            let owner = &self.inner.owner_references[0];
-
-            Some(Self {
-                revision: 0,
-                inner: ObjectMeta {
-                    name: owner.name.to_owned(),
-                    namespace: self.namespace.to_owned(),
-                    uid: owner.uid.to_owned(),
-                    ..Default::default()
-                },
-            })
-        }
     }
 }
 
@@ -108,16 +87,23 @@ impl MetadataItem for K8MetaItem {
         self.inner.deletion_grace_period_seconds.is_some()
     }
 
-    fn set_labels<T: Into<String>>(self, labels: Vec<(T, T)>) -> Self {
-        Self {
-            revision: self.revision,
-            inner: self.inner.set_labels(labels),
-        }
+    fn set_labels<T: Into<String>>(mut self, labels: Vec<(T, T)>) -> Self {
+        let inner = self.inner.set_labels(labels);
+        self.inner = inner;
+        self
     }
 
     /// get string labels
     fn get_labels(&self) -> HashMap<String, String> {
         self.inner.labels.clone()
+    }
+
+    fn owner(&self) -> Option<&Self> {
+        self.owner.as_ref().map(|w| w.as_ref())
+    }
+
+    fn set_owner(&mut self, owner: Self) {
+        self.owner = Some(Box::new(owner))
     }
 }
 
@@ -125,17 +111,33 @@ impl TryFrom<ObjectMeta> for K8MetaItem {
     type Error = ParseIntError;
 
     fn try_from(value: ObjectMeta) -> Result<Self, Self::Error> {
-        if value.resource_version.is_empty() {
-            return Ok(Self {
-                revision: 0,
-                inner: value,
-            });
+        let revision: u64 = if value.resource_version.is_empty() {
+            0
+        } else {
+            value.resource_version.parse()?
+        };
+        if value.owner_references.len() > 1 {
+            error!("too many owners: {value:#?}");
         }
-        let revision: u64 = value.resource_version.parse()?;
+        let owner = if let Some(owner_ref) = value.owner_references.first() {
+            let inner = ObjectMeta {
+                name: owner_ref.name.to_owned(),
+                namespace: value.namespace.to_owned(),
+                uid: owner_ref.uid.to_owned(),
+                ..Default::default()
+            };
+            Some(Box::new(Self {
+                inner,
+                ..Default::default()
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             revision,
             inner: value,
+            owner,
         })
     }
 }
@@ -154,8 +156,7 @@ where
 
 /// trait to convert type object to our spec
 pub trait K8ExtendedSpec: Spec {
-    type K8Spec: K8Spec;
-    type K8Status: K8Status;
+    type K8Spec: K8Spec + Send + Sync;
 
     // if true, use foreground delete
     const DELETE_WAIT_DEPENDENTS: bool = false;
@@ -165,6 +166,10 @@ pub trait K8ExtendedSpec: Spec {
         k8_obj: K8Obj<Self::K8Spec>,
         multi_namespace_context: bool,
     ) -> Result<MetadataStoreObject<Self, K8MetaItem>, K8ConvertError<Self::K8Spec>>;
+
+    fn convert_status_from_k8(status: Self::Status) -> <Self::K8Spec as K8Spec>::Status;
+
+    fn into_k8(self) -> Self::K8Spec;
 }
 
 /// converts typical K8 objects into metadata store objects
@@ -197,19 +202,79 @@ where
             match ctx_item_result {
                 Ok(ctx_item) => {
                     //   trace!("k8 revision: {}, meta revision: {}",ctx_item.revision(),ctx_item.inner().resource_version);
-                    let owner = ctx_item.owner_owned();
                     Ok(MetadataStoreObject::new(key, local_spec, local_status)
-                        .with_context(MetadataContext::new(ctx_item, owner)))
+                        .with_context(MetadataContext::new(ctx_item)))
                 }
                 Err(err) => Err(K8ConvertError::KeyConvertionError(IoError::new(
                     ErrorKind::InvalidData,
-                    format!("error converting metadata: {:#?}", err),
+                    format!("error converting metadata: {err:#?}"),
                 ))),
             }
         }
         Err(err) => Err(K8ConvertError::KeyConvertionError(IoError::new(
             ErrorKind::InvalidData,
-            format!("error converting key: {:#?}", err),
+            format!("error converting key: {err:#?}"),
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k8_types::OwnerReferences;
+
+    use super::*;
+
+    #[test]
+    fn test_k8_meta_from_object_meta() {
+        //given
+        let object_meta = ObjectMeta {
+            name: "w2".to_owned(),
+            namespace: "default".to_owned(),
+            resource_version: "123".to_string(),
+            owner_references: vec![OwnerReferences {
+                kind: "Widget".to_owned(),
+                name: "w1".to_owned(),
+                uid: "13fb7d10-6f1e-4749-8e9d-7f6c4013b8a3".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        //when
+        let k8_meta: K8MetaItem = object_meta.try_into().expect("converted");
+
+        //then
+        assert_eq!(k8_meta.revision, 123);
+        assert_eq!(k8_meta.inner.name, "w2");
+        assert_eq!(k8_meta.inner.namespace, "default");
+        assert_eq!(k8_meta.inner.owner_references.len(), 1);
+
+        let owner = k8_meta.owner.expect("owner");
+        assert_eq!(owner.inner.uid, "13fb7d10-6f1e-4749-8e9d-7f6c4013b8a3");
+        assert_eq!(owner.inner.name, "w1");
+    }
+
+    #[test]
+    fn test_k8_meta_from_object_meta_empty_resource_version() {
+        //given
+        let object_meta = ObjectMeta {
+            name: "w2".to_owned(),
+            owner_references: vec![OwnerReferences {
+                name: "w1".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        //when
+        let k8_meta: K8MetaItem = object_meta.try_into().expect("converted");
+
+        //then
+        assert_eq!(k8_meta.revision, 0);
+        assert_eq!(k8_meta.inner.name, "w2");
+        assert_eq!(k8_meta.inner.owner_references.len(), 1);
+
+        let owner = k8_meta.owner.expect("owner");
+        assert_eq!(owner.inner.name, "w1");
     }
 }

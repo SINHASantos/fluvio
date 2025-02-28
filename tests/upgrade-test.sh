@@ -28,12 +28,14 @@ fi
 
 readonly STABLE=${1:-stable}
 readonly PRERELEASE=${2:-$(cat VERSION)-$(git rev-parse HEAD)}
-readonly CI_SLEEP=${CI_SLEEP:-5}
+readonly CI_SLEEP=${CI_SLEEP:-2}
 readonly CI=${CI:-}
 readonly STABLE_TOPIC=${STABLE_TOPIC:-stable}
 readonly PRERELEASE_TOPIC=${PRERELEASE_TOPIC:-prerelease}
 readonly USE_LATEST=${USE_LATEST:-}
 readonly FLUVIO_BIN=$(${READLINK} -f ${FLUVIO_BIN:-"$(which fluvio)"})
+readonly FVM_BIN=$(${READLINK} -f ${FVM_BIN:-"~/.fvm/bin/fvm"})
+readonly FLUVIO_MODE=${FLUVIO_MODE:-"k8"}
 
 # Change to this script's directory 
 pushd "$(dirname "$(${READLINK} -f "$0")")" > /dev/null
@@ -50,7 +52,7 @@ function cleanup() {
 # If we're in CI, we want to slow down execution
 # to give CPU some time to rest, so we don't time out
 function ci_check() {
-    :
+	sleep $CI_SLEEP
 }
 
 # This function is intended to be run second after the Stable-1 validation
@@ -62,17 +64,24 @@ function validate_cluster_stable() {
     echo "Install (current stable) CLI"
     unset VERSION
 
-    curl -fsS https://packages.fluvio.io/v1/install.sh | bash | tee /tmp/installer.output 
-    STABLE_VERSION=$(cat /tmp/installer.output | grep "Downloading Fluvio" | grep -v "channel" | awk '{print $5}')
+    curl -fsS https://hub.infinyon.cloud/install/install.sh?ctx=ci | bash
+    
+    ~/.fvm/bin/fvm install stable | tee /tmp/installer.output 
+    STABLE_VERSION=$(cat /tmp/installer.output | grep "fluvio@" | awk '{print $4}' | cut -b 8-)
 
     local STABLE_FLUVIO=${HOME}/.fluvio/bin/fluvio
 
     # This is more for ensuring local dev will pass this test if you've changed your channel
     echo "Switch to \"stable\" channel CLI"
-    $STABLE_FLUVIO version switch stable 
+    ~/.fvm/bin/fvm switch stable
 
     echo "Installing stable fluvio cluster"
-    $STABLE_FLUVIO cluster start 
+    if [[ "$FLUVIO_MODE" == "local" ]]; then
+	$STABLE_FLUVIO cluster start --local
+    else
+	$STABLE_FLUVIO cluster start --k8
+    fi
+
     ci_check;
 
     # Baseline: CLI version and platform version are expected to be the same
@@ -88,10 +97,14 @@ function validate_cluster_stable() {
     # $STABLE_FLUVIO topic create ${STABLE_TOPIC}-delete 
     ci_check;
 
+    echo "Create mirror"
+    $STABLE_FLUVIO remote register stable-remote
+
     # Validate consume on topic before produce
     # https://github.com/infinyon/fluvio/issues/1819
     echo "Validate consume on \"${STABLE_TOPIC}\" before producing"
     $STABLE_FLUVIO consume -B -d ${STABLE_TOPIC} 2>/dev/null
+    ci_check;
 
     echo "Producing test data to ${STABLE_TOPIC}"
     cat data1.txt.tmp | $STABLE_FLUVIO produce ${STABLE_TOPIC}
@@ -116,6 +129,7 @@ function validate_cluster_stable() {
 
 
     $STABLE_FLUVIO partition list
+    ci_check;
 
 }
 
@@ -135,31 +149,44 @@ function validate_upgrade_cluster_to_prerelease() {
         # Use the "latest" fluvio channel
         echo "Switch to \"latest\" channel CLI"
         FLUVIO_BIN_ABS_PATH=${HOME}/.fluvio/bin/fluvio
-        $FLUVIO_BIN_ABS_PATH version switch latest
-        DEV_VERSION=$($FLUVIO_BIN_ABS_PATH update | grep "Downloading Fluvio" | grep -v "channel" | awk '{print $8}' | sed 's/[+]/-/')
 
-        # This is slicing the DEV_VERSION string that is expected to look like this (including the ...):
-        # ex. 0.9.17-f7e196f3c3c5cefd0339afb85543073a12db9c5d...
-        TARGET_VERSION=${DEV_VERSION::-44}
+        ~/.fvm/bin/fvm install latest | tee /tmp/installer.output 
+        # expectd output fvm current => 0.11.0-dev-1+hash (latest)
+        DEV_VERSION=$(~/.fvm/bin/fvm current | awk '{print $1}')
+        TARGET_VERSION=${DEV_VERSION:0:${#DEV_VERSION}-41}
+
         echo "Installed CLI version ${DEV_VERSION}"
         echo "Upgrading cluster to ${DEV_VERSION}"
-        $FLUVIO_BIN_ABS_PATH cluster upgrade
+        echo "Target Version ${TARGET_VERSION}"
+
+        FLUVIO_IMAGE_TAG_STRATEGY=version-git \
+        $FLUVIO_BIN_ABS_PATH cluster upgrade --force
         echo "Wait for SPU to be upgraded. sleeping 1 minute"
+
     else
+        TARGET_VERSION=${PRERELEASE:0:${#PRERELEASE}-41}
         echo "Test local image v${PRERELEASE}"
-        TARGET_VERSION=${PRERELEASE::-41}
+        echo "Target Version ${TARGET_VERSION}"
         # This should use the binary that the Makefile set
 
         echo "Using Fluvio binary located @ ${FLUVIO_BIN_ABS_PATH}"
-        $FLUVIO_BIN_ABS_PATH cluster upgrade --develop
+        $FLUVIO_BIN_ABS_PATH cluster upgrade --force --develop
+    fi
+    if [[ "$FLUVIO_MODE" == "local" ]]; then
+	echo "Resuming local cluster"
+	$FLUVIO_BIN_ABS_PATH cluster resume
     fi
     popd
+
+    ci_check;
 
     # Validate that the development version output matches the expected version from installer output
     $FLUVIO_BIN_ABS_PATH version
     validate_cli_version $FLUVIO_BIN_ABS_PATH $TARGET_VERSION
-    validate_platform_version $FLUVIO_BIN_ABS_PATH $TARGET_VERSION
+    ci_check;
 
+    validate_platform_version $FLUVIO_BIN_ABS_PATH $TARGET_VERSION
+    ci_check;
 
     echo "Create test topic: ${PRERELEASE_TOPIC}"
     $FLUVIO_BIN_ABS_PATH topic create ${PRERELEASE_TOPIC}
@@ -300,6 +327,8 @@ function main() {
 
     echo "Update cluster to stable v${STABLE}. Create and validate data."
     validate_cluster_stable;
+
+    ci_check;
 
     echo "Update cluster to prerelease v${PRERELEASE}"
     validate_upgrade_cluster_to_prerelease;

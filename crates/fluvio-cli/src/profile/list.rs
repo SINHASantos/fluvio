@@ -1,9 +1,11 @@
 use std::sync::Arc;
+
+use fluvio_extension_common::installation::InstallationType;
 use serde::Serialize;
 use comfy_table::Row;
 use clap::Parser;
+use anyhow::Result;
 
-use crate::Result;
 use fluvio::config::{ConfigFile, Config, TlsPolicy};
 use fluvio_extension_common::{Terminal, OutputFormat};
 use fluvio_extension_common::output::{TableOutputHandler, OutputType};
@@ -49,28 +51,37 @@ fn format_tls(tls: &TlsPolicy) -> &'static str {
 
 impl TableOutputHandler for ListConfig<'_> {
     fn header(&self) -> Row {
-        Row::from(["", "PROFILE", "CLUSTER", "ADDRESS", "TLS"])
+        Row::from(["", "PROFILE", "CLUSTER", "ADDRESS", "TLS", "INSTALLATION"])
     }
 
     fn content(&self) -> Vec<Row> {
-        self.0
-            .profile
+        let mut profile_names = self.0.profile.keys().collect::<Vec<_>>();
+        profile_names.sort();
+        profile_names
             .iter()
-            .map(|(profile_name, profile)| {
+            .filter_map(|profile_name| {
+                let profile = self.0.profile.get(profile_name.as_str())?;
                 let active = self
                     .0
                     .current_profile_name()
-                    .map(|it| it == profile_name)
+                    .map(|it| it == profile_name.as_str())
                     .map(|active| if active { "*" } else { "" })
                     .unwrap_or("");
 
-                let (cluster, addr, tls) = self
+                let (cluster, addr, tls, installation) = self
                     .0
                     .cluster(&profile.cluster)
-                    .map(|it| (&*profile.cluster, &*it.endpoint, format_tls(&it.tls)))
-                    .unwrap_or(("", "", ""));
-
-                Row::from([active, profile_name, cluster, addr, tls])
+                    .map(|it| {
+                        (
+                            &*profile.cluster,
+                            &*it.endpoint,
+                            format_tls(&it.tls),
+                            InstallationType::load(it).to_string(),
+                        )
+                    })
+                    .unwrap_or(("", "", "", String::new()));
+                let row = Row::from([active, profile_name, cluster, addr, tls, &installation]);
+                Some(row)
             })
             .collect()
     }

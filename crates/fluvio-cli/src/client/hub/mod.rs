@@ -1,7 +1,7 @@
 pub use cmd::HubCmd;
 
-mod download;
-mod list;
+mod connector;
+mod smartmodule;
 
 mod cmd {
     use std::sync::Arc;
@@ -9,21 +9,26 @@ mod cmd {
 
     use async_trait::async_trait;
     use clap::Parser;
+    use anyhow::Result;
 
     use fluvio::Fluvio;
     use fluvio_extension_common::target::ClusterTarget;
 
     use crate::client::cmd::ClientCmd;
     use crate::common::output::Terminal;
-    use crate::Result;
 
-    use super::download::DownloadHubOpt;
-    use super::list::ListHubOpt;
+    use super::connector::ConnectorHubSubCmd;
+    use super::smartmodule::SmartModuleHubSubCmd;
 
     #[derive(Debug, Parser)]
     pub enum HubCmd {
-        Download(DownloadHubOpt),
-        List(ListHubOpt),
+        #[clap(name = "smartmodule", visible_alias = "sm")]
+        #[command(subcommand)]
+        SmartModule(SmartModuleHubSubCmd),
+
+        #[clap(visible_alias = "conn")]
+        #[command(subcommand)]
+        Connector(ConnectorHubSubCmd),
     }
 
     #[async_trait]
@@ -31,14 +36,15 @@ mod cmd {
         async fn process<O: Terminal + Send + Sync + Debug>(
             self,
             out: Arc<O>,
-            target: ClusterTarget,
+            _target: ClusterTarget,
         ) -> Result<()> {
             match self {
-                Self::Download(opt) => {
-                    opt.process(out, target).await?;
+                Self::Connector(subcmd) => {
+                    subcmd.process(out).await?;
                 }
-                Self::List(opt) => {
-                    opt.process(out).await?;
+
+                Self::SmartModule(subcmd) => {
+                    subcmd.process(out).await?;
                 }
             }
             Ok(())
@@ -52,16 +58,4 @@ mod cmd {
             Ok(())
         }
     }
-}
-
-use fluvio_hub_util as hubutil;
-use hubutil::HubAccess;
-
-use crate::{CliError, Result};
-
-pub(crate) fn get_hub_access(remote: &Option<String>) -> Result<HubAccess> {
-    let access = HubAccess::default_load(remote).map_err(|_| {
-        CliError::HubError("missing access credentials, try 'fluvio cloud login'".into())
-    })?;
-    Ok(access)
 }

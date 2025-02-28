@@ -6,24 +6,13 @@ pub struct ContainerAttributes {
     pub varint: bool,
     pub default: bool,
 
-    /// Encodes a numeric enum by the value of its discriminant
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// #[derive(fluvio_protocol::derive::Encoder)]
-    /// #[fluvio(encode_discriminant)]
-    /// enum ValueEnum {
-    ///     One = 1, // Encodes discriminant "1"
-    ///     Two = 2, // Encodes discriminant "2"
-    /// }
-    /// ```
     pub encode_discriminant: bool,
     pub api_min_version: u16,
     pub api_max_version: Option<u16>,
     pub api_key: Option<u8>,
     pub response: Option<String>,
     pub repr_type_name: Option<String>,
+    pub trace: bool,
 }
 
 impl ContainerAttributes {
@@ -63,6 +52,8 @@ impl ContainerAttributes {
                         } else if let NestedMeta::Meta(Meta::Path(path)) = kf_attr {
                             if path.is_ident("default") {
                                 cont_attr.default = true;
+                            } else if path.is_ident("trace") {
+                                cont_attr.trace = true;
                             } else if path.is_ident("encode_discriminant") {
                                 cont_attr.encode_discriminant = true;
                             } else {

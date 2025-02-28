@@ -5,18 +5,18 @@
 //!
 use std::sync::Arc;
 
-use fluvio_controlplane_metadata::partition::store::{PartitionLocalStore, PartitionMetadata};
-use fluvio_controlplane_metadata::spu::store::{SpuLocalStore, SpuMetadata};
-use fluvio_controlplane_metadata::store::k8::K8MetaItem;
+use fluvio_controlplane::PartitionMetadata;
 use tracing::{debug, info, instrument};
 
+use fluvio_controlplane_metadata::store::k8::K8MetaItem;
 use fluvio_controlplane_metadata::core::MetadataItem;
 
 use crate::stores::partition::{
-    PartitionSpec, ReplicaStatus, PartitionResolution, ElectionPolicy, ElectionScoring,
+    PartitionSpec, PartitionResolution, PartitionLocalStore, SimplePolicy, PartitonStatusExtension,
+    ElectionPolicy,
 };
 use crate::stores::actions::WSAction;
-use crate::stores::spu::SpuLocalStorePolicy;
+use crate::stores::spu::{SpuLocalStorePolicy, SpuLocalStore, SpuMetadata};
 
 type PartitionWSAction<C = K8MetaItem> = WSAction<PartitionSpec, C>;
 
@@ -55,18 +55,12 @@ type PartitionWSAction<C = K8MetaItem> = WSAction<PartitionSpec, C>;
 /// If there are another topic1 with same number of partiition and replica then, they will
 /// have different leader because Topic0-0 already is using spu 0.
 #[derive(Debug)]
-pub struct PartitionReducer<C = K8MetaItem>
-where
-    C: MetadataItem + Send + Sync,
-{
+pub struct PartitionReducer<C: MetadataItem = K8MetaItem> {
     partition_store: Arc<PartitionLocalStore<C>>,
     spu_store: Arc<SpuLocalStore<C>>,
 }
 
-impl<C> Default for PartitionReducer<C>
-where
-    C: MetadataItem + Send + Sync,
-{
+impl<C: MetadataItem> Default for PartitionReducer<C> {
     fn default() -> Self {
         Self {
             partition_store: PartitionLocalStore::new_shared(),
@@ -75,15 +69,11 @@ where
     }
 }
 
-impl<C> PartitionReducer<C>
-where
-    C: MetadataItem + Send + Sync,
-{
-    pub fn new<A, B>(partition_store: A, spu_store: B) -> Self
-    where
-        A: Into<Arc<PartitionLocalStore<C>>>,
-        B: Into<Arc<SpuLocalStore<C>>>,
-    {
+impl<C: MetadataItem> PartitionReducer<C> {
+    pub fn new(
+        partition_store: impl Into<Arc<PartitionLocalStore<C>>>,
+        spu_store: impl Into<Arc<SpuLocalStore<C>>>,
+    ) -> Self {
         Self {
             partition_store: partition_store.into(),
             spu_store: spu_store.into(),
@@ -100,7 +90,7 @@ where
             .into_iter()
             .filter_map(|partition| {
                 if partition.ctx().item().is_being_deleted() && !partition.status.is_being_deleted {
-                    debug!("set partition: {} to delete", partition.key());
+                    debug!(partition = ?partition.key(), "set partition to delete");
                     Some(PartitionWSAction::UpdateStatus((
                         partition.key,
                         partition.status.set_to_delete(),
@@ -264,29 +254,6 @@ where
                     }
                 }
             }
-        }
-    }
-}
-
-struct SimplePolicy {}
-
-impl SimplePolicy {
-    fn new() -> Self {
-        SimplePolicy {}
-    }
-}
-
-impl ElectionPolicy for SimplePolicy {
-    fn potential_leader_score(
-        &self,
-        replica_status: &ReplicaStatus,
-        leader: &ReplicaStatus,
-    ) -> ElectionScoring {
-        let lag = leader.leo - replica_status.leo;
-        if lag < 4 {
-            ElectionScoring::Score(lag as u16)
-        } else {
-            ElectionScoring::NotSuitable
         }
     }
 }

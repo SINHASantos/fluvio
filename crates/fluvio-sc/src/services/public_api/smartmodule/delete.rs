@@ -1,5 +1,6 @@
 use std::io::{Error, ErrorKind};
 
+use fluvio_stream_model::core::MetadataItem;
 use tracing::{debug, trace, instrument, info};
 use anyhow::Result;
 
@@ -10,11 +11,11 @@ use fluvio_controlplane_metadata::extended::SpecExt;
 
 use crate::services::auth::AuthServiceContext;
 
-/// Handler for delete smart module request
+/// Handler for delete smartmodule request
 #[instrument(skip(name, auth_ctx))]
-pub async fn handle_delete_smartmodule<AC: AuthContext>(
+pub async fn handle_delete_smartmodule<AC: AuthContext, C: MetadataItem>(
     name: String,
-    auth_ctx: &AuthServiceContext<AC>,
+    auth_ctx: &AuthServiceContext<AC, C>,
 ) -> Result<Status> {
     use fluvio_protocol::link::ErrorCode;
 

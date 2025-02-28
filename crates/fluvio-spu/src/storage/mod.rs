@@ -3,16 +3,17 @@ use std::fmt::Debug;
 use std::time::Instant;
 
 use tracing::{debug, instrument};
-use async_rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use async_lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use anyhow::Result;
 
 use fluvio_protocol::record::BatchRecords;
-use fluvio_controlplane_metadata::partition::{ReplicaKey};
+use fluvio_controlplane_metadata::partition::ReplicaKey;
 use fluvio_spu_schema::Isolation;
 use fluvio_protocol::Encoder;
 use fluvio_protocol::record::{Offset, RecordSet};
 use fluvio_protocol::link::ErrorCode;
 use fluvio_storage::{ReplicaStorage, StorageError, OffsetInfo, ReplicaSlice};
-use fluvio_types::{event::offsets::OffsetChangeListener};
+use fluvio_types::event::offsets::OffsetChangeListener;
 use fluvio_types::event::offsets::OffsetPublisher;
 
 pub const REMOVAL_START: Offset = -1000; // indicate that storage about to be removed
@@ -43,7 +44,7 @@ where
     S: ReplicaStorage,
 {
     /// create new storage replica or restore from durable storage based on configuration
-    pub async fn create(id: ReplicaKey, config: S::ReplicaConfig) -> Result<Self, StorageError> {
+    pub async fn create(id: ReplicaKey, config: S::ReplicaConfig) -> Result<Self> {
         let storage = S::create_or_load(&id, config).await?;
 
         let leo = Arc::new(OffsetPublisher::new(storage.get_leo()));
@@ -132,7 +133,7 @@ where
         &self,
         records: &mut RecordSet<R>,
         hw_update: bool,
-    ) -> Result<(Offset, Offset, usize), StorageError> {
+    ) -> Result<(Offset, Offset, usize)> {
         debug!(
             replica = %self.id,
             leo = self.leo(),

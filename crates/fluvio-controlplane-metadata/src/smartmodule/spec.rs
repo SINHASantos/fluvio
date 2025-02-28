@@ -9,10 +9,7 @@ use tracing::debug;
 
 use fluvio_protocol::{ByteBuf, Encoder, Decoder, Version};
 
-use super::{
-    SmartModuleMetadata,
-    spec_v1::{SmartModuleSpecV1},
-};
+use super::{SmartModuleMetadata, spec_v1::SmartModuleSpecV1};
 
 const V2_FORMAT: Version = 10;
 
@@ -29,7 +26,7 @@ pub struct SmartModuleSpec {
 impl Encoder for SmartModuleSpec {
     fn write_size(&self, version: Version) -> usize {
         if version < V2_FORMAT {
-            //trace!("computing size for smart module spec v1");
+            //trace!("computing size for smartmodule spec v1");
             // just used for computing size
             let spec_v1 = SmartModuleSpecV1::default();
             let mut size = 0;
@@ -53,7 +50,7 @@ impl Encoder for SmartModuleSpec {
         T: BufMut,
     {
         if version < V2_FORMAT {
-            debug!("encoding for smart module spec v1");
+            debug!("encoding for smartmodule spec v1");
             let spec_v1 = SmartModuleSpecV1::default();
             spec_v1.input_kind.encode(dest, version)?;
             spec_v1.output_kind.encode(dest, version)?;
@@ -75,7 +72,7 @@ impl Decoder for SmartModuleSpec {
         T: bytes::Buf,
     {
         if version < V2_FORMAT {
-            debug!("decoding for smart module spec v1");
+            debug!("decoding for smartmodule spec v1");
             let mut spec_v1 = SmartModuleSpecV1::default();
             spec_v1.decode(src, version)?;
             self.wasm = spec_v1.wasm;
@@ -157,19 +154,16 @@ impl SmartModuleWasm {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Encoder, Decoder)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Encoder, Decoder)]
 #[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SmartModuleWasmFormat {
+    #[default]
     #[cfg_attr(feature = "use_serde", serde(rename = "BINARY"))]
+    #[fluvio(tag = 0)]
     Binary,
     #[cfg_attr(feature = "use_serde", serde(rename = "TEXT"))]
+    #[fluvio(tag = 1)]
     Text,
-}
-
-impl Default for SmartModuleWasmFormat {
-    fn default() -> SmartModuleWasmFormat {
-        SmartModuleWasmFormat::Binary
-    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -178,6 +172,7 @@ mod base64 {
 
     use serde::{Serialize, Deserialize};
     use serde::{Deserializer, Serializer};
+    use base64::Engine;
 
     use fluvio_protocol::ByteBuf;
 
@@ -185,13 +180,15 @@ mod base64 {
     where
         S: Serializer,
     {
-        let base64 = base64::encode(bytebuf.deref());
+        let base64 = base64::engine::general_purpose::STANDARD.encode(bytebuf.deref());
         String::serialize(&base64, serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<ByteBuf, D::Error> {
         let b64 = String::deserialize(d)?;
-        let bytes: Vec<u8> = base64::decode(b64.as_bytes()).map_err(serde::de::Error::custom)?;
+        let bytes: Vec<u8> = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(serde::de::Error::custom)?;
         let bytebuf = ByteBuf::from(bytes);
 
         Ok(bytebuf)
@@ -200,11 +197,12 @@ mod base64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[cfg(feature = "smartmodule")]
     #[test]
     fn test_wasm_zip_unzip() {
+        use super::*;
+
         //given
         let payload = b"test wasm";
 

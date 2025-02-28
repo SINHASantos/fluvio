@@ -112,7 +112,7 @@ impl SpuSpec {
 
     pub fn update(&mut self, other: &Self) {
         if self.rack != other.rack {
-            self.rack = other.rack.clone();
+            self.rack.clone_from(&other.rack);
         }
         if self.public_endpoint != other.public_endpoint {
             self.public_endpoint = other.public_endpoint.clone();
@@ -137,6 +137,8 @@ pub struct CustomSpuSpec {
     pub private_endpoint: Endpoint,
     #[cfg_attr(feature = "use_serde", serde(skip_serializing_if = "Option::is_none"))]
     pub rack: Option<String>,
+    #[cfg_attr(feature = "use_serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub public_endpoint_local: Option<Endpoint>,
 }
 
 impl CustomSpuSpec {
@@ -151,7 +153,7 @@ impl From<CustomSpuSpec> for SpuSpec {
             private_endpoint: spec.private_endpoint,
             rack: spec.rack,
             spu_type: SpuType::Custom,
-            public_endpoint_local: Default::default(),
+            public_endpoint_local: spec.public_endpoint_local,
         }
     }
 }
@@ -162,6 +164,7 @@ impl From<SpuSpec> for CustomSpuSpec {
             SpuType::Custom => Self {
                 id: spu.id,
                 public_endpoint: spu.public_endpoint,
+                public_endpoint_local: spu.public_endpoint_local,
                 private_endpoint: spu.private_endpoint,
                 rack: spu.rack,
             },
@@ -329,30 +332,25 @@ impl Endpoint {
     }
 }
 
-#[derive(Decoder, Encoder, Debug, Clone, Eq, PartialEq)]
+#[derive(Default, Decoder, Encoder, Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EncryptionEnum {
+    #[default]
+    #[fluvio(tag = 0)]
     PLAINTEXT,
+    #[fluvio(tag = 1)]
     SSL,
 }
 
-impl Default for EncryptionEnum {
-    fn default() -> Self {
-        EncryptionEnum::PLAINTEXT
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Encoder, Decoder)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Encoder, Decoder)]
 #[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive()]
 pub enum SpuType {
+    #[default]
+    #[fluvio(tag = 0)]
     Managed,
+    #[fluvio(tag = 1)]
     Custom,
-}
-
-impl Default for SpuType {
-    fn default() -> Self {
-        SpuType::Managed
-    }
 }
 
 /// Return type label in String format
@@ -450,7 +448,7 @@ impl Decoder for CustomSpu {
             _ => {
                 return Err(IoError::new(
                     ErrorKind::UnexpectedEof,
-                    format!("invalid value for Custom Spu: {}", value),
+                    format!("invalid value for Custom Spu: {value}"),
                 ))
             }
         }

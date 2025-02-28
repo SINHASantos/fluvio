@@ -9,22 +9,22 @@ mod table_format;
 mod record_format;
 
 use table_format::TableModel;
+
 pub use cmd::ConsumeOpt;
 
 mod cmd {
 
-    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{UNIX_EPOCH, Duration};
     use std::{io::Error as IoError, path::PathBuf};
-    use std::io::{self, ErrorKind, Read, Stdout};
+    use std::io::{self, ErrorKind, IsTerminal, Stdout};
     use std::collections::BTreeMap;
     use std::fmt::Debug;
     use std::sync::Arc;
 
-    use fluvio_types::PartitionId;
+    use fluvio_protocol::link::ErrorCode;
+    use futures_util::{Stream, StreamExt};
     use tracing::{debug, trace, instrument};
-    use flate2::Compression;
-    use flate2::bufread::GzEncoder;
     use clap::{Parser, ValueEnum};
     use futures::{select, FutureExt};
     use async_trait::async_trait;
@@ -37,23 +37,27 @@ mod cmd {
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
     use handlebars::{self, Handlebars};
+    use anyhow::Result;
 
-    use fluvio_spu_schema::server::smartmodule::{
-        SmartModuleContextData, SmartModuleKind, SmartModuleInvocation, SmartModuleInvocationWasm,
-    };
+    use fluvio_types::PartitionId;
+    use fluvio_spu_schema::server::smartmodule::SmartModuleContextData;
     use fluvio_protocol::record::NO_TIMESTAMP;
     use fluvio::metadata::tableformat::TableFormatSpec;
-    use fluvio_future::io::StreamExt;
-    use fluvio::{ConsumerConfig, Fluvio, MultiplePartitionConsumer, Offset, FluvioError};
-    use fluvio::consumer::{PartitionSelectionStrategy, Record};
+    use fluvio::{Fluvio, Offset, FluvioError};
+    use fluvio::consumer::{ConsumerConfigExt, ConsumerStream, OffsetManagementStrategy};
+
+    use fluvio::consumer::Record;
     use fluvio_spu_schema::Isolation;
 
     use crate::monitoring::init_monitoring;
     use crate::render::ProgressRenderer;
-    use crate::{CliError, Result};
+    use crate::CliError;
     use crate::common::FluvioExtensionMetadata;
-    use crate::util::parse_isolation;
+    use crate::util::{parse_isolation, parse_key_val};
     use crate::common::Terminal;
+    use crate::client::smartmodule_invocation::{
+        create_smartmodule, create_smartmodule_from_path, create_smartmodule_list,
+    };
 
     use super::record_format::{
         format_text_record, format_binary_record, format_dynamic_record, format_raw_record,
@@ -64,6 +68,7 @@ mod cmd {
     use fluvio_smartengine::transformation::TransformationConfig;
 
     const USER_TEMPLATE: &str = "user_template";
+    const DEFAULT_OFFSET_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
     /// Read messages from a topic/partition
     ///
@@ -73,27 +78,31 @@ mod cmd {
     #[derive(Debug, Parser)]
     pub struct ConsumeOpt {
         /// Topic name
-        #[clap(value_name = "topic")]
+        #[arg(value_name = "topic")]
         pub topic: String,
 
         /// Partition id
-        #[clap(short = 'p', long, default_value = "0", value_name = "integer")]
-        pub partition: PartitionId,
+        #[arg(short = 'p', long, value_name = "integer")]
+        pub partition: Vec<PartitionId>,
+
+        /// Remote cluster to consume from
+        #[arg(short = 'm', long)]
+        pub mirror: Option<String>,
 
         /// Consume records from all partitions
-        #[clap(short = 'A', long = "all-partitions", conflicts_with_all = &["partition"])]
+        #[arg(short = 'A', long = "all-partitions", conflicts_with_all = &["partition"])]
         pub all_partitions: bool,
 
         /// Disable continuous processing of messages
-        #[clap(short = 'd', long)]
+        #[arg(short = 'd', long)]
         pub disable_continuous: bool,
 
         /// Disable the progress bar and wait spinner
-        #[clap(long)]
+        #[arg(long)]
         pub disable_progressbar: bool,
 
         /// Print records in "[key] value" format, with "[null]" for no key
-        #[clap(short, long)]
+        #[arg(short, long)]
         pub key_value: bool,
 
         /// Provide a template string to print records with a custom format.
@@ -110,43 +119,49 @@ mod cmd {
         /// Would produce a printout where records might look like this:
         ///
         /// Offset 0 has key A and value Apple
-        #[clap(short = 'F', long, conflicts_with_all = &["output"])]
+        #[arg(short = 'F', long, conflicts_with_all = &["output"])]
         pub format: Option<String>,
 
         /// Consume records using the formatting rules defined by TableFormat name
-        #[clap(long)]
+        #[arg(long)]
         pub table_format: Option<String>,
 
         /// Consume records from the beginning of the log
-        #[clap(short = 'B', long,  conflicts_with_all = &["head","start", "tail"])]
+        #[arg(short = 'B', long,  conflicts_with_all = &["head","start", "tail"])]
         pub beginning: bool,
 
         /// Consume records starting <integer> from the beginning of the log
-        #[clap(short = 'H', long, value_name = "integer", conflicts_with_all = &["beginning", "start", "tail"])]
+        #[arg(short = 'H', long, value_name = "integer", conflicts_with_all = &["beginning", "start", "tail"])]
         pub head: Option<u32>,
 
         /// Consume records starting <integer> from the end of the log
-        #[clap(short = 'T', long,  value_name = "integer", conflicts_with_all = &["beginning","head", "start"])]
+        #[arg(short = 'T', long,  value_name = "integer", conflicts_with_all = &["beginning","head", "start"])]
         pub tail: Option<u32>,
 
         /// The absolute offset of the first record to begin consuming from
-        #[clap(long, value_name = "integer", conflicts_with_all = &["beginning", "head", "tail"])]
+        #[arg(long, value_name = "integer", conflicts_with_all = &["beginning", "head", "tail"])]
         pub start: Option<u32>,
 
         /// Consume records until end offset (inclusive)
-        #[clap(long, value_name = "integer")]
+        #[arg(long, value_name = "integer")]
         pub end: Option<u32>,
 
         /// Maximum number of bytes to be retrieved
-        #[clap(short = 'b', long = "maxbytes", value_name = "integer")]
+        #[arg(short = 'b', long = "maxbytes", value_name = "integer")]
         pub max_bytes: Option<i32>,
 
+        /// Isolation level that consumer must respect.
+        /// Supported values: read_committed (ReadCommitted) - consume only committed records,
+        /// read_uncommitted (ReadUncommitted) - consume all records accepted by leader.
+        #[arg(long, value_parser=parse_isolation)]
+        pub isolation: Option<Isolation>,
+
         /// Suppress items items that have an unknown output type
-        #[clap(long = "suppress-unknown")]
+        #[arg(long = "suppress-unknown")]
         pub suppress_unknown: bool,
 
         /// Output
-        #[clap(
+        #[arg(
             short = 'O',
             long = "output",
             value_name = "type",
@@ -155,8 +170,8 @@ mod cmd {
         )]
         pub output: Option<ConsumeOutputType>,
 
-        /// Name of the smart module
-        #[clap(
+        /// Name of the smartmodule
+        #[arg(
             long,
             group("smartmodule_group"),
             group("aggregate_group"),
@@ -164,8 +179,8 @@ mod cmd {
         )]
         pub smartmodule: Option<String>,
 
-        /// Path to the stmart module
-        #[clap(
+        /// Path to the smart module
+        #[arg(
             long,
             group("smartmodule_group"),
             group("aggregate_group"),
@@ -173,45 +188,45 @@ mod cmd {
         )]
         pub smartmodule_path: Option<PathBuf>,
 
-        /// (Optional) Path to a file to use as an initial accumulator value with --aggregate
-        #[clap(long, requires = "aggregate_group", alias = "a-init")]
+        /// (Optional) Value to use as an initial accumulator for aggregate SmartModules
+        #[arg(long, requires = "aggregate_group", alias = "a-init")]
         pub aggregate_initial: Option<String>,
 
-        /// (Optional) Extra input parameters passed to the smartmodule module.
+        /// (Optional) Extra input parameters passed to the smartmodule.
         /// They should be passed using key=value format
-        /// Eg. fluvio consume topic-name --filter filter.wasm -e foo=bar -e key=value -e one=1
-        #[clap(
+        /// Eg. fluvio consume topic-name --smartmodule my_filter -e foo=bar -e key=value -e one=1
+        #[arg(
             short = 'e',
             requires = "smartmodule_group",
             long="params",
             value_parser=parse_key_val,
             // value_parser,
             // action,
-            number_of_values = 1
+            num_args = 1
         )]
         pub params: Option<Vec<(String, String)>>,
 
-        /// Isolation level that consumer must respect.
-        /// Supported values: read_committed (ReadCommitted) - consume only committed records,
-        /// read_uncommitted (ReadUncommitted) - consume all records accepted by leader.
-        #[clap(long, value_parser=parse_isolation)]
-        pub isolation: Option<Isolation>,
-
         /// (Optional) Path to a file with transformation specification.
-        #[clap(long, conflicts_with = "smartmodule_group")]
-        pub transforms_file: Option<PathBuf>,
+        #[arg(
+            short,
+            long,
+            conflicts_with = "smartmodule_group",
+            alias = "transforms-file"
+        )]
+        pub transforms: Option<PathBuf>,
 
         /// (Optional) Transformation specification as JSON formatted string.
-        /// E.g. fluvio consume topic-name --transform='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
-        #[clap(long, short, conflicts_with_all = &["smartmodule_group", "transforms_file"])]
-        pub transform: Vec<String>,
-    }
+        /// E.g. fluvio consume topic-name --transforms-line='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
+        #[arg(long, conflicts_with_all = &["smartmodule_group", "transforms"], alias = "transform")]
+        pub transforms_line: Vec<String>,
 
-    fn parse_key_val(s: &str) -> Result<(String, String)> {
-        let pos = s.find('=').ok_or_else(|| {
-            CliError::InvalidArg(format!("invalid KEY=value: no `=` found in `{}`", s))
-        })?;
-        Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+        /// Truncate the output to one line
+        #[arg(long, conflicts_with_all = &["output", "format"])]
+        pub truncate: bool,
+
+        /// Consumer id
+        #[arg(short, long)]
+        pub consumer: Option<String>,
     }
 
     #[async_trait]
@@ -219,7 +234,7 @@ mod cmd {
         #[instrument(
             skip(self, fluvio),
             name = "Consume",
-            fields(topic = %self.topic, partition = self.partition),
+            fields(topic = %self.topic, partition = ?self.partition),
         )]
         async fn process_client<O: Terminal + Debug + Send + Sync>(
             self,
@@ -246,31 +261,20 @@ mod cmd {
                     }
 
                     if found.is_none() {
-                        return Err(CliError::TableFormatNotFound(tableformat_name.to_string()));
+                        return Err(
+                            CliError::TableFormatNotFound(tableformat_name.to_string()).into()
+                        );
                     }
 
                     found
                 } else {
-                    return Err(CliError::TableFormatNotFound(tableformat_name.to_string()));
+                    return Err(CliError::TableFormatNotFound(tableformat_name.to_string()).into());
                 }
             } else {
                 None
             };
 
-            if self.all_partitions {
-                let consumer = fluvio
-                    .consumer(PartitionSelectionStrategy::All(self.topic.clone()))
-                    .await?;
-                self.consume_records(consumer, maybe_tableformat).await?;
-            } else {
-                let consumer = fluvio
-                    .consumer(PartitionSelectionStrategy::Multiple(vec![(
-                        self.topic.clone(),
-                        self.partition,
-                    )]))
-                    .await?;
-                self.consume_records(consumer, maybe_tableformat).await?;
-            };
+            self.consume_records(fluvio, maybe_tableformat).await?;
 
             Ok(())
         }
@@ -298,14 +302,29 @@ mod cmd {
 
         pub async fn consume_records(
             &self,
-            consumer: MultiplePartitionConsumer,
+            fluvio: &Fluvio,
             tableformat: Option<TableFormatSpec>,
         ) -> Result<()> {
             trace!(config = ?self, "Starting consumer:");
-            self.init_ctrlc()?;
+            let stop_signal = self.init_ctrlc()?;
             let offset = self.calculate_offset()?;
 
-            let mut builder = ConsumerConfig::builder();
+            let mut builder = ConsumerConfigExt::builder();
+            builder.topic(&self.topic);
+            builder.offset_start(offset);
+            for partition in &self.partition {
+                builder.partition(*partition);
+            }
+            if let Some(ref consumer) = self.consumer {
+                builder.offset_consumer(consumer.clone());
+                builder.offset_strategy(OffsetManagementStrategy::Auto);
+                builder.offset_flush(DEFAULT_OFFSET_FLUSH_INTERVAL);
+            }
+
+            if let Some(ref mirror) = self.mirror {
+                builder.mirror(mirror.clone());
+            }
+
             if let Some(max_bytes) = self.max_bytes {
                 builder.max_bytes(max_bytes);
             }
@@ -327,21 +346,16 @@ mod cmd {
                     self.smart_module_ctx(),
                     initial_param,
                 )?]
-            } else if !self.transform.is_empty() {
-                let config =
-                    TransformationConfig::try_from(self.transform.clone()).map_err(|err| {
-                        CliError::InvalidArg(format!(
-                            "unable to parse `transform` argument: {}",
-                            err
-                        ))
-                    })?;
+            } else if !self.transforms_line.is_empty() {
+                let config = TransformationConfig::try_from(self.transforms_line.clone()).map_err(
+                    |err| {
+                        CliError::InvalidArg(format!("unable to parse `transform` argument: {err}"))
+                    },
+                )?;
                 create_smartmodule_list(config)?
-            } else if let Some(transforms_file) = &self.transforms_file {
-                let config = TransformationConfig::from_file(transforms_file).map_err(|err| {
-                    CliError::InvalidArg(format!(
-                        "unable to process `transforms_file` argument: {}",
-                        err
-                    ))
+            } else if let Some(transforms) = &self.transforms {
+                let config = TransformationConfig::from_file(transforms).map_err(|err| {
+                    CliError::InvalidArg(format!("unable to process `transforms` argument: {err}"))
                 })?;
                 create_smartmodule_list(config)?
             } else {
@@ -363,7 +377,8 @@ mod cmd {
                         return Err(CliError::from(FluvioError::CrossingOffsets(
                             start_offset,
                             end_offset,
-                        )));
+                        ))
+                        .into());
                     }
                 }
             }
@@ -375,11 +390,21 @@ mod cmd {
             let consume_config = builder.build()?;
             debug!("consume config: {:#?}", consume_config);
 
-            self.consume_records_stream(consumer, offset, consume_config, tableformat)
+            self.print_status();
+            let mut stream = fluvio
+                .consumer_with_config(consume_config)
+                .await?
+                .take_until(stop_signal.recv());
+            self.consume_records_stream(&mut stream, tableformat)
                 .await?;
 
             if !self.disable_continuous {
                 eprintln!("Consumer stream has closed");
+            }
+
+            if self.consumer.is_some() {
+                stream.get_mut().offset_commit().await?;
+                stream.get_mut().offset_flush().await?;
             }
 
             Ok(())
@@ -388,14 +413,10 @@ mod cmd {
         /// Consume records as a stream, waiting for new records to arrive
         async fn consume_records_stream(
             &self,
-            consumer: MultiplePartitionConsumer,
-            offset: Offset,
-            config: ConsumerConfig,
+            stream: &mut (impl Stream<Item = Result<Record, ErrorCode>> + Unpin),
             tableformat: Option<TableFormatSpec>,
         ) -> Result<()> {
-            self.print_status();
             let maybe_potential_end_offset: Option<u32> = self.end;
-            let mut stream = consumer.stream_with_config(offset, config).await?;
 
             let templates = match self.format.as_deref() {
                 None => None,
@@ -469,6 +490,10 @@ mod cmd {
                                         continue;
                                     }
                                     */
+                                    Err(ErrorCode::MaxRetryReached) => {
+                                        eprintln!("Max limit of retry connection reached");
+                                        break;
+                                    }
                                     Err(other) => return Err(other.into()),
                                 };
 
@@ -503,7 +528,7 @@ mod cmd {
                                         }
                                     }
                                 }
-                                Some(Err(e)) => println!("Error: {:?}\r", e),
+                                Some(Err(e)) => println!("Error: {e:?}\r"),
                                 None => break,
                             }
                         },
@@ -573,17 +598,18 @@ mod cmd {
             pb: &ProgressRenderer,
         ) {
             let formatted_key = record
-                .key()
-                .map(|key| String::from_utf8_lossy(key).to_string())
-                .unwrap_or_else(|| "null".to_string());
+                .get_key()
+                .map(|key| key.as_utf8_lossy_string())
+                .unwrap_or_else(|| "null".into());
 
             let formatted_value = match (&self.output, templates) {
                 (Some(ConsumeOutputType::json), None) => {
                     format_json(record.value(), self.suppress_unknown)
                 }
-                (Some(ConsumeOutputType::text), None) => {
-                    Some(format_text_record(record.value(), self.suppress_unknown))
-                }
+                (Some(ConsumeOutputType::text), None) => Some(format_text_record(
+                    record.get_value(),
+                    self.suppress_unknown,
+                )),
                 (Some(ConsumeOutputType::binary), None) => {
                     Some(format_binary_record(record.value()))
                 }
@@ -609,7 +635,7 @@ mod cmd {
                     }
                 }
                 (_, Some(templates)) => {
-                    let value = String::from_utf8_lossy(record.value()).to_string();
+                    let value = record.get_value().as_utf8_lossy_string();
                     let timestamp_rfc3339 = if record.timestamp() == NO_TIMESTAMP {
                         "NA".to_string()
                     } else {
@@ -639,10 +665,17 @@ mod cmd {
             if self.output != Some(ConsumeOutputType::full_table) {
                 match formatted_value {
                     Some(value) if self.key_value => {
-                        let output = format!("[{}] {}", formatted_key, value);
+                        let output = format!("[{formatted_key}] {value}");
                         pb.println(&output);
                     }
-                    Some(value) => {
+                    Some(mut value) => {
+                        if self.truncate {
+                            // `indicatif` doesn't handle well lengthy messages
+                            // TODO: use `indicatif` truncation once the issue is solved
+                            // https://github.com/console-rs/indicatif/issues/591
+                            let (width, _) = crossterm::terminal::size().unwrap_or((u16::MAX, 0));
+                            value = value.chars().take(width as usize).collect();
+                        }
                         pb.println(&value);
                     }
                     // (Some(_), None) only if JSON cannot be printed, so skip.
@@ -660,27 +693,28 @@ mod cmd {
             let starting_description = if self.beginning {
                 " starting from the beginning of log".to_string()
             } else if let Some(offset) = self.head {
-                format!(" starting {} from the beginning of log", offset)
+                format!(" starting {offset} from the beginning of log")
             } else if let Some(offset) = self.start {
-                format!(" starting at offset {}", offset)
+                format!(" starting at offset {offset}")
             } else if let Some(offset) = self.tail {
-                format!(" starting {} from the end of log", offset)
+                format!(" starting {offset} from the end of log")
             } else {
                 "".to_string()
             };
 
             let ending_description = if let Some(end) = self.end {
-                format!(" until offset {} (inclusive)", end)
+                format!(" until offset {end} (inclusive)")
             } else {
                 "".to_string()
             };
 
-            format!("{}{}{}", prefix, starting_description, ending_description)
+            format!("{prefix}{starting_description}{ending_description}")
         }
 
         fn print_status(&self) {
             use colored::*;
-            if !atty::is(atty::Stream::Stdout) {
+
+            if !std::io::stdout().is_terminal() {
                 return;
             }
 
@@ -688,20 +722,29 @@ mod cmd {
         }
 
         /// Initialize Ctrl-C event handler
-        fn init_ctrlc(&self) -> Result<()> {
+        fn init_ctrlc(&self) -> Result<async_channel::Receiver<()>> {
+            let (s, r) = async_channel::bounded(1);
+            let invoked = AtomicBool::new(false);
             let result = ctrlc::set_handler(move || {
                 debug!("detected control c, setting end");
-                std::process::exit(0);
+                if invoked.load(Ordering::SeqCst) {
+                    std::process::exit(0);
+                } else {
+                    invoked.store(true, Ordering::SeqCst);
+                    let _ = s.try_send(());
+                    std::thread::sleep(Duration::from_secs(2));
+                    std::process::exit(0);
+                }
             });
 
             if let Err(err) = result {
                 return Err(IoError::new(
                     ErrorKind::InvalidData,
-                    format!("CTRL-C handler can't be initialized {}", err),
+                    format!("CTRL-C handler can't be initialized {err}"),
                 )
                 .into());
             }
-            Ok(())
+            Ok(r)
         }
 
         /// Calculate the Offset to use with the consumer based on the provided offset number
@@ -722,58 +765,7 @@ mod cmd {
         }
     }
 
-    /// create smartmodule from predefined name
-    fn create_smartmodule(
-        name: &str,
-        ctx: SmartModuleContextData,
-        params: BTreeMap<String, String>,
-    ) -> SmartModuleInvocation {
-        SmartModuleInvocation {
-            wasm: SmartModuleInvocationWasm::Predefined(name.to_string()),
-            kind: SmartModuleKind::Generic(ctx),
-            params: params.into(),
-        }
-    }
-
-    /// create smartmodule from wasm file
-    fn create_smartmodule_from_path(
-        path: &Path,
-        ctx: SmartModuleContextData,
-        params: BTreeMap<String, String>,
-    ) -> Result<SmartModuleInvocation> {
-        let raw_buffer = std::fs::read(path)?;
-        debug!(len = raw_buffer.len(), "read wasm bytes");
-        let mut encoder = GzEncoder::new(raw_buffer.as_slice(), Compression::default());
-        let mut buffer = Vec::with_capacity(raw_buffer.len());
-        encoder.read_to_end(&mut buffer)?;
-
-        Ok(SmartModuleInvocation {
-            wasm: SmartModuleInvocationWasm::AdHoc(buffer),
-            kind: SmartModuleKind::Generic(ctx),
-            params: params.into(),
-        })
-    }
-
-    /// create list of smartmodules from a list of transformations
-    fn create_smartmodule_list(config: TransformationConfig) -> Result<Vec<SmartModuleInvocation>> {
-        Ok(config
-            .transforms
-            .into_iter()
-            .map(|t| SmartModuleInvocation {
-                wasm: SmartModuleInvocationWasm::Predefined(t.uses),
-                kind: SmartModuleKind::Generic(Default::default()),
-                params: t
-                    .with
-                    .into_iter()
-                    .map(|(k, v)| (k, v.into()))
-                    .collect::<std::collections::BTreeMap<String, String>>()
-                    .into(),
-            })
-            .collect())
-    }
-
     // Uses clap::ArgEnum to choose possible variables
-
     #[derive(ValueEnum, Debug, Clone, Eq, PartialEq)]
     #[allow(non_camel_case_types)]
     pub enum ConsumeOutputType {
@@ -802,6 +794,7 @@ mod cmd {
             ConsumeOpt {
                 topic: "TOPIC_NAME".to_string(),
                 partition: Default::default(),
+                mirror: Default::default(),
                 all_partitions: Default::default(),
                 disable_continuous: Default::default(),
                 disable_progressbar: Default::default(),
@@ -821,8 +814,10 @@ mod cmd {
                 params: Default::default(),
                 isolation: Default::default(),
                 beginning: Default::default(),
-                transforms_file: Default::default(),
-                transform: Default::default(),
+                transforms: Default::default(),
+                transforms_line: Default::default(),
+                truncate: Default::default(),
+                consumer: Default::default(),
             }
         }
         #[test]

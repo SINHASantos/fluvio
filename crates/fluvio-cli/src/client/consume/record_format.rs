@@ -6,10 +6,11 @@
 use std::collections::BTreeMap;
 
 use comfy_table::Table;
+use anyhow::{anyhow, Result};
 
 use fluvio::{metadata::tableformat::TableFormatColumnConfig};
 use fluvio_extension_common::{bytes_to_hex_dump, hex_dump_separator};
-use crate::{CliError, Result};
+use fluvio_smartmodule::RecordData;
 
 use super::TableModel;
 
@@ -21,12 +22,12 @@ pub fn format_json(value: &[u8], suppress: bool) -> Option<String> {
     let maybe_json = match serde_json::from_slice(value) {
         Ok(value) => Some(value),
         Err(e) if !suppress => Some(serde_json::json!({
-            "error": format!("{}", e),
+            "error": format!("{e}"),
         })),
         _ => None,
     };
 
-    maybe_json.and_then(|json| serde_json::to_string(&json).ok())
+    maybe_json.and_then(|json| serde_json::to_string_pretty(&json).ok())
 }
 
 // -----------------------------------
@@ -34,11 +35,11 @@ pub fn format_json(value: &[u8], suppress: bool) -> Option<String> {
 // -----------------------------------
 
 /// Print a single record in text format
-pub fn format_text_record(record: &[u8], suppress: bool) -> String {
-    if is_binary(record) && !suppress {
-        format!("binary: ({} bytes)", record.len())
+pub fn format_text_record(data: &RecordData, suppress: bool) -> String {
+    if data.is_binary() && !suppress {
+        format!("binary: ({} bytes)", data.len())
     } else {
-        format!("{}", String::from_utf8_lossy(record))
+        format!("{}", data.as_utf8_lossy_string())
     }
 }
 
@@ -89,7 +90,7 @@ pub fn format_basic_table_record(record: &[u8], print_header: bool) -> Option<St
     let maybe_json: serde_json::Value = match serde_json::from_slice(record) {
         Ok(value) => value,
         Err(e) => {
-            println!("error parsing record as json: {}", e);
+            println!("error parsing record as json: {e}");
             return None;
         }
     };
@@ -149,7 +150,7 @@ pub fn format_fancy_table_record(record: &[u8], table_model: &mut TableModel) ->
     let maybe_json: serde_json::Value = match serde_json::from_slice(record) {
         Ok(value) => value,
         Err(e) => {
-            println!("error parsing record as json: {}", e);
+            println!("error parsing record as json: {e}");
             return None;
         }
     };
@@ -241,9 +242,7 @@ fn flatten_json_array_updates(
             vec_json_objs.push(obj);
             continue;
         } else {
-            return Err(CliError::Other(
-                "Expected all values in json array to be objects".to_string(),
-            ));
+            return Err(anyhow!("Expected all values in json array to be objects"));
         }
     }
     Ok(vec_json_objs)

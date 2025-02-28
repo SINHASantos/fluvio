@@ -24,10 +24,10 @@ pub enum HubCmd {
 pub struct IdOpt {
     hubid: Option<String>,
 
-    #[clap(long, short)]
+    #[arg(long, short)]
     verbose: bool,
 
-    #[clap(long, hide_short_help = true)]
+    #[arg(long, hide_short_help = true)]
     remote: Option<String>,
 }
 
@@ -64,13 +64,13 @@ impl IdOpt {
 pub fn set_hubid(hubid: &str, access: &mut HubAccess) -> Result<()> {
     // if not: ask server if it exists
     if let Err(e) = run_block_on(access.create_hubid(hubid)) {
-        eprintln!("{}", e);
+        eprintln!("{e}");
         std::process::exit(1);
     }
     access.hubid = hubid.to_string();
 
     let cfgpath = def_hub_cfg_path()?;
-    access.write_hash(&cfgpath)?;
+    access.write_hash(cfgpath)?;
     print!("hubid set to {hubid}");
     Ok(())
 }

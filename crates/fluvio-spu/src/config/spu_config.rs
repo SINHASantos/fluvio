@@ -21,6 +21,7 @@ use fluvio_types::defaults::SPU_LOG_INDEX_MAX_BYTES;
 use fluvio_types::defaults::SPU_LOG_INDEX_MAX_INTERVAL_BYTES;
 use fluvio_types::defaults::SPU_LOG_SEGMENT_MAX_BYTES;
 use fluvio_types::defaults::SPU_RETRY_SC_TIMEOUT_MS;
+use fluvio_types::defaults::SPU_SMARTENGINE_STORE_MAX_BYTES;
 
 // environment variables
 
@@ -75,6 +76,19 @@ impl Default for Log {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct SmartEngineConfig {
+    pub store_max_memory: usize,
+}
+
+impl Default for SmartEngineConfig {
+    fn default() -> Self {
+        Self {
+            store_max_memory: SPU_SMARTENGINE_STORE_MAX_BYTES,
+        }
+    }
+}
+
 /// streaming processing unit configuration file
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct SpuConfig {
@@ -95,6 +109,8 @@ pub struct SpuConfig {
     pub log: Log,
 
     pub peer_max_bytes: u32,
+
+    pub smart_engine: SmartEngineConfig,
 }
 
 impl Default for SpuConfig {
@@ -102,13 +118,14 @@ impl Default for SpuConfig {
         Self {
             id: 0,
             rack: None,
-            public_endpoint: format!("0.0.0.0:{}", SPU_PUBLIC_PORT),
-            private_endpoint: format!("0.0.0.0:{}", SPU_PRIVATE_PORT),
-            sc_endpoint: format!("localhost:{}", SC_PRIVATE_PORT),
+            public_endpoint: format!("0.0.0.0:{SPU_PUBLIC_PORT}"),
+            private_endpoint: format!("0.0.0.0:{SPU_PRIVATE_PORT}"),
+            sc_endpoint: format!("localhost:{SC_PRIVATE_PORT}"),
             replication: ReplicationConfig::default(),
             sc_retry_ms: SPU_RETRY_SC_TIMEOUT_MS,
             log: Log::default(),
             peer_max_bytes: fluvio_storage::FileReplica::PREFER_MAX_LEN,
+            smart_engine: SmartEngineConfig::default(),
         }
     }
 }

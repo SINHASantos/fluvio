@@ -1,12 +1,13 @@
+use std::sync::OnceLock;
+
 use regex::Regex;
-use once_cell::sync::OnceCell;
 
 use fluvio_smartmodule::{
-    smartmodule, Record, Result, eyre,
+    smartmodule, SmartModuleRecord, Result, eyre,
     dataplane::smartmodule::{SmartModuleExtraParams, SmartModuleInitError},
 };
 
-static REGEX: OnceCell<Regex> = OnceCell::new();
+static REGEX: OnceLock<Regex> = OnceLock::new();
 
 #[smartmodule(init)]
 fn init(params: SmartModuleExtraParams) -> Result<()> {
@@ -20,7 +21,7 @@ fn init(params: SmartModuleExtraParams) -> Result<()> {
 }
 
 #[smartmodule(filter)]
-pub fn filter(record: &Record) -> Result<bool> {
+pub fn filter(record: &SmartModuleRecord) -> Result<bool> {
     let string = std::str::from_utf8(record.value.as_ref())?;
     Ok(REGEX.get().unwrap().is_match(string))
 }

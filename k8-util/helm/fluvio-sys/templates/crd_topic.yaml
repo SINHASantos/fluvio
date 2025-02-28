@@ -10,70 +10,6 @@ spec:
     plural: topics
     singular: topic
   versions: 
-    - name: v1
-      served: false
-      storage: false
-      deprecated: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          required: ["spec"]
-          properties:
-            status:
-              type: object
-              x-kubernetes-preserve-unknown-fields: true
-            spec:
-              type: object
-              properties:
-                type:
-                  type: string
-                partitions:
-                  type: integer
-                  minimum: 1
-                  maximum: 5000
-                replicationFactor:
-                  type: integer
-                  minimum: 1
-                  maximum: 5000
-                ignoreRackAssignment:
-                  type: boolean
-                customReplicaAssignment:
-                  type: array
-                  items:
-                    type: object
-                    required:
-                    - partition
-                    properties:
-                      partition:
-                        type: object
-                        required:
-                        - id
-                        - replicas
-                        properties:
-                          id:
-                            type: integer
-                            minimum: 0
-                          replicas:
-                            type: array
-                            items:
-                              type: integer
-                              minimum: 0
-      
-      subresources:
-          status: {}
-      additionalPrinterColumns:
-          - name: Partitions
-            type: integer
-            description: Partition count
-            jsonPath: .spec.partitions
-          - name: Replications
-            type: integer
-            description: Replication Count
-            jsonPath: .spec.replicationFactor
-          - name: Status
-            type: string
-            description: Topic Status
-            jsonPath: .status.resolution
     - name: v2
       served: true
       storage: true
@@ -90,6 +26,10 @@ spec:
               properties:
                 replicas:
                   type: object
+                  oneOf:
+                    - required: ["computed"]
+                    - required: ["assigned"]
+                    - required: ["mirror"]
                   properties:
                     computed:
                       type: object
@@ -109,25 +49,63 @@ spec:
                       items:
                         type: object
                         required:
-                        - partition
+                          - id
+                          - replicas
                         properties:
-                          partition:
-                            type: object
-                            required:
-                            - id
-                            - replicas
-                            properties:
-                              id:
-                                type: integer
-                                minimum: 0
-                              replicas:
-                                type: array
-                                items:
-                                  type: integer
-                                  minimum: 0
-                  oneOf:
-                    - required: ["computed"]
-                    - required: ["assigned"]
+                          id:
+                            type: integer
+                            minimum: 0
+                          replicas:
+                            type: array
+                            items:
+                              type: integer
+                              minimum: 0
+                    mirror:
+                      type: object
+                      oneOf:
+                        - required: ["home"]
+                        - required: ["remote"]
+                      properties:
+                        home:
+                          x-kubernetes-preserve-unknown-fields: true
+                          type: object
+                          properties:
+                            partitions:
+                              type: array
+                              items:
+                                type: object
+                                required: ["remoteCluster", "remoteReplica"]
+                                properties:
+                                  remoteCluster:
+                                    type: string
+                                  remoteReplica:
+                                    type: string
+                                  source:
+                                    type: boolean
+                              source:
+                                type: boolean
+                        remote:
+                          type: object
+                          required: ["homeCluster","homeSpus"]
+                          properties:
+                            homeCluster:
+                              type: string
+                            homeSpus:
+                              type: array
+                              items:
+                                type: object
+                                required: ["id","key","endpoint"]
+                                properties:
+                                  id:
+                                    type: integer
+                                    minimum: 0
+                                  key:
+                                    type: string
+                                  endpoint:
+                                    type: string
+                            target:
+                              type: boolean
+
                 cleanupPolicy:
                   type: object
                   properties:
@@ -144,6 +122,7 @@ spec:
                     - Gzip
                     - Snappy
                     - Lz4
+                    - Zstd
                 storage:
                   type: object
                   properties:
@@ -153,6 +132,35 @@ spec:
                     maxPartitionSize:
                       type: integer
                       minimum: 2048
+                deduplication:
+                  type: object
+                  nullable: true  
+                  properties:
+                    filter: 
+                      type: object
+                      nullable: false   
+                      properties:
+                        transform:
+                          type: object
+                          properties:
+                            uses:
+                              type: string
+                              nullable: false  
+                            with:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                    bounds: 
+                      type: object
+                      nullable: false   
+                      properties:
+                        count:
+                          type: integer
+                          minimum: 0
+                        age:
+                          type: string
+                          nullable: true
+                system:
+                  type: boolean
       subresources:
           status: {}
       additionalPrinterColumns:
@@ -180,9 +188,12 @@ spec:
             type: integer
             description: Max Partition Size
             jsonPath: .spec.storage.maxPartitionSize
+          - name: Deduplication Filter
+            type: string
+            description: Deduplication
+            jsonPath: .spec.deduplication.filter.transform.uses
   conversion:
     # None conversion assumes the same schema for all versions and only sets the apiVersion
     # field of custom resources to the proper value
     strategy: None
                    
-

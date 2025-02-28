@@ -1,7 +1,12 @@
 fn main() {
     use std::process::Command;
 
-    println!("cargo:rerun-if-changed=../../VERSION");
+    if let Ok(verpath) = std::fs::canonicalize("../../VERSION") {
+        if verpath.exists() {
+            println!("cargo:rerun-if-changed=../../VERSION");
+        }
+    }
+    println!("cargo:rerun-if-changed=build.rs");
 
     // Fetch current git hash to print version output
     let git_version_output = Command::new("git")
@@ -11,5 +16,5 @@ fn main() {
     let git_hash = String::from_utf8(git_version_output.stdout)
         .expect("should read 'git' stdout to find hash");
     // Assign the git hash to the compile-time GIT_HASH env variable (to use with env!())
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
 }

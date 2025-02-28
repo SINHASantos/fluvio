@@ -1,5 +1,6 @@
+use fluvio_stream_model::core::MetadataItem;
 use tracing::{trace, debug, instrument};
-use std::io::{Error, ErrorKind};
+use anyhow::{anyhow, Result};
 
 use fluvio_controlplane_metadata::store::KeyFilter;
 use fluvio_sc_schema::objects::{ListResponse, Metadata, ListFilters};
@@ -10,10 +11,11 @@ use fluvio_controlplane_metadata::extended::SpecExt;
 use crate::services::auth::AuthServiceContext;
 
 #[instrument(skip(filters, auth_ctx))]
-pub async fn handle_fetch_topics_request<AC: AuthContext>(
+pub async fn handle_fetch_topics_request<AC: AuthContext, C: MetadataItem>(
     filters: ListFilters,
-    auth_ctx: &AuthServiceContext<AC>,
-) -> Result<ListResponse<TopicSpec>, Error> {
+    system: bool,
+    auth_ctx: &AuthServiceContext<AC, C>,
+) -> Result<ListResponse<TopicSpec>> {
     debug!("retrieving topic list: {:#?}", filters);
 
     if let Ok(authorized) = auth_ctx
@@ -26,7 +28,7 @@ pub async fn handle_fetch_topics_request<AC: AuthContext>(
             return Ok(ListResponse::new(vec![]));
         }
     } else {
-        return Err(Error::new(ErrorKind::Interrupted, "authorization io error"));
+        return Err(anyhow!("authorization error"));
     }
 
     let topics: Vec<Metadata<TopicSpec>> = auth_ctx
@@ -36,6 +38,7 @@ pub async fn handle_fetch_topics_request<AC: AuthContext>(
         .read()
         .await
         .values()
+        .filter(|value| value.inner().spec().is_system() == system)
         .filter_map(|value| {
             if filters.filter(value.key()) {
                 Some(value.inner().clone().into())

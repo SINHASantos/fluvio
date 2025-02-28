@@ -1,5 +1,7 @@
 transforms:
-  - uses: infinyon/jolt@0.1.0
+  - uses: infinyon/jolt@0.4.1
+    lookback:
+      age: 1w
     with:
       spec:
         - operation: shift
@@ -10,7 +12,23 @@ transforms:
           spec:
             device:
               type: "mobile"
-  - uses: infinyon/json-sql@0.1.0
+  - uses: infinyon/jolt@0.4.1
+    lookback:
+      last: 1
+    with:
+      spec:
+        - operation: shift
+          spec:
+            payload:
+              device: "device"
+        - operation: default
+          spec:
+            device:
+              type: "mobile"
+  - uses: infinyon/json-sql@0.2.1
+    lookback:
+      last: 10
+      age: 12 s  
     with:
       mapping:
         table: "topic_message_demo"

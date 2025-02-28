@@ -4,13 +4,13 @@ use std::convert::TryInto;
 use tracing::trace;
 
 use fluvio_protocol::bytes::Buf;
-use fluvio_protocol::{Encoder, Decoder};
+use fluvio_protocol::Decoder;
 use fluvio_protocol::api::{RequestMessage, ApiMessage, RequestHeader};
 
 use super::LeaderPeerApiEnum;
 use super::UpdateOffsetRequest;
 
-#[derive(Debug, Encoder)]
+#[derive(Debug)]
 pub enum LeaderPeerRequest {
     UpdateOffsets(RequestMessage<UpdateOffsetRequest>),
 }

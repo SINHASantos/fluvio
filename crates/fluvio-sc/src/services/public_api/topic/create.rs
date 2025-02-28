@@ -1,43 +1,44 @@
 //!
 //! # Create Topic Request
 //!
-//! Create topic request handler. There are 2 types of topics:
+//! Create topic request handler. There are 3 types of topics:
 //!  * Topics with Computed Replicas (aka. Computed Topics)
 //!  * Topics with Assigned Replicas (aka. Assigned Topics)
+//!  * Topics with Mirror Replicas (aka. Mirror Topics)
 //!
 //! Computed Topics use Fluvio algorithm for replica assignment.
 //! Assigned Topics allow the users to apply their custom-defined replica assignment.
+//! Mirror Topics are used for mirroring data from one topic to another.
 //!
 
-use std::io::{Error as IoError, ErrorKind};
-
-use fluvio_controlplane_metadata::topic::ReplicaSpec;
-use fluvio_sc_schema::objects::CommonCreateRequest;
-use fluvio_sc_schema::topic::validate::valid_topic_name;
 use tracing::{info, debug, trace, instrument};
+use anyhow::{anyhow, Result};
 
 use fluvio_protocol::link::ErrorCode;
-
+use fluvio_controlplane_metadata::topic::ReplicaSpec;
+use fluvio_sc_schema::objects::CreateRequest;
+use fluvio_sc_schema::shared::validate_resource_name;
 use fluvio_sc_schema::Status;
 use fluvio_sc_schema::topic::TopicSpec;
-
 use fluvio_auth::{AuthContext, TypeAction};
 use fluvio_controlplane_metadata::extended::SpecExt;
+use fluvio_controlplane_metadata::smartmodule::SmartModulePackageKey;
+use fluvio_stream_model::core::MetadataItem;
 
+use crate::controllers::topics::policy::{
+    update_replica_map_for_assigned_topic, validate_assigned_topic_parameters,
+    validate_computed_topic_parameters, validate_mirror_topic_parameter,
+};
 use crate::core::Context;
-use crate::controllers::topics::generate_replica_map;
-use crate::controllers::topics::update_replica_map_for_assigned_topic;
-use crate::controllers::topics::validate_computed_topic_parameters;
-use crate::controllers::topics::validate_assigned_topic_parameters;
 use crate::services::auth::AuthServiceContext;
 
 /// Handler for create topic request
-#[instrument(skip(create, auth_ctx))]
-pub async fn handle_create_topics_request<AC: AuthContext>(
-    create: CommonCreateRequest,
-    topic: TopicSpec,
-    auth_ctx: &AuthServiceContext<AC>,
-) -> Result<Status, IoError> {
+#[instrument(skip(req, auth_ctx))]
+pub(crate) async fn handle_create_topics_request<AC: AuthContext, C: MetadataItem>(
+    req: CreateRequest<TopicSpec>,
+    auth_ctx: &AuthServiceContext<AC, C>,
+) -> Result<Status> {
+    let (create, topic) = req.parts();
     let name = create.name;
 
     info!( topic = %name,"creating topic");
@@ -56,17 +57,15 @@ pub async fn handle_create_topics_request<AC: AuthContext>(
             ));
         }
     } else {
-        return Err(IoError::new(
-            ErrorKind::Interrupted,
-            "authorization io error",
-        ));
+        return Err(anyhow!("authorization io error"));
     }
 
     // validate topic request
-    let mut status = validate_topic_request(&name, &topic, &auth_ctx.global_ctx).await;
+    let mut status = validate_topic_request::<C>(&name, &topic, &auth_ctx.global_ctx).await;
     if status.is_error() {
         return Ok(status);
     }
+
     if !create.dry_run {
         status = process_topic_request(auth_ctx, name, topic).await;
     }
@@ -77,15 +76,18 @@ pub async fn handle_create_topics_request<AC: AuthContext>(
 }
 
 /// Validate topic, takes advantage of the validation routines inside topic action workflow
-async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &Context) -> Status {
+async fn validate_topic_request<C: MetadataItem>(
+    name: &str,
+    topic_spec: &TopicSpec,
+    metadata: &Context<C>,
+) -> Status {
     debug!("validating topic: {}", name);
 
-    let valid_name = valid_topic_name(name);
-    if !valid_name {
+    if let Err(err) = validate_resource_name(name) {
         return Status::new(
             name.to_string(),
             ErrorCode::TopicInvalidName,
-            Some(format!("Invalid topic name: '{}'. Topic name can contain only lowercase alphanumeric characters or '-'.", name)),
+            Some(format!("Invalid topic name: '{name}'. {err}")),
         );
     }
 
@@ -97,7 +99,7 @@ async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &C
         return Status::new(
             name.to_string(),
             ErrorCode::TopicAlreadyExists,
-            Some(format!("topic '{}' already defined", name)),
+            Some(format!("Topic '{name}' already exists")),
         );
     }
 
@@ -110,9 +112,34 @@ async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &C
         );
     }
 
+    // check if deduplication filter is present
+    if let Some(deduplication) = topic_spec.get_deduplication() {
+        let sm_name = deduplication.filter.transform.uses.as_str();
+        let sm_fqdn = match SmartModulePackageKey::from_qualified_name(sm_name) {
+            Ok(fqdn) => fqdn.store_id(),
+            Err(err) => {
+                return Status::new(
+                    sm_name.to_string(),
+                    ErrorCode::DeduplicationSmartModuleNameInvalid(err.to_string()),
+                    Some(err.to_string()),
+                )
+            }
+        };
+        if !metadata.smartmodules().store().contains_key(&sm_fqdn).await {
+            return Status::new(
+                sm_name.to_string(),
+                ErrorCode::DeduplicationSmartModuleNotLoaded,
+                Some(format!(
+                    "{}\nHint: try `fluvio hub download {sm_name}` and repeat this operation",
+                    ErrorCode::DeduplicationSmartModuleNotLoaded
+                )),
+            );
+        }
+    }
+
     match topic_spec.replicas() {
         ReplicaSpec::Computed(param) => {
-            let next_state = validate_computed_topic_parameters(param);
+            let next_state = validate_computed_topic_parameters::<C>(param);
             trace!("validating, computed topic: {:#?}", next_state);
             if next_state.resolution.is_invalid() {
                 Status::new(
@@ -121,21 +148,11 @@ async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &C
                     Some(next_state.reason),
                 )
             } else {
-                let next_state = generate_replica_map(spus, param).await;
-                trace!("validating, generate replica map topic: {:#?}", next_state);
-                if next_state.resolution.no_resource() {
-                    Status::new(
-                        name.to_string(),
-                        ErrorCode::TopicError,
-                        Some(next_state.reason),
-                    )
-                } else {
-                    Status::new_ok(name.to_owned())
-                }
+                Status::new_ok(name.to_owned())
             }
         }
         ReplicaSpec::Assigned(ref partition_map) => {
-            let next_state = validate_assigned_topic_parameters(partition_map);
+            let next_state = validate_assigned_topic_parameters::<C>(partition_map);
             trace!("validating, computed topic: {:#?}", next_state);
             if next_state.resolution.is_invalid() {
                 Status::new(
@@ -144,7 +161,8 @@ async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &C
                     Some(next_state.reason),
                 )
             } else {
-                let next_state = update_replica_map_for_assigned_topic(partition_map, spus).await;
+                let next_state =
+                    update_replica_map_for_assigned_topic::<C>(partition_map, spus).await;
                 trace!("validating, assign replica map topic: {:#?}", next_state);
                 if next_state.resolution.is_invalid() {
                     Status::new(
@@ -157,13 +175,26 @@ async fn validate_topic_request(name: &str, topic_spec: &TopicSpec, metadata: &C
                 }
             }
         }
+        ReplicaSpec::Mirror(ref mirror) => {
+            let next_state = validate_mirror_topic_parameter::<C>(mirror);
+            trace!("validating, mirror topic: {:#?}", next_state);
+            if next_state.resolution.is_invalid() {
+                Status::new(
+                    name.to_string(),
+                    ErrorCode::TopicError,
+                    Some(next_state.reason),
+                )
+            } else {
+                Status::new_ok(name.to_owned())
+            }
+        }
     }
 }
 
 /// create new topic and wait until all partitions are fully provisioned
 /// if any partitions are not provisioned in time, this will generate error
-async fn process_topic_request<AC: AuthContext>(
-    auth_ctx: &AuthServiceContext<AC>,
+async fn process_topic_request<AC: AuthContext, C: MetadataItem>(
+    auth_ctx: &AuthServiceContext<AC, C>,
     name: String,
     topic_spec: TopicSpec,
 ) -> Status {
@@ -183,7 +214,7 @@ async fn process_topic_request<AC: AuthContext>(
     let topic_instance = match auth_ctx
         .global_ctx
         .topics()
-        .create_spec(name.clone(), topic_spec)
+        .create_spec(name.clone(), topic_spec.clone())
         .await
     {
         Ok(instance) => instance,
@@ -191,10 +222,16 @@ async fn process_topic_request<AC: AuthContext>(
             return Status::new(
                 name.clone(),
                 ErrorCode::TopicNotProvisioned,
-                Some(format!("error: {}", err)),
+                Some(format!("error: {err}")),
             )
         }
     };
+
+    // Mirror topics are not provisioned by the SC
+    if let ReplicaSpec::Mirror(_) = topic_spec.replicas() {
+        info!(topic = %name, "Topic created successfully");
+        return Status::new_ok(name);
+    }
 
     let partition_count = topic_instance.spec.partitions();
     debug!(
@@ -202,7 +239,7 @@ async fn process_topic_request<AC: AuthContext>(
         "waiting for partitions to be provisioned",
 
     );
-    let topic_uid = &topic_instance.ctx().item().uid;
+    let topic_uid = &topic_instance.ctx().item().uid();
 
     let partition_ctx = auth_ctx.global_ctx.partitions();
     let mut partition_listener = partition_ctx.change_listener();
@@ -234,7 +271,7 @@ async fn process_topic_request<AC: AuthContext>(
         select! {
             _ = &mut timer  => {
                 debug!("timer expired waiting for topic: {} provisioning",name);
-                return Status::new(name, ErrorCode::TopicNotProvisioned, Some(format!("only {} out of {} provisioned",provisioned_count,partition_count)));
+                return Status::new(name, ErrorCode::TopicNotProvisioned, Some(format!("only {provisioned_count} out of {partition_count} provisioned")));
             },
             _ = partition_listener.listen() => {
                 debug!("partition changed");

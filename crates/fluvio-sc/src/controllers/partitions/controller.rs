@@ -1,5 +1,5 @@
 //!
-//! # Auth Controller
+//! # Partition Controller
 //!
 
 use std::time::Duration;
@@ -12,7 +12,7 @@ use fluvio_future::task::spawn;
 use fluvio_controlplane_metadata::core::MetadataItem;
 use fluvio_controlplane_metadata::store::k8::K8MetaItem;
 
-use crate::stores::{StoreContext};
+use crate::stores::StoreContext;
 use crate::stores::partition::PartitionSpec;
 use crate::stores::spu::SpuSpec;
 
@@ -20,10 +20,7 @@ use super::reducer::PartitionReducer;
 
 /// Handles Partition election
 #[derive(Debug)]
-pub struct PartitionController<C = K8MetaItem>
-where
-    C: MetadataItem + Send + Sync,
-{
+pub struct PartitionController<C: MetadataItem = K8MetaItem> {
     partitions: StoreContext<PartitionSpec, C>,
     spus: StoreContext<SpuSpec, C>,
     reducer: PartitionReducer<C>,
@@ -31,7 +28,7 @@ where
 
 impl<C> PartitionController<C>
 where
-    C: MetadataItem + Send + Sync + 'static,
+    C: MetadataItem + 'static,
 {
     pub fn start(partitions: StoreContext<PartitionSpec, C>, spus: StoreContext<SpuSpec, C>) {
         let controller = Self {
@@ -108,10 +105,7 @@ where
         }
 
         let (updates, _) = changes.parts();
-        trace!(
-            meta_changes = &*format!("{:#?}", updates),
-            "metadata changes"
-        );
+        trace!(meta_changes = &*format!("{updates:#?}"), "metadata changes");
 
         let actions = self.reducer.process_partition_update(updates).await;
 
@@ -162,48 +156,6 @@ TODO: in progress, do not delete
 mod test {
 
     use super::*;
-
-    mod meta {
-        use fluvio_controlplane_metadata::core::{MetadataItem, MetadataRevExtension};
-
-        /// simple memory representation of meta
-        #[derive(Debug, Default, PartialEq, Clone)]
-        pub struct MemoryMeta {
-            pub rev: u32,
-        }
-
-        impl MetadataItem for MemoryMeta {
-            type UId = u32;
-
-            fn uid(&self) -> &Self::UId {
-                &self.rev
-            }
-
-            fn is_newer(&self, another: &Self) -> bool {
-                self.rev >= another.rev
-            }
-        }
-
-        impl MetadataRevExtension for MemoryMeta {
-            fn next_rev(&self) -> Self {
-                Self { rev: self.rev + 1 }
-            }
-        }
-
-        impl MemoryMeta {
-            pub fn new(rev: u32) -> Self {
-                Self { rev }
-            }
-        }
-
-        /*
-        impl From<u32> for MetadataContext<MemoryMeta> {
-            fn from(val: u32) -> MetadataContext<MemoryMeta> {
-                MemoryMeta::new(val).into()
-            }
-        }
-        */
-    }
 
     use fluvio_controlplane_metadata::store::MetadataStoreObject;
     use meta::*;

@@ -4,9 +4,7 @@
 //! CLI command for Profile operation
 //!
 
-use std::sync::Arc;
-use clap::Parser;
-
+mod add;
 mod sync;
 mod current;
 mod switch;
@@ -16,8 +14,13 @@ mod delete_cluster;
 mod list;
 mod export;
 
-use crate::Result;
+use std::sync::Arc;
+
+use clap::Parser;
+use anyhow::Result;
+
 use crate::common::output::Terminal;
+use crate::profile::add::ManualAddOpt;
 use crate::profile::current::CurrentOpt;
 use crate::profile::delete_cluster::DeleteClusterOpt;
 use crate::profile::delete_profile::DeleteProfileOpt;
@@ -45,39 +48,43 @@ impl ProfileOpt {
 }
 
 #[derive(Debug, Parser)]
-#[clap(about = "Available Commands")]
+#[command(about = "Available Commands")]
 pub enum ProfileCmd {
     /// Print the name of the current context
-    #[clap(name = "current")]
+    #[command(name = "current")]
     DisplayCurrent(CurrentOpt),
 
     /// Delete the named profile
-    #[clap(name = "delete")]
+    #[command(name = "delete")]
     DeleteProfile(DeleteProfileOpt),
 
     /// Delete the named cluster
-    #[clap(name = "delete-cluster")]
+    #[command(name = "delete-cluster")]
     DeleteCluster(DeleteClusterOpt),
 
     /// Display the entire Fluvio configuration
-    #[clap(name = "list")]
+    #[command(name = "list")]
     List(ListOpt),
 
     /// Rename a profile
-    #[clap(name = "rename")]
+    #[command(name = "rename")]
     Rename(RenameOpt),
 
     /// Switch to the named profile
-    #[clap(name = "switch")]
+    #[command(name = "switch")]
     Switch(SwitchOpt),
 
     /// Sync a profile from a cluster
-    #[clap(subcommand, name = "sync")]
+    #[command(subcommand, name = "sync")]
     Sync(SyncCmd),
 
     /// Export a profile for use in other applications
-    #[clap(name = "export")]
+    #[command(name = "export")]
     Export(ExportOpt),
+
+    /// Manually add a profile (advanced)
+    #[command(name = "add")]
+    ManualAdd(ManualAddOpt),
 }
 
 impl ProfileCmd {
@@ -106,6 +113,9 @@ impl ProfileCmd {
             }
             Self::Export(export) => {
                 export.process(out)?;
+            }
+            Self::ManualAdd(add) => {
+                add.process()?;
             }
         }
 

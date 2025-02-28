@@ -1,6 +1,8 @@
-use std::{time::Duration};
+use std::time::Duration;
 
-use fluvio_stream_dispatcher::{store::K8ChangeListener};
+use anyhow::Result;
+use fluvio_stream_dispatcher::store::K8ChangeListener;
+use fluvio_stream_model::store::k8::K8MetaItem;
 use tracing::debug;
 use tracing::error;
 use tracing::trace;
@@ -9,14 +11,13 @@ use tracing::instrument;
 
 use fluvio_future::task::spawn;
 use fluvio_future::timer::sleep;
-use k8_client::ClientError;
 
-use crate::stores::{StoreContext};
+use crate::stores::StoreContext;
 use crate::stores::spg::{SpuGroupSpec, SpuGroupStatus};
-use crate::stores::spu::{SpuSpec};
+use crate::stores::spu::SpuSpec;
 use crate::cli::TlsConfig;
 
-use crate::k8::objects::spg_group::{SpuGroupObj};
+use crate::k8::objects::spg_group::SpuGroupObj;
 use crate::k8::objects::spu_k8_config::ScK8Config;
 use crate::k8::objects::statefulset::StatefulsetSpec;
 use crate::k8::objects::spg_service::SpgServiceSpec;
@@ -24,22 +25,22 @@ use crate::k8::objects::spg_service::SpgServiceSpec;
 /// Update Statefulset and Service from SPG
 pub struct SpgStatefulSetController {
     namespace: String,
-    groups: StoreContext<SpuGroupSpec>,
-    spus: StoreContext<SpuSpec>,
-    statefulsets: StoreContext<StatefulsetSpec>,
-    spg_services: StoreContext<SpgServiceSpec>,
-    configs: StoreContext<ScK8Config>,
+    groups: StoreContext<SpuGroupSpec, K8MetaItem>,
+    spus: StoreContext<SpuSpec, K8MetaItem>,
+    statefulsets: StoreContext<StatefulsetSpec, K8MetaItem>,
+    spg_services: StoreContext<SpgServiceSpec, K8MetaItem>,
+    configs: StoreContext<ScK8Config, K8MetaItem>,
     tls: Option<TlsConfig>,
 }
 
 impl SpgStatefulSetController {
     pub fn start(
         namespace: String,
-        configs: StoreContext<ScK8Config>,
-        groups: StoreContext<SpuGroupSpec>,
-        statefulsets: StoreContext<StatefulsetSpec>,
-        spus: StoreContext<SpuSpec>,
-        spg_services: StoreContext<SpgServiceSpec>,
+        configs: StoreContext<ScK8Config, K8MetaItem>,
+        groups: StoreContext<SpuGroupSpec, K8MetaItem>,
+        statefulsets: StoreContext<StatefulsetSpec, K8MetaItem>,
+        spus: StoreContext<SpuSpec, K8MetaItem>,
+        spg_services: StoreContext<SpgServiceSpec, K8MetaItem>,
         tls: Option<TlsConfig>,
     ) {
         let controller = Self {
@@ -66,7 +67,7 @@ impl SpgStatefulSetController {
     }
 
     #[instrument(skip(self), name = "SpgStatefulSetController")]
-    async fn inner_loop(&mut self) -> Result<(), ClientError> {
+    async fn inner_loop(&mut self) -> Result<()> {
         use tokio::select;
 
         let mut spg_listener = self.groups.change_listener();
@@ -99,7 +100,7 @@ impl SpgStatefulSetController {
     async fn sync_with_config(
         &mut self,
         listener: &mut K8ChangeListener<ScK8Config>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<()> {
         if !listener.has_change() {
             trace!("no config change, skipping");
             return Ok(());
@@ -132,7 +133,7 @@ impl SpgStatefulSetController {
     async fn sync_spgs_to_statefulset(
         &mut self,
         listener: &mut K8ChangeListener<SpuGroupSpec>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<()> {
         if !listener.has_change() {
             debug!("no spg change, skipping");
             return Ok(());
@@ -170,13 +171,13 @@ impl SpgStatefulSetController {
         &mut self,
         spu_group: SpuGroupObj,
         spu_k8_config: &ScK8Config,
-    ) -> Result<(), ClientError> {
+    ) -> Result<()> {
         let spg_name = spu_group.key();
 
         // ensure we don't have conflict with existing spu group
         if let Some(conflict_id) = spu_group.is_conflict_with(self.spus.store()).await {
             warn!(conflict_id, "spg is in conflict with existing id");
-            let status = SpuGroupStatus::invalid(format!("conflict with: {}", conflict_id));
+            let status = SpuGroupStatus::invalid(format!("conflict with: {conflict_id}"));
 
             self.groups
                 .update_status(spg_name.to_owned(), status)
@@ -219,10 +220,11 @@ impl SpgStatefulSetController {
 #[cfg(test)]
 mod test {
 
+    use fluvio_stream_model::store::k8::K8MetaItem;
     use tracing::debug;
 
     use fluvio_stream_dispatcher::actions::WSAction;
-    use fluvio_stream_dispatcher::dispatcher::K8ClusterStateDispatcher;
+    use fluvio_stream_dispatcher::dispatcher::MetadataDispatcher;
 
     use crate::k8::fixture::TestEnv;
     use super::*;
@@ -242,24 +244,24 @@ mod test {
         let test_env = TestEnv::create().await;
         let (global_ctx, config_ctx) = test_env.create_global_ctx().await;
 
-        let statefulset_ctx: StoreContext<StatefulsetSpec> = StoreContext::new();
-        let spg_service_ctx: StoreContext<SpgServiceSpec> = StoreContext::new();
+        let statefulset_ctx: StoreContext<StatefulsetSpec, K8MetaItem> = StoreContext::new();
+        let spg_service_ctx: StoreContext<SpgServiceSpec, K8MetaItem> = StoreContext::new();
 
         // start statefullset dispatcher
-        K8ClusterStateDispatcher::<_, _>::start(
+        MetadataDispatcher::<_, _, K8MetaItem>::start(
             test_env.ns().to_owned(),
             test_env.client().clone(),
             statefulset_ctx.clone(),
         );
 
         // start spg service dispatcher
-        K8ClusterStateDispatcher::<_, _>::start(
+        MetadataDispatcher::<_, _, K8MetaItem>::start(
             test_env.ns().to_owned(),
             test_env.client().clone(),
             spg_service_ctx.clone(),
         );
 
-        K8ClusterStateDispatcher::<_, _>::start(
+        MetadataDispatcher::<_, _, K8MetaItem>::start(
             test_env.ns().to_owned(),
             test_env.client().clone(),
             global_ctx.spgs().clone(),

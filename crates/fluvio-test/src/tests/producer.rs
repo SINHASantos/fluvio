@@ -1,7 +1,7 @@
 use std::any::Any;
 use clap::Parser;
 
-use fluvio::{RecordKey, TopicProducer};
+use fluvio::{TopicProducerPool, RecordKey};
 use fluvio_test_derive::fluvio_test;
 use fluvio_test_util::test_meta::environment::EnvironmentSetup;
 use fluvio_test_util::test_meta::{TestOption, TestCase};
@@ -33,10 +33,10 @@ impl From<TestCase> for ProducerTestCase {
 }
 
 #[derive(Debug, Clone, Parser, Default, Eq, PartialEq)]
-#[clap(name = "Fluvio Producer Test")]
+#[command(name = "Fluvio Producer Test")]
 pub struct ProducerTestOption {
     /// Num of producers to create
-    #[clap(long, default_value = "3")]
+    #[arg(long, default_value = "3")]
     pub producers: u32,
 
     // Not sure how we're going to support this yet
@@ -46,18 +46,18 @@ pub struct ProducerTestOption {
     //#[clap(long, value_parser=parse_seconds, default_value = "60")]
     //runtime_seconds: Duration,
     /// Total number of records to producer
-    #[clap(long, default_value = "100")]
+    #[arg(long, default_value = "100")]
     pub num_records: u32,
 
     /// Size of test record. This test doesn't use the TestRecord struct so this is the total size, not just the dynamic payload size
-    #[clap(long, default_value = "1000")]
+    #[arg(long, default_value = "1000")]
     pub record_size: usize,
 
     // Eventually we're going to need to support batch options
     // max-linger
     // max-batch
     /// Opt-in to detailed output printed to stdout
-    #[clap(long, short)]
+    #[arg(long, short)]
     verbose: bool,
 }
 
@@ -74,7 +74,7 @@ impl TestOption for ProducerTestOption {
 
 // The total num_records should be divided up and assigned per producer
 async fn producer_work(
-    producer: TopicProducer,
+    producer: TopicProducerPool,
     producer_id: u32,
     workload_size: u32,
     record_tag_start: u32,
@@ -120,7 +120,7 @@ async fn producer_work(
         producer
             .send(RecordKey::NULL, record.clone())
             .await
-            .unwrap_or_else(|_| panic!("Producer {} send failed", producer_id));
+            .unwrap_or_else(|_| panic!("Producer {producer_id} send failed"));
 
         let send_latency = now.elapsed().unwrap().as_nanos() as u64;
         latency_histogram.record(send_latency).unwrap();
@@ -130,7 +130,7 @@ async fn producer_work(
         // Converting from nanoseconds to seconds, to store (bytes per second) in histogram
         let send_throughput =
             (((record_size as f32) / (send_latency as f32)) * 1_000_000_000.0) as u64;
-        throughput_histogram.record(send_throughput as u64).unwrap();
+        throughput_histogram.record(send_throughput).unwrap();
 
         if test_case.option.verbose {
             // Convert bytes per second to kilobytes per second
@@ -141,7 +141,7 @@ async fn producer_work(
                 producer_id,
                 record_tag,
                 record_size,
-                format_args!("{:?}", Duration::from_nanos(send_latency)),
+                format!("{:?}", Duration::from_nanos(send_latency)),
                 throughput_kbps,
             );
         }
@@ -153,8 +153,7 @@ async fn producer_work(
     let throughput_p99 = throughput_histogram.max() / 1_000;
 
     println!(
-        "[producer-{}] Produce P99: {:?} Peak Throughput: {:?} kB/s",
-        producer_id, produce_p99, throughput_p99
+        "[producer-{producer_id}] Produce P99: {produce_p99:?} Peak Throughput: {throughput_p99:?} kB/s"
     );
 }
 
@@ -168,16 +167,13 @@ pub fn run(mut test_driver: FluvioTestDriver, mut test_case: TestCase) {
     let producers = if total_records > test_case.option.producers {
         test_case.option.producers
     } else {
-        println!(
-            "More producers than records to split. Reducing number to {}",
-            total_records
-        );
+        println!("More producers than records to split. Reducing number to {total_records}");
         total_records
     };
 
     println!("\nStarting Producer test");
-    println!("Producers: {}", producers);
-    println!("# Records: {}", total_records);
+    println!("Producers: {producers}");
+    println!("# Records: {total_records}");
 
     // Divide work up amongst the total number of producers
     let record_producer_modulo = total_records % producers;
@@ -192,7 +188,7 @@ pub fn run(mut test_driver: FluvioTestDriver, mut test_case: TestCase) {
     // Spawn the producers
     let mut producer_wait = Vec::new();
     for n in 0..producers {
-        println!("Starting Producer #{}", n);
+        println!("Starting Producer #{n}");
 
         let producer = async_process!(
             async {
@@ -227,7 +223,7 @@ pub fn run(mut test_driver: FluvioTestDriver, mut test_case: TestCase) {
                 )
                 .await
             },
-            format!("producer-{}", n)
+            format!("producer-{n}")
         );
 
         producer_wait.push(producer);

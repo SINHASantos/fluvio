@@ -1,7 +1,8 @@
 use std::io::Error as IoError;
 use std::io::ErrorKind;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::prelude::AsRawFd;
-use std::os::unix::prelude::FromRawFd;
 use std::path::PathBuf;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::SystemTimeError;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use anyhow::Result;
 
 use fluvio_future::fs::File;
 use fluvio_future::fs::remove_file;
@@ -23,8 +25,7 @@ use fluvio_protocol::record::{Offset, Size, Size64};
 use crate::LogIndex;
 use crate::config::SharedReplicaConfig;
 use crate::util::generate_file_name;
-use crate::validator::validate;
-use crate::validator::LogValidationError;
+use crate::validator::LogValidator;
 use crate::StorageError;
 
 pub const MESSAGE_LOG_EXTENSION: &str = "log";
@@ -69,7 +70,7 @@ impl FileRecordsSlice {
         debug!(
             path = %log_path.display(),
             len,
-            seconds = last_modified_time.elapsed().map_err(|err| StorageError::Other(format!("Other: {:#?}",err)))?. as_secs(),
+            seconds = last_modified_time.elapsed().map_err(|err| StorageError::Other(format!("Other: {err:#?}")))?. as_secs(),
             "opened read only records");
         Ok(FileRecordsSlice {
             base_offset,
@@ -88,13 +89,8 @@ impl FileRecordsSlice {
         self.base_offset
     }
 
-    pub async fn validate(
-        &self,
-        index: &LogIndex,
-        skip_errors: bool,
-        verbose: bool,
-    ) -> Result<Offset, LogValidationError> {
-        validate(&self.path, Some(index), skip_errors, verbose).await
+    pub async fn validate(&self, index: &LogIndex) -> Result<LogValidator> {
+        LogValidator::default_validate(&self.path, Some(index)).await
     }
 
     pub fn modified_time_elapsed(&self) -> Result<Duration, SystemTimeError> {
@@ -122,7 +118,7 @@ impl FileRecordsSlice {
 
 impl FileRecords for FileRecordsSlice {
     fn file(&self) -> File {
-        unsafe { File::from_raw_fd(self.file.as_raw_fd()) }
+        unsafe { File::from(<OwnedFd as FromRawFd>::from_raw_fd(self.file.as_raw_fd())) }
     }
 
     fn get_base_offset(&self) -> Offset {

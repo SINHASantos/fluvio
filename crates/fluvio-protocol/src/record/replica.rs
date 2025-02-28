@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use std::{convert::TryFrom, str::FromStr};
 use std::fmt;
 
 use fluvio_types::PartitionId;
@@ -22,11 +22,7 @@ unsafe impl Send for ReplicaKey {}
 unsafe impl Sync for ReplicaKey {}
 
 impl ReplicaKey {
-    pub fn new<S, P>(topic: S, partition: P) -> Self
-    where
-        S: Into<String>,
-        P: Into<PartitionId>,
-    {
+    pub fn new(topic: impl Into<String>, partition: impl Into<PartitionId>) -> Self {
         ReplicaKey {
             topic: topic.into(),
             partition: partition.into(),
@@ -57,7 +53,15 @@ impl TryFrom<String> for ReplicaKey {
     type Error = PartitionError;
 
     fn try_from(value: String) -> Result<Self, PartitionError> {
-        let (topic, partition) = decompose_partition_name(&value)?;
+        value.parse()
+    }
+}
+
+impl FromStr for ReplicaKey {
+    type Err = PartitionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (topic, partition) = decompose_partition_name(s)?;
         Ok(ReplicaKey::new(topic, partition))
     }
 }
@@ -70,7 +74,7 @@ pub enum PartitionError {
 impl fmt::Display for PartitionError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::InvalidSyntax(msg) => write!(f, "invalid partition syntax: {}", msg),
+            Self::InvalidSyntax(msg) => write!(f, "invalid partition syntax: {msg}"),
         }
     }
 }
@@ -111,5 +115,5 @@ pub fn decompose_partition_name(
 }
 
 pub fn create_partition_name(topic_name: &str, idx: &i32) -> String {
-    format!("{}-{}", topic_name, idx)
+    format!("{topic_name}-{idx}")
 }

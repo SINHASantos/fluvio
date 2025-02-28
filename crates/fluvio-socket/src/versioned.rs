@@ -1,16 +1,18 @@
 use std::default::Default;
 use std::fmt;
 use std::fmt::{Debug, Display};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fluvio_protocol::Version;
 use tracing::{debug, instrument, info};
 
 use fluvio_protocol::api::RequestMessage;
 use fluvio_protocol::api::Request;
 use fluvio_protocol::link::versions::{ApiVersions, ApiVersionsRequest, ApiVersionsResponse};
 use fluvio_future::net::{DomainConnector, DefaultDomainConnector};
-use fluvio_future::retry::retry;
+use fluvio_future::retry::retry_if;
 
 use crate::{SocketError, FluvioSocket, SharedMultiplexerSocket, AsyncResponse};
 
@@ -109,8 +111,8 @@ impl From<String> for ClientConfig {
 }
 
 impl ClientConfig {
-    pub fn new<S: Into<String>>(
-        addr: S,
+    pub fn new(
+        addr: impl Into<String>,
         connector: DomainConnector,
         use_spu_local_address: bool,
     ) -> Self {
@@ -122,6 +124,7 @@ impl ClientConfig {
         }
     }
 
+    #[allow(clippy::box_default)]
     pub fn with_addr(addr: String) -> Self {
         Self::new(addr, Box::new(DefaultDomainConnector::default()), false)
     }
@@ -136,6 +139,10 @@ impl ClientConfig {
 
     pub fn use_spu_local_address(&self) -> bool {
         self.use_spu_local_address
+    }
+
+    pub fn connector(&self) -> &DomainConnector {
+        &self.connector
     }
 
     pub fn set_client_id(&mut self, id: impl Into<String>) {
@@ -166,6 +173,17 @@ impl ClientConfig {
             addr: self.addr.clone(),
             client_id: self.client_id.clone(),
             connector,
+            use_spu_local_address: self.use_spu_local_address,
+        }
+    }
+
+    pub fn recreate(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            client_id: self.client_id.clone(),
+            connector: self
+                .connector
+                .new_domain(self.connector.domain().to_owned()),
             use_spu_local_address: self.use_spu_local_address,
         }
     }
@@ -218,6 +236,14 @@ pub struct VersionedSerialSocket {
     versions: Versions,
 }
 
+impl Deref for VersionedSerialSocket {
+    type Target = SharedMultiplexerSocket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
+
 impl fmt::Display for VersionedSerialSocket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "config: {}, {:?}", self.config, self.socket)
@@ -247,12 +273,27 @@ impl VersionedSerialSocket {
         self.socket.clone()
     }
 
+    /// Check if inner socket is stale
+    pub fn is_stale(&self) -> bool {
+        self.socket.is_stale()
+    }
+
+    fn check_liveness(&self) -> Result<(), SocketError> {
+        if self.is_stale() {
+            Err(SocketError::SocketStale)
+        } else {
+            Ok(())
+        }
+    }
+
     /// send and wait for reply serially
     #[instrument(level = "trace", skip(self, request))]
     pub async fn send_receive<R>(&self, request: R) -> Result<R::Response, SocketError>
     where
         R: Request + Send + Sync,
     {
+        self.check_liveness()?;
+
         let req_msg = self.new_request(request, self.versions.lookup_version::<R>());
 
         // send request & save response
@@ -265,10 +306,20 @@ impl VersionedSerialSocket {
     where
         R: Request + Send + Sync,
     {
-        let req_msg = self.new_request(request, self.versions.lookup_version::<R>());
+        self.check_liveness()?;
+
+        let req_msg = self.new_request(request, self.lookup_version::<R>());
 
         // send request & get a Future that resolves to response
         self.socket.send_async(req_msg).await
+    }
+
+    /// look up version for the request
+    pub fn lookup_version<R>(&self) -> Option<Version>
+    where
+        R: Request,
+    {
+        self.versions.lookup_version::<R>()
     }
 
     /// send, wait for reply and retry if failed
@@ -282,15 +333,22 @@ impl VersionedSerialSocket {
         R: Request + Send + Sync + Clone,
         I: IntoIterator<Item = Duration> + Debug + Send,
     {
+        self.check_liveness()?;
+
         let req_msg = self.new_request(request, self.versions.lookup_version::<R>());
 
         // send request & retry it if result is Err
-        retry(retries, || self.socket.send_and_receive(req_msg.clone())).await
+        retry_if(
+            retries,
+            || self.socket.send_and_receive(req_msg.clone()),
+            is_retryable,
+        )
+        .await
     }
 
     /// create new request based on version
     #[instrument(level = "trace", skip(self, request, version))]
-    fn new_request<R>(&self, request: R, version: Option<i16>) -> RequestMessage<R>
+    pub fn new_request<R>(&self, request: R, version: Option<i16>) -> RequestMessage<R>
     where
         R: Request + Send,
     {
@@ -309,6 +367,26 @@ impl VersionedSerialSocket {
 impl SerialFrame for VersionedSerialSocket {
     fn config(&self) -> &ClientConfig {
         &self.config
+    }
+}
+
+fn is_retryable(err: &SocketError) -> bool {
+    use std::io::ErrorKind;
+    match err {
+        SocketError::Io { source, .. } => matches!(
+            source.kind(),
+            ErrorKind::AddrNotAvailable
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::NotConnected
+                | ErrorKind::Other
+                | ErrorKind::TimedOut
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::Interrupted
+        ),
+
+        SocketError::SocketClosed | SocketError::SocketStale => false,
     }
 }
 

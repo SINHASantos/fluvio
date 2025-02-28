@@ -1,95 +1,52 @@
-use std::{
-    env::temp_dir,
-    path::{PathBuf, Path},
-    time::Duration,
-};
+use std::{env::temp_dir, path::PathBuf, time::Duration};
 use std::sync::Arc;
 
-use tracing::{debug};
-use flate2::{Compression, bufread::GzEncoder};
+use chrono::{Utc, Days};
+use fluvio_controlplane::replica::Replica;
+use fluvio_controlplane::spu_api::update_smartmodule::SmartModule;
+use fluvio_smartmodule::dataplane::smartmodule::Lookback;
+use tracing::{debug, info};
 
-use fluvio_controlplane_metadata::{
-    partition::Replica,
-    smartmodule::{SmartModule, SmartModuleWasm, SmartModuleWasmFormat, SmartModuleSpec},
+use fluvio_controlplane_metadata::smartmodule::{
+    SmartModuleWasm, SmartModuleWasmFormat, SmartModuleSpec,
 };
-use fluvio_storage::{FileReplica, ReplicaStorage};
+use fluvio_storage::FileReplica;
 use flv_util::fixture::ensure_clean_dir;
 use futures_util::{Future, StreamExt};
 
 use fluvio_future::timer::sleep;
-use fluvio_socket::{FluvioSocket, MultiplexerSocket};
-use fluvio_spu_schema::{
-    Isolation,
-    server::smartmodule::{
+use fluvio_socket::{FluvioSocket, MultiplexerSocket, AsyncResponse};
+use fluvio_spu_schema::server::{
+    smartmodule::{
         SmartModuleKind, SmartModuleInvocation, SmartModuleInvocationWasm, SmartModuleContextData,
     },
+    stream_fetch::StreamFetchRequest,
 };
 use fluvio_protocol::{
     fixture::BatchProducer,
-    record::{RecordData, Record},
+    record::{RecordData, Record, Batch, RawRecords},
     link::{smartmodule::SmartModuleKind as SmartModuleKindError, ErrorCode},
     ByteBuf,
 };
-use fluvio_protocol::fixture::{create_batch, TEST_RECORD};
+use fluvio_protocol::fixture::{TEST_RECORD, create_raw_recordset};
 use fluvio_spu_schema::{
-    server::{
-        update_offset::{UpdateOffsetsRequest, OffsetUpdate},
-    },
+    server::update_offset::{UpdateOffsetsRequest, OffsetUpdate},
     fetch::DefaultFetchRequest,
 };
-use fluvio_spu_schema::server::stream_fetch::{DefaultStreamFetchRequest};
-use crate::{core::GlobalContext, services::public::tests::create_filter_records};
+use fluvio_spu_schema::server::stream_fetch::DefaultStreamFetchRequest;
+use crate::services::public::tests::{
+    create_filter_raw_records, create_public_server_with_root_auth, vec_to_batch,
+};
+use crate::{
+    core::GlobalContext,
+    services::public::tests::{create_filter_records, vec_to_raw_batch},
+};
 use crate::config::SpuConfig;
 use crate::replication::leader::LeaderReplicaState;
-use crate::services::public::create_public_server;
 
-use fluvio_protocol::{
-    api::{RequestMessage},
-    record::RecordSet,
-};
+use fluvio_protocol::{api::RequestMessage, record::RecordSet};
 
-fn read_filter_from_path(filter_path: impl AsRef<Path>) -> Vec<u8> {
-    let path = filter_path.as_ref();
-    std::fs::read(path).unwrap_or_else(|_| panic!("Unable to read file {}", path.display()))
-}
-
-fn zip(raw_buffer: Vec<u8>) -> Vec<u8> {
-    use std::io::Read;
-    let mut encoder = GzEncoder::new(raw_buffer.as_slice(), Compression::default());
-    let mut buffer = Vec::with_capacity(raw_buffer.len());
-    encoder
-        .read_to_end(&mut buffer)
-        .unwrap_or_else(|_| panic!("Unable to gzip file"));
-    buffer
-}
-
-fn read_wasm_module(module_name: &str) -> Vec<u8> {
-    let spu_dir = std::env::var("CARGO_MANIFEST_DIR").expect("target");
-    let wasm_path = PathBuf::from(spu_dir)
-        .parent()
-        .expect("parent")
-        .parent()
-        .expect("fluvio")
-        .join(format!(
-            "smartmodule/examples/target/wasm32-unknown-unknown/release/{}.wasm",
-            module_name
-        ));
-    read_filter_from_path(wasm_path)
-}
-
-fn load_wasm_module<S: ReplicaStorage>(ctx: &GlobalContext<S>, module_name: &str) {
-    let wasm = zip(read_wasm_module(module_name));
-    ctx.smartmodule_localstore().insert(SmartModule {
-        name: module_name.to_owned(),
-        spec: SmartModuleSpec {
-            wasm: SmartModuleWasm {
-                format: SmartModuleWasmFormat::Binary,
-                payload: ByteBuf::from(wasm),
-            },
-            ..Default::default()
-        },
-    });
-}
+use super::{zip, read_wasm_module, load_wasm_module};
 
 #[fluvio_future::test(ignore)]
 async fn test_stream_fetch_basic() {
@@ -97,12 +54,12 @@ async fn test_stream_fetch_basic() {
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
     let mut spu_config = SpuConfig::default();
     spu_config.log.base_dir = test_path;
     let ctx = GlobalContext::new_shared_context(spu_config);
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -112,32 +69,33 @@ async fn test_stream_fetch_basic() {
 
     // perform for two versions
     for version in 10..11 {
-        let topic = format!("test{}", version);
+        let topic = format!("test{version}");
         let test = Replica::new((topic.clone(), 0), 5001, vec![5001]);
         let test_id = test.id.clone();
         let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
             .await
-            .expect("replica");
+            .expect("replica")
+            .init(&ctx)
+            .await
+            .expect("init succeeded");
+
         ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-        let stream_request = DefaultStreamFetchRequest {
-            topic: topic.clone(),
-            partition: 0,
-            fetch_offset: 0,
-            isolation: Isolation::ReadUncommitted,
-            max_bytes: 1000,
-            ..Default::default()
-        };
+        let stream_request = DefaultStreamFetchRequest::builder()
+            .topic(topic.clone())
+            .max_bytes(1000)
+            .build()
+            .expect("request");
 
         let mut stream = client_socket
             .create_stream(RequestMessage::new_request(stream_request), version)
             .await
             .expect("create stream");
 
-        let mut records = RecordSet::default().add(create_batch());
+        let mut records = create_raw_recordset(2);
         // write records, base offset = 0 since we are starting from 0
         replica
-            .write_record_set(&mut records, ctx.follower_notifier())
+            .write_record_set(&mut create_raw_recordset(2), ctx.follower_notifier())
             .await
             .expect("write");
 
@@ -302,7 +260,7 @@ async fn adhoc_test<Fut, TestFn>(
 {
     let test_path = temp_dir().join(test_name);
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
     let wasm = zip(read_wasm_module(module_name));
@@ -325,7 +283,7 @@ async fn adhoc_chain_test<Fut, TestFn>(
 {
     let test_path = temp_dir().join(test_name);
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
     let mut smartmodules = Vec::with_capacity(modules.len());
@@ -353,7 +311,7 @@ async fn predefined_test<Fut, TestFn>(
 {
     let test_path = temp_dir().join(test_name);
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
     load_wasm_module(&ctx, module_name);
@@ -376,7 +334,7 @@ async fn predefined_chain_test<Fut, TestFn>(
 {
     let test_path = temp_dir().join(test_name);
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
     let mut smartmodules = Vec::with_capacity(modules.len());
@@ -435,9 +393,9 @@ async fn test_stream_fetch_filter(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -453,21 +411,23 @@ async fn test_stream_fetch_filter(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("build");
 
     // 1 out of 2 are filtered
-    let mut records = create_filter_records(2);
+    let mut records = create_filter_records(2)
+        .try_into()
+        .expect("converted to raw");
     //debug!("records: {:#?}", records);
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
@@ -517,21 +477,21 @@ async fn test_stream_fetch_filter(
     drop(response);
 
     // first write 2 non filterable records
-    let mut records = RecordSet::default().add(create_batch());
+    let mut records = create_raw_recordset(2);
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
         .expect("write");
 
     // another 1 of 3, here base offset should be = 4
-    let mut records = create_filter_records(3);
+    let mut records = create_filter_raw_records(3);
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
         .expect("write");
 
     // create another 4, base should be 4 + 3 = 7 and total 10 records
-    let mut records = create_filter_records(3);
+    let mut records = create_filter_raw_records(3);
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
@@ -624,9 +584,9 @@ async fn test_stream_fetch_filter_individual(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -639,18 +599,19 @@ async fn test_stream_fetch_filter_individual(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("builder");
 
     // First, open the consumer stream
     let mut stream = client_socket
@@ -663,7 +624,9 @@ async fn test_stream_fetch_filter_individual(
         .record_generator(Arc::new(|_, _| Record::new("1")))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
@@ -679,7 +642,10 @@ async fn test_stream_fetch_filter_individual(
         .record_generator(Arc::new(|_, _| Record::new("2")))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
+
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
@@ -744,9 +710,9 @@ async fn test_stream_filter_error_fetch(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -762,18 +728,19 @@ async fn test_stream_filter_error_fetch(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("builder");
 
     fn generate_record(record_index: usize, _producer: &BatchProducer) -> Record {
         let value = if record_index < 10 {
@@ -790,7 +757,9 @@ async fn test_stream_filter_error_fetch(
         .record_generator(Arc::new(generate_record))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
 
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
@@ -822,7 +791,7 @@ async fn test_stream_filter_error_fetch(
             assert!(error.record_key.is_none());
             assert_eq!(error.record_value.as_ref(), "ten".as_bytes());
             assert_eq!(error.kind, SmartModuleKindError::Filter);
-            let rendered = format!("{}", error);
+            let rendered = format!("{error}");
             assert_eq!(rendered, "Oops something went wrong\n\nCaused by:\n   0: Failed to parse int\n   1: invalid digit found in string\n\nSmartModule Info: \n    Type: Filter\n    Offset: 10\n    Key: NULL\n    Value: ten");
         }
         _ => panic!("should have gotten error code"),
@@ -876,9 +845,9 @@ async fn test_stream_filter_max(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -894,34 +863,35 @@ async fn test_stream_filter_max(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
     // write 2 batches each with 10 records
     //debug!("records: {:#?}", records);
     replica
-        .write_record_set(&mut create_filter_records(10), ctx.follower_notifier())
+        .write_record_set(&mut create_filter_raw_records(10), ctx.follower_notifier())
         .await
         .expect("write"); // 1000 bytes
     replica
-        .write_record_set(&mut create_filter_records(10), ctx.follower_notifier())
+        .write_record_set(&mut create_filter_raw_records(10), ctx.follower_notifier())
         .await
         .expect("write"); // 2000 bytes totals
     replica
-        .write_record_set(&mut create_filter_records(10), ctx.follower_notifier())
+        .write_record_set(&mut create_filter_raw_records(10), ctx.follower_notifier())
         .await
         .expect("write"); // 3000 bytes total
                           // now total of 300 filter records bytes (min), but last filter record is greater than max
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 250,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(250)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1021,9 +991,9 @@ async fn test_stream_fetch_map(
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1038,18 +1008,19 @@ async fn test_stream_fetch_map(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 300,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(300)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1062,7 +1033,9 @@ async fn test_stream_fetch_map(
             .record_generator(Arc::new(|i, _| Record::new(i.to_string())))
             .build()
             .expect("batch")
-            .records();
+            .records()
+            .try_into()
+            .expect("raw");
 
         replica
             .write_record_set(&mut records, ctx.follower_notifier())
@@ -1173,9 +1146,9 @@ async fn test_stream_fetch_map_chain(
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1190,15 +1163,19 @@ async fn test_stream_fetch_map_chain(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        max_bytes: 300,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(300)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1211,7 +1188,9 @@ async fn test_stream_fetch_map_chain(
             .record_generator(Arc::new(|i, _| Record::new(i.to_string())))
             .build()
             .expect("batch")
-            .records();
+            .records()
+            .try_into()
+            .expect("raw");
 
         replica
             .write_record_set(&mut records, ctx.follower_notifier())
@@ -1327,9 +1306,9 @@ async fn test_stream_fetch_map_error(
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1344,18 +1323,19 @@ async fn test_stream_fetch_map_error(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1373,7 +1353,9 @@ async fn test_stream_fetch_map_error(
         }))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
 
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
@@ -1462,9 +1444,9 @@ async fn test_stream_aggregate_fetch_single_batch(
     ensure_clean_dir(&test_path);
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1477,18 +1459,19 @@ async fn test_stream_aggregate_fetch_single_batch(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     // Aggregate 5 records
     // These records look like:
@@ -1503,7 +1486,10 @@ async fn test_stream_aggregate_fetch_single_batch(
         .record_generator(Arc::new(|i, _| Record::new(i.to_string())))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
+
     debug!("records: {:#?}", records);
 
     let mut stream = client_socket
@@ -1604,9 +1590,9 @@ async fn test_stream_aggregate_fetch_multiple_batch(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1619,7 +1605,11 @@ async fn test_stream_aggregate_fetch_multiple_batch(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
     // Aggregate 6 records in 2 batches
@@ -1632,7 +1622,10 @@ async fn test_stream_aggregate_fetch_multiple_batch(
         .record_generator(Arc::new(|i, _| Record::new(i.to_string())))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
+
     debug!("first batch: {:#?}", records);
 
     replica
@@ -1649,7 +1642,9 @@ async fn test_stream_aggregate_fetch_multiple_batch(
         .record_generator(Arc::new(|i, _| Record::new((i + 3).to_string())))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
 
     debug!("2nd batch: {:#?}", records2);
 
@@ -1658,15 +1653,12 @@ async fn test_stream_aggregate_fetch_multiple_batch(
         .await
         .expect("write");
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1736,9 +1728,9 @@ async fn test_stream_fetch_and_new_request(
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1752,18 +1744,19 @@ async fn test_stream_fetch_and_new_request(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let _stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1824,9 +1817,9 @@ async fn test_stream_fetch_array_map(
     ensure_clean_dir(&test_path);
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1840,7 +1833,11 @@ async fn test_stream_fetch_array_map(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
     // Input: One JSON record with 10 ints: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -1852,22 +1849,21 @@ async fn test_stream_fetch_array_map(
         }))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
 
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
         .expect("write");
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -1943,9 +1939,9 @@ async fn test_stream_fetch_filter_map(
     ensure_clean_dir(&test_path);
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -1959,7 +1955,11 @@ async fn test_stream_fetch_filter_map(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
     // Input: the following records:
@@ -1974,22 +1974,21 @@ async fn test_stream_fetch_filter_map(
         .record_generator(Arc::new(|i, _| Record::new(((i + 1) * 11).to_string())))
         .build()
         .expect("batch")
-        .records();
+        .records()
+        .try_into()
+        .expect("raw");
 
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
         .expect("write");
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -2065,9 +2064,9 @@ async fn test_stream_fetch_filter_with_params(
     ensure_clean_dir(&test_path);
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -2082,13 +2081,17 @@ async fn test_stream_fetch_filter_with_params(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
     let mut params = BTreeMap::new();
     params.insert("key".to_string(), "b".to_string());
 
-    let smartmodule_with_params = smartmodules
+    let smartmodule_with_params: Vec<SmartModuleInvocation> = smartmodules
         .clone()
         .into_iter()
         .map(|mut w| {
@@ -2097,18 +2100,15 @@ async fn test_stream_fetch_filter_with_params(
         })
         .collect();
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules: smartmodule_with_params,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodule_with_params)
+        .build()
+        .expect("stream request");
 
     // 1 out of 2 are filtered
-    let mut records = create_filter_records(2);
+    let mut records = create_filter_raw_records(2);
     replica
         .write_record_set(&mut records, ctx.follower_notifier())
         .await
@@ -2154,15 +2154,12 @@ async fn test_stream_fetch_filter_with_params(
         assert_eq!(partition.records.batches.len(), 1);
     }
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -2209,7 +2206,7 @@ async fn test_stream_fetch_filter_with_params(
 async fn test_stream_fetch_invalid_smartmodule_adhoc() {
     let test_path = temp_dir().join("test_stream_fetch_invalid_smartmodule_adhoc");
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
     let wasm = zip(include_bytes!("test_data/filter_missing_attribute.wasm").to_vec());
@@ -2226,7 +2223,7 @@ async fn test_stream_fetch_invalid_smartmodule_adhoc() {
 async fn test_stream_fetch_invalid_smartmodule_predefined() {
     let test_path = temp_dir().join("test_stream_fetch_invalid_smartmodule_predefined");
     let mut spu_config = SpuConfig::default();
-    spu_config.log.base_dir = test_path.clone();
+    spu_config.log.base_dir.clone_from(&test_path);
 
     let ctx = GlobalContext::new_shared_context(spu_config);
 
@@ -2259,9 +2256,9 @@ async fn test_stream_fetch_invalid_smartmodule(
     ensure_clean_dir(&test_path);
 
     let port = portpicker::pick_unused_port().expect("No free ports left");
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
@@ -2275,18 +2272,19 @@ async fn test_stream_fetch_invalid_smartmodule(
     let test_id = test.id.clone();
     let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
         .await
-        .expect("replica");
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
     ctx.leaders_state().insert(test_id, replica.clone()).await;
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
+    let stream_request = DefaultStreamFetchRequest::builder()
+        .topic(topic.to_owned())
+        .max_bytes(10000)
+        .smartmodules(smartmodules)
+        .build()
+        .expect("stream request");
 
     let mut stream = client_socket
         .create_stream(RequestMessage::new_request(stream_request), 11)
@@ -2308,262 +2306,788 @@ async fn test_stream_fetch_invalid_smartmodule(
     debug!("terminated controller");
 }
 
-async fn test_stream_fetch_join(
-    ctx: Arc<GlobalContext<FileReplica>>,
-    test_path: PathBuf,
-    smartmodules: Vec<SmartModuleInvocation>,
-) {
-    // disable join test now
-    if true {
-        return;
-    }
-
-    ///        0  1  2  3  4  5  6
-    ///  ----------------------
-    /// left   11  22   33 44        55  66
-    /// right        9           22   
-    /// joined       20 31 42 53     77  88
-    use fluvio::metadata::spu::SpuSpec;
+#[fluvio_future::test(ignore)]
+async fn test_stream_metrics() {
+    let test_path = temp_dir().join("test_stream_metrics");
     ensure_clean_dir(&test_path);
     let port = portpicker::pick_unused_port().expect("No free ports left");
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{port}");
+    let mut spu_config = SpuConfig::default();
+    spu_config.log.base_dir = test_path;
+    let ctx = GlobalContext::new_shared_context(spu_config);
 
-    let server_end_event = create_public_server(addr.to_owned(), ctx.clone()).run();
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
 
     // wait for stream controller async to start
     sleep(Duration::from_millis(100)).await;
 
-    let spu_localstore = ctx.spu_localstore();
-    let spu_spec = SpuSpec::new_public_addr(5001, port, "127.0.0.1".into());
-    spu_localstore.insert(spu_spec);
-
     let client_socket =
-        MultiplexerSocket::shared(FluvioSocket::connect(&addr).await.expect("connect"));
+        MultiplexerSocket::new(FluvioSocket::connect(&addr).await.expect("connect"));
 
-    let topic_left = "test-join-left";
-    let test_left = Replica::new((topic_left.to_owned(), 0), 5001, vec![5001]);
-    let test_id_left = test_left.id.clone();
-    let replica_left =
-        LeaderReplicaState::create(test_left.clone(), ctx.config(), ctx.status_update_owned())
+    let topic = "test_topic";
+    let test = Replica::new((topic.to_string(), 0), 5001, vec![5001]);
+    let test_id = test.id.clone();
+    let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+        .await
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
+    ctx.leaders_state().insert(test_id, replica.clone()).await;
+
+    assert_eq!(ctx.metrics().outbound().client_bytes(), 0);
+    assert_eq!(ctx.metrics().outbound().client_records(), 0);
+    assert_eq!(ctx.metrics().outbound().connector_bytes(), 0);
+    assert_eq!(ctx.metrics().outbound().connector_records(), 0);
+
+    assert_eq!(ctx.metrics().chain_metrics().bytes_in(), 0);
+    assert_eq!(ctx.metrics().chain_metrics().records_out(), 0);
+    assert_eq!(ctx.metrics().chain_metrics().invocation_count(), 0);
+
+    let batch = Batch::from(vec![
+        Record::new(RecordData::from("foo")),
+        Record::new(RecordData::from("bar")),
+    ]);
+    let records = RecordSet::default().add(batch);
+    // write records, base offset = 0 since we are starting from 0
+    replica
+        .write_record_set(
+            &mut records.try_into().expect("raw"),
+            ctx.follower_notifier(),
+        )
+        .await
+        .expect("write");
+
+    {
+        let mut stream = client_socket
+            .create_stream(
+                RequestMessage::new_request(
+                    DefaultStreamFetchRequest::builder()
+                        .topic(topic.to_string())
+                        .max_bytes(1000)
+                        .build()
+                        .expect("stream request"),
+                ),
+                10,
+            )
             .await
-            .expect("replica");
-    ctx.leaders_state()
-        .insert(test_id_left, replica_left.clone())
-        .await;
+            .expect("create stream");
+        let response = stream.next().await.expect("first").expect("response");
+        let partition = &response.partition;
+        assert_eq!(partition.error_code, ErrorCode::None);
+        assert_eq!(partition.records.batches.len(), 1);
+        let batch = &partition.records.batches[0];
+        assert_eq!(batch.memory_records().expect("records").len(), 2);
 
-    ctx.replica_localstore().insert(test_left.clone());
-    let topic_right = JOIN_RIGHT_TOPIC;
-    let test_right = Replica::new((topic_right.to_owned(), 0), 5001, vec![5001]);
-    let test_id_right = test_right.id.clone();
-    let replica_right =
-        LeaderReplicaState::create(test_right.clone(), ctx.config(), ctx.status_update_owned())
+        assert_eq!(ctx.metrics().outbound().client_bytes(), 81);
+        assert_eq!(ctx.metrics().outbound().client_records(), 2);
+        assert_eq!(ctx.metrics().outbound().connector_bytes(), 0);
+        assert_eq!(ctx.metrics().outbound().connector_records(), 0);
+
+        assert_eq!(ctx.metrics().chain_metrics().bytes_in(), 0);
+        assert_eq!(ctx.metrics().chain_metrics().records_out(), 0);
+        assert_eq!(ctx.metrics().chain_metrics().invocation_count(), 0);
+    }
+    {
+        let mut request = RequestMessage::new_request(
+            DefaultStreamFetchRequest::builder()
+                .topic(topic.to_string())
+                .max_bytes(1000)
+                .build()
+                .expect("stream request"),
+        );
+        request.header.set_client_id("fluvio_connector");
+        let mut stream = client_socket
+            .create_stream(request, 10)
             .await
-            .expect("replica");
-    ctx.replica_localstore().insert(test_right);
-    ctx.leaders_state()
-        .insert(test_id_right, replica_right.clone())
-        .await;
+            .expect("create stream");
+        let response = stream.next().await.expect("second").expect("response");
+        let partition = &response.partition;
+        assert_eq!(partition.error_code, ErrorCode::None);
+        assert_eq!(partition.records.batches.len(), 1);
+        let batch = &partition.records.batches[0];
+        assert_eq!(batch.memory_records().expect("records").len(), 2);
 
-    // Input: the following records:
-    //
-    // 11
-    // 22
-    let mut records_left = BatchProducer::builder()
-        .records(2u16)
-        .record_generator(Arc::new(|i, _| Record::new(((i + 1) * 11).to_string())))
-        .build()
-        .expect("batch")
-        .records();
+        assert_eq!(ctx.metrics().outbound().client_bytes(), 81);
+        assert_eq!(ctx.metrics().outbound().client_records(), 2);
+        assert_eq!(ctx.metrics().outbound().connector_bytes(), 81);
+        assert_eq!(ctx.metrics().outbound().connector_records(), 2);
 
-    // Input: the following records to the right topic:
-    //
-    // 9
-    let mut records_right = BatchProducer::builder()
-        .records(1u16)
-        .record_generator(Arc::new(|_, _| Record::new((9).to_string())))
-        .build()
-        .expect("batch")
-        .records();
+        assert_eq!(ctx.metrics().chain_metrics().bytes_in(), 0);
+        assert_eq!(ctx.metrics().chain_metrics().records_out(), 0);
+        assert_eq!(ctx.metrics().chain_metrics().invocation_count(), 0);
+    }
+    {
+        let wasm = zip(read_wasm_module(FLUVIO_WASM_FILTER));
+        let smartmodule = SmartModuleInvocation {
+            wasm: SmartModuleInvocationWasm::AdHoc(wasm),
+            kind: SmartModuleKind::Filter,
+            ..Default::default()
+        };
+        let mut request = RequestMessage::new_request(
+            DefaultStreamFetchRequest::builder()
+                .topic(topic.to_string())
+                .max_bytes(1000)
+                .smartmodules(vec![smartmodule])
+                .build()
+                .expect("request"),
+        );
 
-    replica_left
-        .write_record_set(&mut records_left, ctx.follower_notifier())
-        .await
-        .expect("write");
+        request.header.set_client_id("fluvio_connector2");
+        let mut stream = client_socket
+            .create_stream(request, 10)
+            .await
+            .expect("create stream");
+        let response = stream.next().await.expect("third").expect("response");
+        let partition = &response.partition;
+        assert_eq!(partition.error_code, ErrorCode::None);
+        assert_eq!(partition.records.batches.len(), 1);
+        let batch = &partition.records.batches[0];
+        assert_eq!(batch.memory_records().expect("records").len(), 1);
 
-    replica_right
-        .write_record_set(&mut records_right, ctx.follower_notifier())
-        .await
-        .expect("write");
+        assert_eq!(ctx.metrics().outbound().client_bytes(), 81);
+        assert_eq!(ctx.metrics().outbound().client_records(), 2);
+        assert_eq!(ctx.metrics().outbound().connector_bytes(), 84); // if records went through smartengine we calculate size of deserialized data, so it's +3 bytes here
+        assert_eq!(ctx.metrics().outbound().connector_records(), 3); // one records passed, one filtered out
 
-    let stream_request = DefaultStreamFetchRequest {
-        topic: topic_left.to_owned(),
-        partition: 0,
-        fetch_offset: 0,
-        isolation: Isolation::ReadUncommitted,
-        max_bytes: 10000,
-        smartmodules,
-        ..Default::default()
-    };
-
-    let mut stream = client_socket
-        .create_stream(RequestMessage::new_request(stream_request), 11)
-        .await
-        .expect("create stream");
-
-    let response = stream
-        .next()
-        .await
-        .expect("should get response")
-        .expect("response should be Ok");
-    let stream_id = response.stream_id;
-
-    assert_eq!(response.partition.records.batches.len(), 1);
-    let batch = &response.partition.records.batches[0];
-    assert_eq!(batch.memory_records().expect("records").len(), 2);
-
-    // Output:
-    //     + 9
-    // 11 -> 20
-    // 22 -> 31
-    let records = batch.memory_records().expect("records");
-    assert_eq!(records[0].value, RecordData::from(20.to_string()));
-    assert_eq!(records[1].value, RecordData::from(31.to_string()));
-
-    // Input: the following records:
-    //
-    // 33
-    // 44
-    let mut records_left = BatchProducer::builder()
-        .records(2u16)
-        .record_generator(Arc::new(|i, _| Record::new(((i + 3) * 11).to_string())))
-        .build()
-        .expect("batch")
-        .records();
-    replica_left
-        .write_record_set(&mut records_left, ctx.follower_notifier())
-        .await
-        .expect("write");
-
-    // send back that consume has processed all current bacthes
-    client_socket
-        .send_and_receive(RequestMessage::new_request(UpdateOffsetsRequest {
-            offsets: vec![OffsetUpdate {
-                offset: 2,
-                session_id: stream_id,
-            }],
-        }))
-        .await
-        .expect("send offset");
-
-    let response = stream.next().await.expect("2nd").expect("response");
-
-    assert_eq!(response.partition.records.batches.len(), 1);
-    let batch = &response.partition.records.batches[0];
-    assert_eq!(batch.memory_records().expect("records").len(), 2);
-
-    // Output:
-    //     + 9
-    // 33 -> 42
-    // 44 -> 53
-    let records = batch.memory_records().expect("records");
-    assert_eq!(records[0].value, RecordData::from(42.to_string()));
-    assert_eq!(records[1].value, RecordData::from(53.to_string()));
-
-    // Input: the following records to the right topic:
-    //
-    // 22
-    let mut records_right = BatchProducer::builder()
-        .records(1u16)
-        .record_generator(Arc::new(|_, _| Record::new((22).to_string())))
-        .build()
-        .expect("batch")
-        .records();
-
-    replica_right
-        .write_record_set(&mut records_right, ctx.follower_notifier())
-        .await
-        .expect("write");
-
-    // Sleep before sending records to left topic, so right record is updated
-    sleep(Duration::from_millis(100)).await;
-
-    // send back that consume has processed all current bacthes
-    client_socket
-        .send_and_receive(RequestMessage::new_request(UpdateOffsetsRequest {
-            offsets: vec![OffsetUpdate {
-                offset: 4,
-                session_id: stream_id,
-            }],
-        }))
-        .await
-        .expect("send offset");
-
-    // Input: the following records:
-    //
-    // 55
-    // 66
-    let mut records_left = BatchProducer::builder()
-        .records(2u16)
-        .record_generator(Arc::new(|i, _| Record::new(((i + 5) * 11).to_string())))
-        .build()
-        .expect("batch")
-        .records();
-    replica_left
-        .write_record_set(&mut records_left, ctx.follower_notifier())
-        .await
-        .expect("write");
-
-    let response = stream.next().await.expect("2nd").expect("response");
-
-    assert_eq!(response.partition.records.batches.len(), 1);
-    let batch = &response.partition.records.batches[0];
-    assert_eq!(batch.memory_records().expect("records").len(), 2);
-
-    // Output:
-    //     + 22
-    // 55 -> 77
-    // 66 -> 88
-    let records = batch.memory_records().expect("records");
-    assert_eq!(records[0].value, RecordData::from(77.to_string()));
-    assert_eq!(records[1].value, RecordData::from(88.to_string()));
+        assert_eq!(ctx.metrics().chain_metrics().bytes_in(), 24);
+        assert_eq!(ctx.metrics().chain_metrics().records_out(), 1);
+        assert_eq!(ctx.metrics().chain_metrics().invocation_count(), 1); // one invocation per batch
+    }
 
     server_end_event.notify();
     debug!("terminated controller");
 }
 
-const FLUVIO_WASM_JOIN: &str = "fluvio_wasm_join";
-const JOIN_RIGHT_TOPIC: &str = "test-join-right";
+const FLUVIO_WASM_FILTER_WITH_LOOKBACK: &str = "fluvio_smartmodule_filter_lookback";
 
 #[fluvio_future::test(ignore)]
-async fn test_stream_fetch_join_adhoc() {
-    adhoc_test(
-        "test_stream_fetch_join_adhoc",
-        FLUVIO_WASM_JOIN,
-        SmartModuleKind::Join(JOIN_RIGHT_TOPIC.into()),
-        test_stream_fetch_join,
+async fn test_stream_fetch_filter_lookback() {
+    predefined_test(
+        "test_stream_fetch_filter_lookback",
+        FLUVIO_WASM_FILTER_WITH_LOOKBACK,
+        SmartModuleKind::Filter,
+        stream_fetch_filter_lookback,
     )
     .await;
 }
 
 #[fluvio_future::test(ignore)]
-async fn test_stream_fetch_join_predefined() {
+async fn test_stream_fetch_filter_lookback_age() {
     predefined_test(
-        "test_stream_fetch_join_predefenided",
-        FLUVIO_WASM_JOIN,
-        SmartModuleKind::Join(JOIN_RIGHT_TOPIC.into()),
-        test_stream_fetch_join,
+        "test_stream_fetch_filter_lookback",
+        FLUVIO_WASM_FILTER_WITH_LOOKBACK,
+        SmartModuleKind::Filter,
+        stream_fetch_filter_lookback_age,
     )
     .await;
 }
 
+async fn stream_fetch_filter_lookback(
+    ctx: Arc<GlobalContext<FileReplica>>,
+    test_path: PathBuf,
+    mut smartmodules: Vec<SmartModuleInvocation>,
+) {
+    ensure_clean_dir(&test_path);
+    let port = portpicker::pick_unused_port().expect("No free ports left");
+
+    let addr = format!("127.0.0.1:{port}");
+
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
+
+    // wait for stream controller async to start
+    sleep(Duration::from_millis(100)).await;
+
+    let client_socket =
+        MultiplexerSocket::new(FluvioSocket::connect(&addr).await.expect("connect"));
+
+    let topic = "testfilter_lookback";
+
+    for sm in smartmodules.iter_mut() {
+        sm.params.set_lookback(Some(Lookback::last(1)));
+    }
+
+    let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+    let test_id = test.id.clone();
+    let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+        .await
+        .expect("replica")
+        .init(&ctx)
+        .await
+        .expect("init succeeded");
+
+    ctx.leaders_state().insert(test_id, replica.clone()).await;
+
+    {
+        // it will read all records that greater than the last one (3)
+        replica
+            .write_record_set(
+                &mut vec_to_raw_batch(&["1", "10", "2", "11", "3"]),
+                ctx.follower_notifier(),
+            )
+            .await
+            .expect("write");
+
+        let stream = client_socket
+            .create_stream(
+                RequestMessage::new_request(
+                    DefaultStreamFetchRequest::builder()
+                        .topic(topic.to_owned())
+                        .max_bytes(10000)
+                        .smartmodules(smartmodules.clone())
+                        .build()
+                        .expect("build"),
+                ),
+                11,
+            )
+            .await
+            .expect("create stream");
+        assert_eq!(
+            read_records(stream, 2).await.expect("read records"),
+            vec!["10", "11"]
+        );
+    }
+
+    {
+        // it will read all records that greater than the last one (13)
+        replica
+            .write_record_set(
+                &mut vec_to_raw_batch(&["10", "14", "13"]),
+                ctx.follower_notifier(),
+            )
+            .await
+            .expect("write");
+
+        let stream = client_socket
+            .create_stream(
+                RequestMessage::new_request(
+                    DefaultStreamFetchRequest::builder()
+                        .topic(topic.to_owned())
+                        .max_bytes(10000)
+                        .smartmodules(smartmodules.clone())
+                        .build()
+                        .expect("build"),
+                ),
+                11,
+            )
+            .await
+            .expect("create stream");
+        assert_eq!(
+            read_records(stream, 1).await.expect("read records"),
+            vec!["14"]
+        );
+    }
+    {
+        // last 0 should mean no records should be read
+        for sm in smartmodules.iter_mut() {
+            sm.params.set_lookback(Some(Lookback::last(0)));
+        }
+
+        let stream = client_socket
+            .create_stream(
+                RequestMessage::new_request(
+                    DefaultStreamFetchRequest::builder()
+                        .topic(topic.to_owned())
+                        .max_bytes(10000)
+                        .smartmodules(smartmodules.clone())
+                        .build()
+                        .expect("build"),
+                ),
+                11,
+            )
+            .await
+            .expect("create stream");
+        assert_eq!(
+            read_records(stream, 4).await.expect("read records"),
+            vec!["1", "10", "11", "14"]
+        );
+    }
+
+    {
+        // last could not be parsed by look_back from SM, error should be propagated
+        replica
+            .write_record_set(
+                &mut vec_to_raw_batch(&["wrong record"]),
+                ctx.follower_notifier(),
+            )
+            .await
+            .expect("write");
+
+        for sm in smartmodules.iter_mut() {
+            sm.params.set_lookback(Some(Lookback::last(1)));
+        }
+
+        let mut stream = client_socket
+            .create_stream(
+                RequestMessage::new_request(
+                    DefaultStreamFetchRequest::builder()
+                        .topic(topic.to_owned())
+                        .max_bytes(10000)
+                        .smartmodules(smartmodules.clone())
+                        .build()
+                        .expect("build"),
+                ),
+                11,
+            )
+            .await
+            .expect("create stream");
+        let response = stream.next().await.expect("next").expect("ok");
+        let partition = &response.partition;
+        assert_eq!(partition.records.batches.len(), 0);
+        assert_eq!(
+            partition.error_code,
+            ErrorCode::SmartModuleLookBackError("invalid digit found in string\n\nSmartModule Lookback Error: \n    Offset: 0\n    Key: NULL\n    Value: wrong record".to_string())
+        );
+    }
+
+    server_end_event.notify();
+    debug!("terminated controller");
+}
+
+async fn stream_fetch_filter_lookback_age(
+    ctx: Arc<GlobalContext<FileReplica>>,
+    test_path: PathBuf,
+    mut smartmodules: Vec<SmartModuleInvocation>,
+) {
+    ensure_clean_dir(&test_path);
+    let port = portpicker::pick_unused_port().expect("No free ports left");
+
+    let addr = format!("127.0.0.1:{port}");
+
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
+
+    // wait for stream controller async to start
+    sleep(Duration::from_millis(100)).await;
+
+    let client_socket =
+        MultiplexerSocket::new(FluvioSocket::connect(&addr).await.expect("connect"));
+
+    // tests for lookback records with age
+    {
+        for sm in smartmodules.iter_mut() {
+            sm.params.set_lookback(Some(Lookback::last(1)));
+        }
+
+        // tests for lookback by age
+        {
+            let topic = "testfilter_lookback_age_1";
+            info!(topic, "running test");
+
+            // read last record with matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(3600), Some(1))));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                // it will read all records that greater than the last one (3)
+                replica
+                    .write_record_set(
+                        &mut vec_to_raw_batch(&["1", "10", "2", "11", "3"]),
+                        ctx.follower_notifier(),
+                    )
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 2).await.expect("read records"),
+                    vec!["10", "11"]
+                );
+            }
+        }
+
+        // it will read all records because lookback found nothing
+        {
+            let topic = "testfilter_lookback_age_2";
+            info!(topic, "running test");
+
+            // no matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(3600), Some(1))));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                let mut batch = vec_to_raw_batch(&["1", "2", "3", "4", "5"]);
+                batch.batches[0].header.first_timestamp = Utc::now()
+                    .checked_sub_days(Days::new(1))
+                    .expect("valid date")
+                    .timestamp_millis();
+                batch.batches[0].header.max_time_stamp = batch.batches[0].header.first_timestamp;
+
+                replica
+                    .write_record_set(&mut batch, ctx.follower_notifier())
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 5).await.expect("read records"),
+                    vec!["1", "2", "3", "4", "5"]
+                );
+            }
+        }
+
+        // no last, one batch, all record matched age
+        {
+            let topic = "testfilter_lookback_age_3";
+            info!(topic, "running test");
+
+            // no matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(3600), None)));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                let mut batch = vec_to_raw_batch(&["1", "10", "2", "11", "3"]);
+
+                replica
+                    .write_record_set(&mut batch, ctx.follower_notifier())
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 2).await.expect("read records"),
+                    vec!["10", "11"]
+                );
+            }
+        }
+
+        // no last, one batch, some records have matched age
+        {
+            let topic = "testfilter_lookback_age_4";
+            info!(topic, "running test");
+
+            // no matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(60 * 60 * 13), None)));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                let mut batch = vec_to_batch(&["1", "10", "2", "11", "3"]);
+                batch.batches[0].header.first_timestamp = Utc::now()
+                    .checked_sub_days(Days::new(1))
+                    .expect("valid date")
+                    .timestamp_millis();
+                batch.batches[0].mut_records()[4]
+                    .preamble
+                    .set_timestamp_delta(Duration::from_secs(60 * 60 * 12).as_millis() as i64);
+
+                replica
+                    .write_record_set(&mut batch.try_into().expect("raw"), ctx.follower_notifier())
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 2).await.expect("read records"),
+                    vec!["10", "11"]
+                );
+            }
+        }
+
+        // no last, two batches, all record matched age
+        {
+            let topic = "testfilter_lookback_age_5";
+            info!(topic, "running test");
+
+            // no matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(3600), None)));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                let mut batch1 = vec_to_raw_batch(&["1", "10", "2"]);
+                let mut batch2 = vec_to_raw_batch(&["11", "3"]);
+
+                replica
+                    .write_record_set(&mut batch1, ctx.follower_notifier())
+                    .await
+                    .expect("write");
+                replica
+                    .write_record_set(&mut batch2, ctx.follower_notifier())
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 2).await.expect("read records"),
+                    vec!["10", "11"]
+                );
+            }
+        }
+
+        // no last, two batches, some records have matched age
+        {
+            let topic = "testfilter_lookback_age_6";
+            info!(topic, "running test");
+
+            // no matched age
+            for sm in smartmodules.iter_mut() {
+                sm.params
+                    .set_lookback(Some(Lookback::age(Duration::from_secs(60 * 60 * 13), None)));
+            }
+
+            let test = Replica::new((topic.to_owned(), 0), 5001, vec![5001]);
+            let test_id = test.id.clone();
+            let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+                .await
+                .expect("replica")
+                .init(&ctx)
+                .await
+                .expect("init succeeded");
+            ctx.leaders_state().insert(test_id, replica.clone()).await;
+            {
+                let mut batch1 = vec_to_batch(&["1", "10", "2"]);
+                batch1.batches[0].header.first_timestamp = Utc::now()
+                    .checked_sub_days(Days::new(1))
+                    .expect("valid date")
+                    .timestamp_millis();
+                batch1.batches[0].mut_records()[2]
+                    .preamble
+                    .set_timestamp_delta(Duration::from_secs(60 * 60 * 12).as_millis() as i64);
+
+                let mut batch2 = vec_to_raw_batch(&["11", "3"]);
+
+                replica
+                    .write_record_set(
+                        &mut batch1.try_into().expect("raw"),
+                        ctx.follower_notifier(),
+                    )
+                    .await
+                    .expect("write");
+                replica
+                    .write_record_set(&mut batch2, ctx.follower_notifier())
+                    .await
+                    .expect("write");
+
+                let stream = client_socket
+                    .create_stream(
+                        RequestMessage::new_request(
+                            DefaultStreamFetchRequest::builder()
+                                .topic(topic.to_owned())
+                                .max_bytes(10000)
+                                .smartmodules(smartmodules.clone())
+                                .build()
+                                .expect("build"),
+                        ),
+                        11,
+                    )
+                    .await
+                    .expect("create stream");
+                assert_eq!(
+                    read_records(stream, 2).await.expect("read records"),
+                    vec!["10", "11"]
+                );
+            }
+        }
+    }
+    server_end_event.notify();
+    debug!("terminated controller");
+}
+
+async fn read_records(
+    mut stream: AsyncResponse<StreamFetchRequest<RecordSet<RawRecords>>>,
+    count: usize,
+) -> anyhow::Result<Vec<String>> {
+    let mut res = Vec::with_capacity(count);
+    while res.len() < count {
+        let response = stream
+            .next()
+            .await
+            .ok_or(anyhow::anyhow!("expected item"))??;
+        let partition = &response.partition;
+        assert_eq!(partition.records.batches.len(), 1);
+        let batch = &partition.records.batches[0];
+        for record in batch.memory_records()? {
+            res.push(String::from_utf8_lossy(record.value().as_ref()).to_string());
+        }
+    }
+    Ok(res)
+}
+
 #[fluvio_future::test(ignore)]
-async fn test_stream_fetch_join_generic() {
-    predefined_test(
-        "test_stream_fetch_join_generic",
-        FLUVIO_WASM_JOIN,
-        SmartModuleKind::Generic(SmartModuleContextData::Join(JOIN_RIGHT_TOPIC.into())),
-        test_stream_fetch_join,
-    )
-    .await;
+async fn test_stream_fetch_sends_topic_delete_error_on_topic_delete() {
+    let test_path = temp_dir().join("test_stream_fetch");
+    ensure_clean_dir(&test_path);
+    let port = portpicker::pick_unused_port().expect("No free ports left");
+
+    let addr = format!("127.0.0.1:{port}");
+    let mut spu_config = SpuConfig::default();
+    spu_config.log.base_dir = test_path;
+    let ctx = GlobalContext::new_shared_context(spu_config);
+
+    let server_end_event = create_public_server_with_root_auth(addr.to_owned(), ctx.clone()).run();
+
+    // wait for stream controller async to start
+    sleep(Duration::from_millis(100)).await;
+
+    let client_socket =
+        MultiplexerSocket::new(FluvioSocket::connect(&addr).await.expect("connect"));
+
+    // perform for two versions
+    for version in 10..11 {
+        let topic = format!("test{version}");
+        let test = Replica::new((topic.clone(), 0), 5001, vec![5001]);
+        let test_id = test.id.clone();
+        let replica = LeaderReplicaState::create(test, ctx.config(), ctx.status_update_owned())
+            .await
+            .expect("replica")
+            .init(&ctx)
+            .await
+            .expect("init succeeded");
+
+        ctx.leaders_state().insert(test_id, replica.clone()).await;
+
+        let stream_request = DefaultStreamFetchRequest::builder()
+            .topic(topic.clone())
+            .max_bytes(1000)
+            .build()
+            .expect("request");
+
+        let mut stream = client_socket
+            .create_stream(RequestMessage::new_request(stream_request), version)
+            .await
+            .expect("create stream");
+
+        // Yield a very short time to ensure that the offset publishing registration occurs before topic delete signal,
+        // otherwise we never get a response. I suspect that this race condition should only occur when the consumer
+        // and replica are in the same async executor and you signal a topic delete immediately after creating the stream.
+        sleep(Duration::from_millis(1)).await;
+
+        replica.signal_topic_deleted().await;
+
+        let response = stream.next().await.expect("first").expect("response");
+        debug!("response: {:#?}", response);
+
+        debug!("received first message");
+        assert_eq!(response.topic, topic);
+
+        let partition = &response.partition;
+        assert_eq!(partition.error_code, ErrorCode::TopicDeleted);
+    }
+
+    server_end_event.notify();
+    debug!("terminated controller");
 }

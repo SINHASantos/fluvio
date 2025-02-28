@@ -5,7 +5,10 @@ mod produce;
 mod partition;
 mod tableformat;
 mod smartmodule;
-mod derivedstream;
+mod smartmodule_invocation;
+mod consumer;
+mod remote;
+mod home;
 
 pub use metadata::client_metadata;
 pub use cmd::FluvioCmd;
@@ -36,16 +39,18 @@ mod cmd {
     use std::sync::Arc;
     use std::fmt::Debug;
 
-    use clap::{Parser};
+    use clap::Parser;
     use async_trait::async_trait;
+    use anyhow::Result;
 
     use fluvio::Fluvio;
 
     use crate::common::target::ClusterTarget;
     use crate::common::Terminal;
-    use crate::Result;
 
-    use super::derivedstream::DerivedStreamCmd;
+    use super::consumer::ConsumerCmd;
+    use super::remote::RemoteCmd;
+    use super::home::HomeCmd;
     use super::smartmodule::SmartModuleCmd;
     use super::consume::ConsumeOpt;
     use super::produce::ProduceOpt;
@@ -87,11 +92,11 @@ mod cmd {
     #[derive(Parser, Debug)]
     pub enum FluvioCmd {
         /// Read messages from a topic/partition
-        #[clap(name = "consume")]
+        #[command(name = "consume")]
         Consume(Box<ConsumeOpt>),
 
         /// Write messages to a topic/partition
-        #[clap(name = "produce")]
+        #[command(name = "produce")]
         Produce(ProduceOpt),
 
         /// Manage and view Topics
@@ -100,7 +105,7 @@ mod cmd {
         /// are related to each other. Similar to the role of tables in a relational
         /// database, the names and contents of Topics will typically reflect the
         /// structure of the application domain they are used for.
-        #[clap(subcommand, name = "topic")]
+        #[command(subcommand, name = "topic")]
         Topic(TopicCmd),
 
         /// Manage and view Partitions
@@ -110,13 +115,13 @@ mod cmd {
         /// partitions may be processed by separate SPUs on different computers. By
         /// dividing the load of a Topic evenly among partitions, you can increase the
         /// total throughput of the Topic.
-        #[clap(subcommand, name = "partition")]
+        #[command(subcommand, name = "partition")]
         Partition(PartitionCmd),
 
         /// Create and manage SmartModules
         ///
         /// SmartModules are compiled WASM modules used to create SmartModules.
-        #[clap(
+        #[command(
             subcommand,
             name = "smartmodule",
             visible_alias = "sm",
@@ -129,19 +134,24 @@ mod cmd {
         ///
         /// Used with the consumer output type `full_table` to
         /// describe how to render JSON data in a tabular form
-        #[clap(subcommand, name = "table-format", visible_alias = "tf")]
+        #[command(subcommand, name = "table-format", visible_alias = "tf")]
         TableFormat(TableFormatCmd),
 
-        /// Create and manage DerivedStreams
-        ///
-        /// Use topics, SmartModules or other DerivedStreams
-        /// to build a customized stream to consume
-        #[clap(subcommand, name = "derived-stream", visible_alias = "ds")]
-        DerivedStream(DerivedStreamCmd),
-
         /// Work with the SmartModule Hub
-        #[clap(subcommand, name = "hub")]
+        #[command(subcommand, name = "hub")]
         Hub(HubCmd),
+
+        /// Manage and view Consumers
+        #[command(subcommand, name = "consumer")]
+        Consumer(ConsumerCmd),
+
+        /// Manage and view remote clusters mirrored
+        #[command(subcommand, name = "remote")]
+        Remote(Box<RemoteCmd>),
+
+        /// Commands to interact with the home cluster
+        #[command(subcommand, name = "home")]
+        Home(Box<HomeCmd>),
     }
 
     impl FluvioCmd {
@@ -170,11 +180,17 @@ mod cmd {
                 Self::TableFormat(tableformat) => {
                     tableformat.process(out, target).await?;
                 }
-                Self::DerivedStream(derivedstream) => {
-                    derivedstream.process(out, target).await?;
-                }
                 Self::Hub(hub) => {
                     hub.process(out, target).await?;
+                }
+                Self::Consumer(consumer) => {
+                    consumer.process(out, target).await?;
+                }
+                Self::Remote(remote) => {
+                    remote.process(out, target).await?;
+                }
+                Self::Home(home) => {
+                    home.process(out, target).await?;
                 }
             }
 

@@ -1,25 +1,27 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use serde::{Deserialize};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use fluvio_controlplane_metadata::core::MetadataContext;
 use fluvio_types::defaults::SPU_PUBLIC_PORT;
-use k8_client::{ClientError};
-use k8_types::Env;
-use k8_types::core::pod::{
+use fluvio_stream_model::k8_types::Env;
+use fluvio_stream_model::k8_types::core::pod::{
     ResourceRequirements, PodSecurityContext, ContainerSpec, VolumeMount, VolumeSpec,
 };
-use k8_types::core::config_map::{ConfigMapSpec, ConfigMapStatus};
-use k8_types::core::service::{ServicePort, ServiceSpec, TargetPort, LoadBalancerType};
+use fluvio_stream_model::k8_types::core::config_map::{ConfigMapSpec, ConfigMapStatus};
+use fluvio_stream_model::k8_types::core::service::{
+    ServicePort, ServiceSpec, TargetPort, LoadBalancerType,
+};
 
 use crate::dispatcher::core::{Spec, Status};
 
 const CONFIG_MAP_NAME: &str = "spu-k8";
 
 // this is same struct as in helm config
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodConfig {
     #[serde(default)]
@@ -37,22 +39,21 @@ pub struct PodConfig {
     pub extra_volumes: Vec<VolumeSpec>,
 }
 
-#[derive(Debug, Eq, PartialEq, Default, Clone)]
+#[derive(Debug, Eq, PartialEq, Default, Clone, Serialize, Deserialize)]
 pub struct ScK8Config {
     pub image: String,
     pub pod_security_context: Option<PodSecurityContext>,
     pub lb_service_annotations: HashMap<String, String>,
     pub service: Option<ServiceSpec>,
     pub spu_pod_config: PodConfig,
-    pub connector_prefixes: Vec<String>,
 }
 
 impl ScK8Config {
-    fn from(mut data: BTreeMap<String, String>) -> Result<Self, ClientError> {
+    fn from(mut data: BTreeMap<String, String>) -> Result<Self> {
         debug!("ConfigMap {} data: {:?}", CONFIG_MAP_NAME, data);
 
         let image = data.remove("image").ok_or_else(|| {
-            ClientError::Other("image not found in ConfigMap spu-k8 data".to_owned())
+            anyhow::anyhow!("image not found in ConfigMap spu-k8 data".to_owned())
         })?;
 
         let pod_security_context =
@@ -76,9 +77,8 @@ impl ScK8Config {
         };
 
         let spu_pod_config = if let Some(config_str) = data.remove("spuPodConfig") {
-            serde_json::from_str(&config_str).map_err(|err| {
-                ClientError::Other(format!("not able to parse spu pod config: {:#?}", err))
-            })?
+            serde_json::from_str(&config_str)
+                .map_err(|err| anyhow::anyhow!("not able to parse spu pod config: {err:#?}"))?
         } else {
             info!("spu pod config not found, using default");
             PodConfig::default()
@@ -86,20 +86,12 @@ impl ScK8Config {
 
         info!(?spu_pod_config, "spu pod config");
 
-        let connector_prefixes: Vec<String> =
-            if let Some(prefix_string) = data.remove("connectorPrefixes") {
-                prefix_string.split(' ').map(|s| s.to_owned()).collect()
-            } else {
-                Vec::new()
-            };
-
         Ok(Self {
             image,
             pod_security_context,
             lb_service_annotations,
             service,
             spu_pod_config,
-            connector_prefixes,
         })
     }
 
@@ -164,7 +156,7 @@ impl From<ScK8Config> for ConfigMapSpec {
     }
 }
 
-#[derive(Deserialize, Debug, Eq, PartialEq, Default, Clone)]
+#[derive(Debug, Eq, PartialEq, Default, Clone, Serialize, Deserialize)]
 pub struct FluvioConfigStatus();
 
 impl Status for FluvioConfigStatus {}
@@ -196,19 +188,19 @@ mod extended {
     use tracing::debug;
     use tracing::trace;
 
-    use k8_types::K8Obj;
-    use k8_types::core::config_map::{ConfigMapSpec, ConfigMapStatus};
+    use fluvio_stream_model::k8_types::K8Obj;
+    use fluvio_stream_model::k8_types::core::config_map::ConfigMapSpec;
+    use fluvio_stream_model::k8_types::Spec as K8Spec;
 
     use crate::stores::k8::K8ConvertError;
     use crate::stores::k8::K8ExtendedSpec;
     use crate::stores::k8::K8MetaItem;
-    use crate::stores::{MetadataStoreObject};
+    use crate::stores::MetadataStoreObject;
 
     use super::*;
 
     impl K8ExtendedSpec for ScK8Config {
         type K8Spec = ConfigMapSpec;
-        type K8Status = ConfigMapStatus;
 
         fn convert_from_k8(
             k8_obj: K8Obj<Self::K8Spec>,
@@ -222,7 +214,7 @@ mod extended {
                 match ScK8Config::from(k8_obj.header.data) {
                     Ok(config) => match k8_obj.metadata.try_into() {
                         Ok(ctx_item) => {
-                            let ctx = MetadataContext::new(ctx_item, None);
+                            let ctx = MetadataContext::new(ctx_item);
                             Ok(
                                 MetadataStoreObject::new("fluvio", config, FluvioConfigStatus {})
                                     .with_context(ctx),
@@ -230,7 +222,7 @@ mod extended {
                         }
                         Err(err) => Err(K8ConvertError::KeyConvertionError(IoError::new(
                             ErrorKind::InvalidData,
-                            format!("error converting metadata: {:#?}", err),
+                            format!("error converting metadata: {err:#?}"),
                         ))),
                     },
                     Err(err) => Err(K8ConvertError::Other(std::io::Error::new(
@@ -244,6 +236,13 @@ mod extended {
                     "skipping non spu service");
                 Err(K8ConvertError::Skip(Box::new(k8_obj)))
             }
+        }
+
+        fn convert_status_from_k8(status: Self::Status) -> <ConfigMapSpec as K8Spec>::Status {
+            status.into()
+        }
+        fn into_k8(self) -> Self::K8Spec {
+            self.into()
         }
     }
 }

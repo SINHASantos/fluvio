@@ -3,35 +3,36 @@
 //!
 //! Converts Custom Spu API request into KV request and sends to KV store for processing.
 //!
+use fluvio_stream_model::core::MetadataItem;
 use tracing::{debug, info, trace, instrument};
-use std::io::{Error as IoError};
+use std::io::Error as IoError;
 
 use fluvio_protocol::link::ErrorCode;
-use fluvio_controlplane_metadata::spu::store::SpuLocalStorePolicy;
 use fluvio_sc_schema::Status;
 use fluvio_sc_schema::spu::SpuSpec;
 use fluvio_sc_schema::customspu::CustomSpuSpec;
-use fluvio_sc_schema::objects::{CommonCreateRequest};
+use fluvio_sc_schema::objects::CreateRequest;
 use fluvio_auth::{AuthContext, TypeAction};
 use fluvio_controlplane_metadata::extended::SpecExt;
 
-use crate::core::{SharedContext};
+use crate::core::SharedContext;
 use crate::services::auth::AuthServiceContext;
+use crate::stores::spu::SpuLocalStorePolicy;
 
-pub struct RegisterCustomSpu {
-    ctx: SharedContext,
+pub struct RegisterCustomSpu<C: MetadataItem> {
+    ctx: SharedContext<C>,
     name: String,
     spec: CustomSpuSpec,
 }
 
-impl RegisterCustomSpu {
+impl<C: MetadataItem> RegisterCustomSpu<C> {
     /// Handler for create spus request
-    #[instrument(skip(create, auth_ctx))]
+    #[instrument(skip(req, auth_ctx))]
     pub async fn handle_register_custom_spu_request<AC: AuthContext>(
-        create: CommonCreateRequest,
-        spec: CustomSpuSpec,
-        auth_ctx: &AuthServiceContext<AC>,
+        req: CreateRequest<CustomSpuSpec>,
+        auth_ctx: &AuthServiceContext<AC, C>,
     ) -> Status {
+        let (create, spec) = req.parts();
         let name = create.name;
 
         info!(
@@ -41,7 +42,7 @@ impl RegisterCustomSpu {
 
         if let Ok(authorized) = auth_ctx
             .auth
-            .allow_type_action(CustomSpuSpec::OBJECT_TYPE, TypeAction::Read)
+            .allow_type_action(CustomSpuSpec::OBJECT_TYPE, TypeAction::Create)
             .await
         {
             if !authorized {

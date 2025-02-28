@@ -6,11 +6,10 @@
 
 use tracing::debug;
 use clap::Parser;
+use anyhow::Result;
 
 use fluvio::Fluvio;
 use fluvio::metadata::spg::*;
-
-use crate::cli::ClusterCliError;
 
 // -----------------------------------
 // CLI Options
@@ -19,28 +18,28 @@ use crate::cli::ClusterCliError;
 #[derive(Debug, Parser, Default)]
 pub struct CreateManagedSpuGroupOpt {
     /// The name for the new SPU Group
-    #[clap(value_name = "name")]
+    #[arg(value_name = "name")]
     pub name: String,
 
     /// The number of SPUs to create in this SPG
-    #[clap(short, long, value_name = "integer", default_value = "1")]
+    #[arg(short, long, value_name = "integer", default_value = "1")]
     pub replicas: u16,
 
     /// Minimum SPU ID
-    #[clap(long, value_name = "integer", default_value = "1")]
+    #[arg(long, value_name = "integer", default_value = "1")]
     pub min_id: i32,
 
     /// Rack name
-    #[clap(long, value_name = "string")]
+    #[arg(long, value_name = "string")]
     pub rack: Option<String>,
 
     /// The amount of storage to assign to this SPG
-    #[clap(long, value_name = "string")]
+    #[arg(long, value_name = "string")]
     pub storage_size: Option<String>,
 }
 
 impl CreateManagedSpuGroupOpt {
-    pub async fn process(self, fluvio: &Fluvio) -> Result<(), ClusterCliError> {
+    pub async fn process(self, fluvio: &Fluvio) -> Result<()> {
         let (name, spec) = self.validate();
         debug!("creating spg: {}, spec: {:#?}", name, spec);
 

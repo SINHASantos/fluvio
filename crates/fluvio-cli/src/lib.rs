@@ -11,7 +11,7 @@ mod metadata;
 mod render;
 pub(crate) mod monitoring;
 
-pub(crate) use error::{Result, CliError};
+pub(crate) use error::CliError;
 use fluvio_extension_common as common;
 pub(crate) const VERSION: &str = include_str!("../../../VERSION");
 
@@ -23,8 +23,41 @@ use install::update::{
 pub use root::{Root, HelpOpt};
 pub use client::TableFormatConfig;
 
-mod root {
+// Checks for an update if channel is latest or ALWAYS_CHECK is set
+async fn check_for_channel_update() {
+    if should_always_print_available_update() {
+        println!("🔍 Checking for new version");
+        let agent = HttpAgent::default();
+        let update_result = check_update_available(&agent, false).await;
+        if let Ok(Some(latest_version)) = update_result {
+            prompt_available_update(&latest_version);
+        } else {
+            println!("✅ fluvio-cli is up to date");
+        }
+    }
+}
 
+mod util {
+    use fluvio_spu_schema::Isolation;
+    use crate::CliError;
+
+    pub(crate) fn parse_isolation(s: &str) -> Result<Isolation, String> {
+        match s {
+            "read_committed" | "ReadCommitted" | "readCommitted" | "readcommitted" => Ok(Isolation::ReadCommitted),
+            "read_uncommitted" | "ReadUncommitted" | "readUncommitted" | "readuncommitted" => Ok(Isolation::ReadUncommitted),
+            _ => Err(format!("unrecognized isolation: {s}. Supported: read_committed (ReadCommitted), read_uncommitted (ReadUncommitted)")),
+        }
+    }
+
+    pub(crate) fn parse_key_val(s: &str) -> anyhow::Result<(String, String)> {
+        let pos = s.find('=').ok_or_else(|| {
+            CliError::InvalidArg(format!("invalid KEY=value: no `=` found in `{s}`"))
+        })?;
+        Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+    }
+}
+
+mod root {
     use crate::check_for_channel_update;
     use std::sync::Arc;
     use std::path::PathBuf;
@@ -32,7 +65,9 @@ mod root {
 
     use clap::{Parser, Command as ClapCommand, CommandFactory};
     use clap_complete::{generate, Shell};
+    use fluvio_benchmark::cli::BenchmarkOpt;
     use tracing::debug;
+    use anyhow::Result;
 
     #[cfg(feature = "k8s")]
     use fluvio_cluster::cli::ClusterCmd;
@@ -40,16 +75,13 @@ mod root {
     use fluvio_channel::{FLUVIO_RELEASE_CHANNEL, LATEST_CHANNEL_NAME};
 
     use crate::profile::ProfileOpt;
-    use crate::install::update::UpdateOpt;
-    use crate::install::plugins::InstallOpt;
+    use crate::install::opts::InstallOpt;
     use crate::client::FluvioCmd;
     use crate::metadata::{MetadataOpt, subcommand_metadata};
     use crate::version::VersionOpt;
     use crate::common::target::ClusterTarget;
     use crate::common::COMMAND_TEMPLATE;
     use crate::common::PrintTerminal;
-
-    use super::Result;
 
     /// Fluvio Command Line Interface
     #[derive(Parser, Debug)]
@@ -62,9 +94,11 @@ mod root {
 
     impl Root {
         pub async fn process(self) -> Result<()> {
-            if !matches_consume(&self.command) {
+            if command_triggers_update_check(&self.command) {
+                tracing::info!("Triggered a Fluvio Update Check");
                 check_for_channel_update().await;
             }
+
             self.command.process(self.opts).await?;
             Ok(())
         }
@@ -77,7 +111,7 @@ mod root {
     }
 
     #[derive(Debug, Parser)]
-    #[clap(
+    #[command(
         about = "Fluvio Command Line Interface",
         name = "fluvio",
         help_template = COMMAND_TEMPLATE,
@@ -90,9 +124,13 @@ mod root {
         )]
     enum RootCmd {
         /// All top-level commands that require a Fluvio client are bundled in `FluvioCmd`
-        #[clap(flatten)]
+        #[command(flatten)]
         #[cfg(feature = "consumer")]
         Fluvio(FluvioCmd),
+
+        /// Run Fluvio benchmarks
+        #[command(name = "benchmark", alias = "bench")]
+        Benchmark(BenchmarkOpt),
 
         /// Manage Profiles, which describe linked clusters
         ///
@@ -100,13 +138,13 @@ mod root {
         /// This might correspond to Fluvio running on Minikube or in the Cloud.
         /// There is one "active" profile, which determines which cluster all of the
         /// Fluvio CLI commands interact with.
-        #[clap(name = "profile")]
+        #[command(name = "profile")]
         Profile(ProfileOpt),
 
         /// Install or uninstall Fluvio cluster
         ///
         #[cfg(feature = "k8s")]
-        #[clap(subcommand, name = "cluster")]
+        #[command(subcommand, name = "cluster")]
         Cluster(Box<ClusterCmd>),
 
         /// Install Fluvio plugins
@@ -116,15 +154,11 @@ mod root {
         /// be invoked by running `fluvio foo`.
         ///
         /// This command allows you to install plugins from Fluvio's package registry.
-        #[clap(name = "install")]
+        #[command(name = "install", hide = true)]
         Install(InstallOpt),
 
-        /// Update the Fluvio CLI
-        #[clap(name = "update")]
-        Update(UpdateOpt),
-
         /// Print Fluvio version information
-        #[clap(name = "version")]
+        #[command(name = "version")]
         Version(VersionOpt),
 
         /// Generate command-line completions for Fluvio
@@ -135,14 +169,14 @@ mod root {
         ///
         /// $ fluvio completions bash > ~/fluvio_completions.sh
         /// {n}$ echo "source ~/fluvio_completions.sh" >> ~/.bashrc
-        #[clap(subcommand, name = "completions")]
+        #[command(subcommand, name = "completions")]
         Completions(CompletionCmd),
 
         /// Generate metadata for Fluvio base CLI
-        #[clap(name = "metadata", hide = true)]
+        #[command(name = "metadata", hide = true)]
         Metadata(MetadataOpt),
 
-        #[clap(external_subcommand)]
+        #[command(external_subcommand)]
         External(Vec<String>),
     }
 
@@ -177,17 +211,6 @@ mod root {
 
                     install.process().await?;
                 }
-                Self::Update(mut update) => {
-                    if let Ok(channel_name) = std::env::var(FLUVIO_RELEASE_CHANNEL) {
-                        println!("Current channel: {}", &channel_name);
-
-                        if channel_name == LATEST_CHANNEL_NAME {
-                            update.develop = true;
-                        }
-                    };
-
-                    update.process().await?;
-                }
                 Self::Version(version) => {
                     version.process(root.target).await?;
                 }
@@ -196,6 +219,9 @@ mod root {
                 }
                 Self::Metadata(metadata) => {
                     metadata.process()?;
+                }
+                Self::Benchmark(bench) => {
+                    bench.process().await?;
                 }
 
                 Self::External(args) => {
@@ -244,20 +270,20 @@ mod root {
 
     #[derive(Debug, Parser)]
     struct CompletionOpt {
-        #[clap(long, default_value = "fluvio")]
+        #[arg(long, default_value = "fluvio")]
         name: String,
     }
 
     #[derive(Debug, Parser)]
     enum CompletionCmd {
         /// Generate CLI completions for bash
-        #[clap(name = "bash")]
+        #[command(name = "bash")]
         Bash(CompletionOpt),
         /// Generate CLI completions for zsh
-        #[clap(name = "zsh")]
+        #[command(name = "zsh")]
         Zsh(CompletionOpt),
         /// Generate CLI completions for fish
-        #[clap(name = "fish")]
+        #[command(name = "fish")]
         Fish(CompletionOpt),
     }
 
@@ -281,15 +307,15 @@ mod root {
 
     /// Search for a Fluvio plugin in the following places:
     ///
-    /// - In the system PATH
     /// - In the directory where the `fluvio` executable is located
+    /// - In the system PATH
     /// - In the `~/.fluvio/extensions/` directory
     fn find_plugin(name: &str) -> Option<PathBuf> {
         let ext_dir = fluvio_extensions_dir().ok();
         let self_exe = std::env::current_exe().ok();
         let self_dir = self_exe.as_ref().and_then(|it| it.parent());
-        which::which(name)
-            .or_else(|_| which::which_in(name, self_dir, "."))
+        which::which_in(name, self_dir, ".")
+            .or_else(|_| which::which(name))
             .or_else(|_| which::which_in(name, ext_dir, "."))
             .ok()
     }
@@ -299,7 +325,7 @@ mod root {
         let cmd = args.remove(0);
 
         // Check for a matching external command in the environment
-        let subcommand = format!("fluvio-{}", cmd);
+        let subcommand = format!("fluvio-{cmd}");
         let subcommand_path = match find_plugin(&subcommand) {
             Some(path) => path,
             None => {
@@ -343,59 +369,22 @@ mod root {
             // https://doc.rust-lang.org/std/os/unix/process/trait.ExitStatusExt.html
             use std::os::unix::process::ExitStatusExt;
             if let Some(signal) = status.signal() {
-                println!("Extension killed via {} signal", signal);
+                println!("Extension killed via {signal} signal");
                 std::process::exit(signal);
             }
         }
 
         Ok(())
     }
+
+    /// Retrieves `true` if the provided `fluvio` command must trigger an
+    /// update check.
+    ///
+    /// Commands that must trigger update checks are:
+    ///
+    /// - `fluvio version`
     #[inline]
-    fn matches_consume(cmd: &RootCmd) -> bool {
-        matches!(cmd, RootCmd::Fluvio(FluvioCmd::Consume(_)))
-    }
-    #[cfg(test)]
-    mod tests {
-        use clap::Parser;
-
-        use crate::{Root, root::matches_consume};
-
-        #[test]
-        fn test_matches_consume() {
-            assert!(matches_consume(
-                &parse("fluvio consume hello").unwrap().command
-            ));
-            assert!(!matches_consume(
-                &parse("fluvio produce hello").unwrap().command
-            ));
-        }
-        fn parse(command: &str) -> Result<Root, clap::error::Error> {
-            Root::try_parse_from(command.split_whitespace())
-        }
-    }
-}
-// Checks for an update if channel is latest or ALWAYS_CHECK is set
-async fn check_for_channel_update() {
-    if should_always_print_available_update() {
-        println!("🔍 Checking for new version");
-        let agent = HttpAgent::default();
-        let update_result = check_update_available(&agent, false).await;
-        if let Ok(Some(latest_version)) = update_result {
-            prompt_available_update(&latest_version);
-        } else {
-            println!("✅ fluvio-cli is up to date");
-        }
-    }
-}
-
-mod util {
-    use fluvio_spu_schema::Isolation;
-
-    pub(crate) fn parse_isolation(s: &str) -> Result<Isolation, String> {
-        match s {
-            "read_committed" | "ReadCommitted" | "readCommitted" | "readcommitted" => Ok(Isolation::ReadCommitted),
-            "read_uncommitted" | "ReadUncommitted" | "readUncommitted" | "readuncommitted" => Ok(Isolation::ReadUncommitted),
-            _ => Err(format!("unrecognized isolation: {}. Supported: read_committed (ReadCommitted), read_uncommitted (ReadUncommitted)", s)),
-        }
+    fn command_triggers_update_check(cmd: &RootCmd) -> bool {
+        matches!(cmd, RootCmd::Version(_))
     }
 }

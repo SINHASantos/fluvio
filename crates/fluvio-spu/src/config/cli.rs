@@ -4,10 +4,10 @@
 //! Command line interface to provision SPU id and configure various
 //! system parameters.
 //!
-use std::io::Error as IoError;
 use std::process;
-use std::io::ErrorKind;
 
+use anyhow::{anyhow, Result};
+use fluvio_future::openssl::SslVerifyMode;
 use tracing::debug;
 use tracing::info;
 use clap::Parser;
@@ -20,38 +20,38 @@ use super::SpuConfig;
 
 /// cli options
 #[derive(Debug, Default, Parser)]
-#[clap(name = "fluvio-spu", about = "Streaming Processing Unit")]
+#[command(name = "fluvio-spu", about = "Streaming Processing Unit")]
 pub struct SpuOpt {
     /// SPU unique identifier
-    #[clap(short = 'i', long = "id", value_name = "integer")]
+    #[arg(short = 'i', long = "id", value_name = "integer")]
     pub id: Option<i32>,
 
-    #[clap(short = 'p', long = "public-server", value_name = "host:port")]
+    #[arg(short = 'p', long = "public-server", value_name = "host:port")]
     /// Spu server for external communication
     pub bind_public: Option<String>,
 
-    #[clap(short = 'v', long = "private-server", value_name = "host:port")]
+    #[arg(short = 'v', long = "private-server", value_name = "host:port")]
     /// Spu server for internal cluster communication
     pub bind_private: Option<String>,
 
     /// Address of the SC Server
-    #[clap(long, value_name = "host:port", env = "FLV_SC_PRIVATE_HOST")]
+    #[arg(long, value_name = "host:port", env = "FLV_SC_PRIVATE_HOST")]
     pub sc_addr: Option<String>,
 
-    #[clap(long, value_name = "dir", env = "FLV_LOG_BASE_DIR")]
+    #[arg(long, value_name = "dir", env = "FLV_LOG_BASE_DIR")]
     pub log_base_dir: Option<String>,
 
-    #[clap(long, value_name = "log size", env = "FLV_LOG_SIZE")]
+    #[arg(long, value_name = "log size", env = "FLV_LOG_SIZE")]
     pub log_size: Option<String>,
 
-    #[clap(long, value_name = "integer", env = "FLV_LOG_INDEX_MAX_BYTES")]
+    #[arg(long, value_name = "integer", env = "FLV_LOG_INDEX_MAX_BYTES")]
     pub index_max_bytes: Option<u32>,
 
-    #[clap(long, value_name = "integer", env = "FLV_LOG_INDEX_MAX_INTERVAL_BYTES")]
+    #[arg(long, value_name = "integer", env = "FLV_LOG_INDEX_MAX_INTERVAL_BYTES")]
     pub index_max_interval_bytes: Option<u32>,
 
     /// max bytes to transfer between leader and follower
-    #[clap(
+    #[arg(
         long,
         value_name = "integer",
         env = "FLV_PEER_MAX_BYTES",
@@ -59,13 +59,20 @@ pub struct SpuOpt {
     )]
     pub peer_max_bytes: u32,
 
+    #[arg(
+        long,
+        value_name = "integer",
+        env = "FLV_SMART_ENGINE_MAX_MEMORY_BYTES"
+    )]
+    pub smart_engine_max_memory: Option<usize>,
+
     #[clap(flatten)]
     tls: TlsConfig,
 }
 
 impl SpuOpt {
     /// Validate SPU (Streaming Processing Unit) cli inputs and generate SpuConfig
-    fn get_spu_config(self) -> Result<(SpuConfig, Option<(TlsAcceptor, String)>), IoError> {
+    fn get_spu_config(self) -> Result<(SpuConfig, Option<(TlsAcceptor, String)>)> {
         let tls_acceptor = self.try_build_tls_acceptor()?;
         let (spu_config, tls_addr_opt) = self.as_spu_config()?;
         let tls_config = tls_acceptor.map(|it| (it, tls_addr_opt.unwrap()));
@@ -73,7 +80,7 @@ impl SpuOpt {
     }
 
     #[allow(clippy::wrong_self_convention)]
-    fn as_spu_config(self) -> Result<(SpuConfig, Option<String>), IoError> {
+    fn as_spu_config(self) -> Result<(SpuConfig, Option<String>)> {
         use std::path::PathBuf;
 
         let mut config = SpuConfig {
@@ -123,12 +130,10 @@ impl SpuOpt {
             let proxy_addr = config.public_endpoint.clone();
             debug!("using tls proxy addr: {}", proxy_addr);
             tls_port = Some(proxy_addr);
-            config.public_endpoint = self.tls.bind_non_tls_public.ok_or_else(|| {
-                IoError::new(
-                    ErrorKind::NotFound,
-                    "non tls addr for public must be specified",
-                )
-            })?;
+            config.public_endpoint = self
+                .tls
+                .bind_non_tls_public
+                .ok_or_else(|| anyhow!("non tls addr for public must be specified"))?;
         }
 
         if let Some(private_addr) = self.bind_private {
@@ -138,10 +143,18 @@ impl SpuOpt {
 
         config.peer_max_bytes = self.peer_max_bytes;
 
+        if let Some(smart_engine_max_memory) = self.smart_engine_max_memory {
+            info!(
+                "overriding smart engine max memory: {}",
+                smart_engine_max_memory
+            );
+            config.smart_engine.store_max_memory = smart_engine_max_memory;
+        }
+
         Ok((config, tls_port))
     }
 
-    fn try_build_tls_acceptor(&self) -> Result<Option<TlsAcceptor>, IoError> {
+    fn try_build_tls_acceptor(&self) -> Result<Option<TlsAcceptor>> {
         let tls_config = &self.tls;
         if !tls_config.tls {
             return Ok(None);
@@ -150,26 +163,24 @@ impl SpuOpt {
         let server_crt_path = tls_config
             .server_cert
             .as_ref()
-            .ok_or_else(|| IoError::new(ErrorKind::NotFound, "missing server cert"))?;
+            .ok_or_else(|| anyhow!("missing server cert"))?;
         let server_key_path = tls_config
             .server_key
             .as_ref()
-            .ok_or_else(|| IoError::new(ErrorKind::NotFound, "missing server key"))?;
+            .ok_or_else(|| anyhow!("missing server key"))?;
 
         let builder = (if tls_config.enable_client_cert {
             let ca_path = tls_config
                 .ca_cert
                 .as_ref()
-                .ok_or_else(|| IoError::new(ErrorKind::NotFound, "missing ca cert"))?;
-            TlsAcceptor::builder()
-                .map_err(|err| err.into_io_error())?
-                .with_ca_from_pem_file(ca_path)
-                .map_err(|err| err.into_io_error())?
+                .ok_or_else(|| anyhow!("missing ca cert"))?;
+            TlsAcceptor::builder()?
+                .with_ssl_verify_mode(SslVerifyMode::PEER)
+                .with_ca_from_pem_file(ca_path)?
         } else {
-            TlsAcceptor::builder().map_err(|err| err.into_io_error())?
+            TlsAcceptor::builder()?
         })
-        .with_certifiate_and_key_from_pem_files(server_crt_path, server_key_path)
-        .map_err(|err| err.into_io_error())?;
+        .with_certifiate_and_key_from_pem_files(server_crt_path, server_key_path)?;
 
         Ok(Some(builder.build()))
     }
@@ -186,15 +197,13 @@ impl SpuOpt {
 }
 
 /// find spu id from env, if not found, return error
-fn find_spu_id_from_env() -> Result<SpuId, IoError> {
+fn find_spu_id_from_env() -> Result<SpuId> {
     use std::env;
     use fluvio_types::defaults::FLV_SPU_ID;
 
     if let Ok(id_str) = env::var(FLV_SPU_ID) {
         debug!("found spu id from env: {}", id_str);
-        let id = id_str
-            .parse()
-            .map_err(|err| IoError::new(ErrorKind::InvalidInput, format!("spu-id: {}", err)))?;
+        let id = id_str.parse().map_err(|err| anyhow!("spu-id: {err}"))?;
         Ok(id)
     } else {
         // try get special env SPU which has form of {}-{id} when in as in-cluster config
@@ -202,32 +211,25 @@ fn find_spu_id_from_env() -> Result<SpuId, IoError> {
             info!("extracting SPU from: {}", spu_name);
             let spu_tokens: Vec<&str> = spu_name.split('-').collect();
             if spu_tokens.len() < 2 {
-                Err(IoError::new(
-                    ErrorKind::InvalidInput,
-                    format!("SPU is invalid format: {} bailing out", spu_name),
-                ))
+                Err(anyhow!("SPU is invalid format: {spu_name} bailing out"))
             } else {
                 let spu_token = spu_tokens[spu_tokens.len() - 1];
-                let id: SpuId = spu_token.parse().map_err(|err| {
-                    IoError::new(ErrorKind::InvalidInput, format!("invalid spu id: {}", err))
-                })?;
+                let id: SpuId = spu_token
+                    .parse()
+                    .map_err(|err| anyhow!("invalid spu id: {err}"))?;
                 info!("found SPU INDEX ID: {}", id);
 
                 // now we get SPU_MIN which tells min
                 let spu_min_var = env::var("SPU_MIN").unwrap_or_else(|_| "0".to_owned());
                 debug!("found SPU MIN ID: {}", spu_min_var);
-                let base_id: SpuId = spu_min_var.parse().map_err(|err| {
-                    IoError::new(
-                        ErrorKind::InvalidInput,
-                        format!("invalid spu min id: {}", err),
-                    )
-                })?;
+                let base_id: SpuId = spu_min_var
+                    .parse()
+                    .map_err(|err| anyhow!("invalid spu min id: {err}"))?;
                 Ok(id + base_id)
             }
         } else {
-            Err(IoError::new(
-                ErrorKind::NotFound,
-                format!("SPU index id not found from SPU_INDEX or {FLV_SPU_ID}"),
+            Err(anyhow!(
+                "SPU index id not found from SPU_INDEX or {FLV_SPU_ID}"
             ))
         }
     }
@@ -237,23 +239,23 @@ fn find_spu_id_from_env() -> Result<SpuId, IoError> {
 #[derive(Debug, Parser, Default)]
 struct TlsConfig {
     /// enable tls
-    #[clap(long)]
+    #[arg(long)]
     pub tls: bool,
 
     /// TLS: path to server certificate
-    #[clap(long)]
+    #[arg(long)]
     pub server_cert: Option<String>,
-    #[clap(long)]
+    #[arg(long)]
     /// TLS: path to server private key
     pub server_key: Option<String>,
     /// TLS: enable client cert
-    #[clap(long)]
+    #[arg(long)]
     pub enable_client_cert: bool,
     /// TLS: path to ca cert, required when client cert is enabled
-    #[clap(long)]
+    #[arg(long)]
     pub ca_cert: Option<String>,
 
-    #[clap(long)]
+    #[arg(long)]
     /// TLS: address of non tls public service, required
     pub bind_non_tls_public: Option<String>,
 }

@@ -3,6 +3,7 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::borrow::Cow;
 use std::process::Child;
@@ -11,7 +12,14 @@ use std::time::Duration;
 use std::env;
 use std::time::SystemTime;
 
+use anyhow::{anyhow, Result};
 use derive_builder::Builder;
+use k8_client::meta_client::NameSpace;
+use tracing::{info, warn, error, debug, instrument};
+use once_cell::sync::Lazy;
+use tempfile::NamedTempFile;
+use semver::Version;
+
 use fluvio::FluvioAdmin;
 use fluvio_controlplane_metadata::spg::SpuConfig;
 use fluvio_sc_schema::objects::CommonCreateRequest;
@@ -19,15 +27,9 @@ use fluvio_types::defaults::TLS_CLIENT_SECRET_NAME;
 use fluvio_types::defaults::TLS_SERVER_SECRET_NAME;
 use k8_client::SharedK8Client;
 use k8_client::load_and_share;
-use k8_metadata_client::NameSpace;
 use k8_types::K8Obj;
 use k8_types::app::deployment::DeploymentSpec;
-use tracing::{info, warn, debug, instrument};
-use once_cell::sync::Lazy;
-use tempfile::NamedTempFile;
-use semver::Version;
-
-use fluvio::{Fluvio, FluvioConfig};
+use fluvio::{Fluvio, FluvioClusterConfig};
 use fluvio::metadata::spg::SpuGroupSpec;
 use fluvio::metadata::spu::SpuSpec;
 use fluvio::config::{TlsPolicy, TlsConfig, TlsPaths, ConfigFile};
@@ -38,7 +40,7 @@ use k8_types::core::service::{LoadBalancerType, ServiceSpec, TargetPort};
 use k8_types::core::node::{NodeSpec, NodeAddress};
 use fluvio_command::CommandExt;
 
-use crate::check::ClusterCheckError;
+use crate::InstallationType;
 use crate::check::{AlreadyInstalled, SysChartCheck};
 use crate::error::K8InstallError;
 use crate::progress::ProgressBarFactory;
@@ -46,10 +48,10 @@ use crate::render::ProgressRenderedText;
 use crate::render::ProgressRenderer;
 use crate::start::common::check_crd;
 use crate::tls_config_to_cert_paths;
-use crate::{ClusterError, StartStatus, DEFAULT_NAMESPACE, ClusterChecker};
+use crate::{StartStatus, DEFAULT_NAMESPACE, ClusterChecker};
 use crate::charts::{ChartConfig, ChartInstaller};
 use crate::UserChartLocation;
-use crate::progress::{InstallProgressMessage};
+use crate::progress::InstallProgressMessage;
 
 use super::constants::*;
 use super::common::try_connect_to_sc;
@@ -88,7 +90,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .namespace("my-namespace")
     ///     .build()?;
@@ -111,7 +113,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .image_tag("0.6.0")
     ///     .build()?;
@@ -143,7 +145,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .image_registry("localhost:5000/infinyon")
     ///     .build()?;
@@ -169,7 +171,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .group_name("orange")
     ///     .build()?;
@@ -185,7 +187,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .spu_replicas(2)
     ///     .build()?;
@@ -200,7 +202,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .rust_log("debug")
     ///     .build()?;
@@ -226,7 +228,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .authorization_config_map("authorization")
     ///     .build()?;
@@ -242,7 +244,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .save_profile(true)
     ///     .build()?;
@@ -259,7 +261,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .install_sys(false)
     ///     .build()?;
@@ -277,7 +279,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .skip_checks(true)
     ///     .build()?;
@@ -309,9 +311,6 @@ pub struct ClusterConfig {
 
     #[builder(setter(into), default)]
     spu_config: SpuConfig,
-
-    #[builder(setter(into), default)]
-    connector_prefixes: Vec<String>,
 
     #[builder(setter(into), default = "TLS_SERVER_SECRET_NAME.to_string()")]
     tls_server_secret_name: String,
@@ -351,7 +350,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// use semver::Version;
     /// let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap()).build()?;
     /// # Ok(())
@@ -359,7 +358,7 @@ impl ClusterConfigBuilder {
     /// ```
     ///
     /// [`ClusterInstaller`]: ./struct.ClusterInstaller.html
-    pub fn build(&self) -> Result<ClusterConfig, ClusterError> {
+    pub fn build(&self) -> Result<ClusterConfig> {
         let config = self
             .build_impl()
             .map_err(|err| K8InstallError::MissingRequiredConfig(err.to_string()))?;
@@ -373,7 +372,7 @@ impl ClusterConfigBuilder {
     /// previously assigned.
     ///
     /// - Use the git hash of HEAD as the image_tag
-    pub fn development(&mut self) -> Result<&mut Self, ClusterError> {
+    pub fn development(&mut self) -> Result<&mut Self> {
         // look at git version instead of compiling git version which may not be same as image version
         let git_version_output = Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -381,7 +380,7 @@ impl ClusterConfigBuilder {
             .expect("should run 'git rev-parse HEAD' to get git hash");
         let git_hash = String::from_utf8(git_version_output.stdout)
             .expect("should read 'git' stdout to find hash");
-        println!("using development git hash: {}", git_hash);
+        println!("using development git hash: {git_hash}");
         self.image_tag(git_hash.trim());
         Ok(self)
     }
@@ -400,7 +399,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .local_chart("./k8-util/helm")
     ///     .build()?;
@@ -409,7 +408,7 @@ impl ClusterConfigBuilder {
     /// ```
     ///
     /// [`remote_chart`]: ./struct.ClusterInstallerBuilder#method.remote_chart
-    pub fn local_chart<S: Into<PathBuf>>(&mut self, local_chart_location: S) -> &mut Self {
+    pub fn local_chart(&mut self, local_chart_location: impl Into<PathBuf>) -> &mut Self {
         let user_chart_location = UserChartLocation::Local(local_chart_location.into());
         debug!(?user_chart_location, "setting local chart");
         self.chart_location(user_chart_location);
@@ -429,7 +428,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .remote_chart("https://charts.fluvio.io")
     ///     .build()?;
@@ -438,7 +437,7 @@ impl ClusterConfigBuilder {
     /// ```
     ///
     /// [`local_chart`]: ./struct.ClusterInstallerBuilder#method.local_chart
-    pub fn remote_chart<S: Into<String>>(&mut self, remote_chart_location: S) -> &mut Self {
+    pub fn remote_chart(&mut self, remote_chart_location: impl Into<String>) -> &mut Self {
         self.chart_location(UserChartLocation::Remote(remote_chart_location.into()));
         self
     }
@@ -451,7 +450,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// use std::path::PathBuf;
     /// use fluvio::config::TlsPaths;
     /// use semver::Version;
@@ -476,11 +475,7 @@ impl ClusterConfigBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn tls<C: Into<TlsPolicy>, S: Into<TlsPolicy>>(
-        &mut self,
-        client: C,
-        server: S,
-    ) -> &mut Self {
+    pub fn tls(&mut self, client: impl Into<TlsPolicy>, server: impl Into<TlsPolicy>) -> &mut Self {
         let client_policy = client.into();
         let server_policy = server.into();
 
@@ -516,7 +511,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterError, ClusterConfig};
-    /// # fn example() -> Result<(), ClusterError> {
+    /// # fn example() -> anyhow::Result<()> {
     /// use semver::Version;
     /// let custom_namespace = false;
     /// let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap())
@@ -552,8 +547,8 @@ impl ClusterConfigBuilder {
 /// # Example
 ///
 /// ```
-/// # use fluvio_cluster::{ClusterInstaller, ClusterConfig, ClusterError};
-/// # async fn example() -> Result<(), ClusterError> {
+/// # use fluvio_cluster::{ClusterInstaller, ClusterConfig};
+/// # async fn example() -> anyhow::Result<()> {
 /// use semver::Version;
 /// let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap()).build()?;
 /// let installer = ClusterInstaller::from_config(config)?;
@@ -579,15 +574,22 @@ impl ClusterInstaller {
     /// # Example
     ///
     /// ```
-    /// # use fluvio_cluster::{ClusterConfig, ClusterError, ClusterInstaller};
-    /// # fn example(config: ClusterConfig) -> Result<(), ClusterError> {
+    /// # use fluvio_cluster::{ClusterConfig, ClusterInstaller};
+    /// # fn example(config: ClusterConfig) -> anyhow::Result<()> {
     /// let installer = ClusterInstaller::from_config(config)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn from_config(config: ClusterConfig) -> Result<Self, ClusterError> {
+    pub fn from_config(config: ClusterConfig) -> Result<Self> {
+        let kube_client = load_and_share().map_err(|k8_err| {
+            let msg =
+                format!("unable to load kubectl context to access k8 cluster\nError: {k8_err:?}\n");
+            error!(target: "kubectl", msg);
+            anyhow!(msg)
+        })?;
+
         Ok(Self {
-            kube_client: load_and_share().map_err(K8InstallError::K8ClientError)?,
+            kube_client,
             pb_factory: ProgressBarFactory::new(config.hide_spinner),
             config,
         })
@@ -603,7 +605,7 @@ impl ClusterInstaller {
     ///
     /// [`system_chart`]: ./struct.ClusterInstaller.html#method.system_chart
     #[instrument(skip(self))]
-    pub async fn preflight_check(&self, fix: bool) -> Result<(), ClusterCheckError> {
+    pub async fn preflight_check(&self, fix: bool) -> Result<()> {
         const DISPATCHER_WAIT: &str = "FLV_DISPATCHER_WAIT";
 
         // HACK. set FLV_DISPATCHER if not set
@@ -648,7 +650,7 @@ impl ClusterInstaller {
         skip(self),
         fields(namespace = &*self.config.namespace),
     )]
-    pub async fn install_fluvio(&self) -> Result<StartStatus, K8InstallError> {
+    pub async fn install_fluvio(&self) -> Result<StartStatus> {
         if !self.config.skip_checks {
             self.preflight_check(true).await?;
         }
@@ -656,16 +658,18 @@ impl ClusterInstaller {
         self.install_app().await?;
 
         // before we do let's try make sure SPU are installed.
-        check_crd(self.kube_client.clone())
-            .await
-            .map_err(K8InstallError::from)?;
+        check_crd(self.kube_client.clone()).await?;
 
         let pb = self.pb_factory.create()?;
 
         let sc_service = self.discover_sc_service().await?;
         let (external_host, external_port) =
             self.discover_sc_external_host_and_port(&sc_service).await?;
-        let external_host_and_port = format!("{}:{}", external_host, external_port);
+        let external_host_and_port = format!("{external_host}:{external_port}");
+
+        if self.config.save_profile {
+            self.update_profile(&external_host_and_port)?;
+        }
 
         self.wait_for_sc_availability().await?;
 
@@ -673,29 +677,22 @@ impl ClusterInstaller {
             pb.println("Using K8 port forwarding for install".to_string());
             let (install_host, install_port, pf_process) =
                 self.start_sc_port_forwarding(&sc_service, &pb).await?;
-            (
-                format!("{}:{}", install_host, install_port),
-                Some(pf_process),
-            )
+            (format!("{install_host}:{install_port}"), Some(pf_process))
         } else {
             (external_host_and_port.clone(), None)
         };
 
-        let cluster_config = FluvioConfig::new(install_host_and_port.clone())
+        let cluster_config = FluvioClusterConfig::new(install_host_and_port.clone())
             .with_tls(self.config.client_tls_policy.clone());
         pb.set_message("🔎 Discovering Fluvio SC");
         let fluvio =
             match try_connect_to_sc(&cluster_config, &self.config.platform_version, &pb).await {
                 Some(fluvio) => fluvio,
-                None => return Err(K8InstallError::SCServiceTimeout),
+                None => return Err(K8InstallError::SCServiceTimeout.into()),
             };
-        pb.println(format!("✅ Connected to SC: {}", install_host_and_port));
+        pb.println(format!("✅ Connected to SC: {install_host_and_port}"));
         pb.finish_and_clear();
         drop(pb);
-
-        if self.config.save_profile {
-            self.update_profile(&external_host_and_port)?;
-        }
 
         // Create a managed SPU cluster
         self.create_managed_spu_group(&fluvio).await?;
@@ -718,7 +715,7 @@ impl ClusterInstaller {
 
     /// Install Fluvio Core chart on the configured cluster
     #[instrument(skip(self))]
-    async fn install_app(&self) -> Result<(), K8InstallError> {
+    async fn install_app(&self) -> Result<()> {
         debug!(
             "Installing fluvio with the following configuration: {:#?}",
             &self.config
@@ -744,13 +741,6 @@ impl ClusterInstaller {
 
         if let Some(tag) = &self.config.image_tag {
             install_settings.push(("image.tag", Cow::Borrowed(tag)));
-        }
-
-        if !self.config.connector_prefixes.is_empty() {
-            install_settings.push((
-                "connectorPrefixes",
-                Cow::Owned(self.config.connector_prefixes.join(" ")),
-            ));
         }
 
         // If configured with TLS, copy certs to server
@@ -800,11 +790,7 @@ impl ClusterInstaller {
                         node_addr
                             .iter()
                             .find(|a| a.r#type == "InternalIP")
-                            .ok_or_else(|| {
-                                K8InstallError::Other(
-                                    "No nodes with ExternalIP or InternalIP set".into(),
-                                )
-                            })?
+                            .ok_or_else(|| anyhow!("No nodes with ExternalIP or InternalIP set"))?
                     }
                 };
                 anode.address.clone()
@@ -822,8 +808,17 @@ impl ClusterInstaller {
 
             debug!(?helm_lb_config, "helm_lb_config");
 
-            serde_yaml::to_writer(&np_addr_fd, &helm_lb_config)
-                .map_err(|err| K8InstallError::Other(err.to_string()))?;
+            let helm_values: String = serde_yaml::to_string(&helm_lb_config).map_err(|e| {
+                debug!(
+                    ?helm_lb_config,
+                    "couldn't serialize helm load balancer config"
+                );
+                anyhow!("couldn't serialize helm yaml {e:?}")
+            })?;
+            debug!(%helm_values, "helm_values");
+            write!(&np_addr_fd, "{helm_values}")
+                .map_err(|e| anyhow!("Error writing helm values file\n{e}"))?;
+
             Some((np_addr_fd, np_conf_path))
         } else {
             None
@@ -888,11 +883,7 @@ impl ClusterInstaller {
     }
 
     /// Uploads TLS secrets to Kubernetes
-    fn upload_tls_secrets(
-        &self,
-        server_tls: &TlsConfig,
-        client_tls: &TlsConfig,
-    ) -> Result<(), K8InstallError> {
+    fn upload_tls_secrets(&self, server_tls: &TlsConfig, client_tls: &TlsConfig) -> Result<()> {
         let server_paths: Cow<TlsPaths> = tls_config_to_cert_paths(server_tls)?;
         let client_paths: Cow<TlsPaths> = tls_config_to_cert_paths(client_tls)?;
         self.upload_tls_secrets_from_files(server_paths.as_ref(), client_paths.as_ref())?;
@@ -905,7 +896,7 @@ impl ClusterInstaller {
         &self,
         service: &K8Obj<ServiceSpec>,
         pb: &ProgressRenderer,
-    ) -> Result<(String, u16, Child), K8InstallError> {
+    ) -> Result<(String, u16, Child)> {
         let pf_host_name = "localhost";
 
         let pf_port = portpicker::pick_unused_port().expect("No local ports available");
@@ -915,8 +906,8 @@ impl ClusterInstaller {
             .arg("-n")
             .arg(&service.metadata.namespace)
             .arg("port-forward")
-            .arg(format!("service/{}", FLUVIO_SC_SERVICE))
-            .arg(format!("{}:{}", pf_port, target_port))
+            .arg(format!("service/{FLUVIO_SC_SERVICE}"))
+            .arg(format!("{pf_port}:{target_port}"))
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
             .spawn()
@@ -934,10 +925,10 @@ impl ClusterInstaller {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = String::new();
                 let _ = reader.read_to_string(&mut buf)?;
-                let error_msg = format!("kubectl port-forward error: {}", buf);
+                let error_msg = format!("kubectl port-forward error: {buf}");
                 pb.println(error_msg);
 
-                return Err(K8InstallError::PortForwardingFailed(status));
+                return Err(K8InstallError::PortForwardingFailed(status).into());
             }
             None => {
                 info!("Port forwarding process started");
@@ -949,7 +940,7 @@ impl ClusterInstaller {
 
     /// Looks up the external address of a Fluvio SC instance in the given namespace
     #[instrument(skip(self))]
-    async fn discover_sc_service(&self) -> Result<K8Obj<ServiceSpec>, K8InstallError> {
+    async fn discover_sc_service(&self) -> Result<K8Obj<ServiceSpec>> {
         use tokio::select;
         use futures_util::stream::StreamExt;
 
@@ -965,7 +956,7 @@ impl ClusterInstaller {
             select! {
                 _ = &mut timer => {
                     debug!(timer = *MAX_SC_SERVICE_WAIT,"timer expired");
-                    return Err(K8InstallError::SCServiceTimeout)
+                    return Err(K8InstallError::SCServiceTimeout.into())
                 },
                 service_next = service_stream.next() => {
                     if let Some(service_watches) = service_next {
@@ -987,7 +978,7 @@ impl ClusterInstaller {
                         }
                     } else {
                         debug!("service stream ended");
-                        return Err(K8InstallError::SCServiceTimeout)
+                        return Err(K8InstallError::SCServiceTimeout.into())
                     }
                 }
             }
@@ -996,7 +987,7 @@ impl ClusterInstaller {
 
     /// Waits for SC pod
     #[instrument(skip(self))]
-    async fn wait_for_sc_availability(&self) -> Result<K8Obj<DeploymentSpec>, K8InstallError> {
+    async fn wait_for_sc_availability(&self) -> Result<K8Obj<DeploymentSpec>> {
         use tokio::select;
         use futures_util::stream::StreamExt;
 
@@ -1012,7 +1003,7 @@ impl ClusterInstaller {
             select! {
                 _ = &mut timer => {
                     debug!(timer = *MAX_SC_DEPLOYMENT_AVAILABLE_WAIT, "timer expired");
-                    return Err(K8InstallError::SCDeploymentTimeout)
+                    return Err(K8InstallError::SCDeploymentTimeout.into())
                 },
                 deployment_next = deployment_stream.next() => {
                     if let Some(deployment_watches) = deployment_next {
@@ -1039,7 +1030,7 @@ impl ClusterInstaller {
                         }
                     } else {
                         debug!("deployment stream ended");
-                        return Err(K8InstallError::SCDeploymentTimeout)
+                        return Err(K8InstallError::SCDeploymentTimeout.into())
                     }
                 }
             }
@@ -1051,7 +1042,7 @@ impl ClusterInstaller {
     async fn discover_sc_external_host_and_port(
         &self,
         service: &K8Obj<ServiceSpec>,
-    ) -> Result<(String, u16), K8InstallError> {
+    ) -> Result<(String, u16)> {
         let target_port = ClusterInstaller::target_port_for_service(service)?;
 
         let node_port = service
@@ -1069,13 +1060,12 @@ impl ClusterInstaller {
             .spec
             .r#type
             .as_ref()
-            .ok_or_else(|| K8InstallError::Other("Load Balancer Type".into()))?;
+            .ok_or_else(|| anyhow!("Load Balancer Type"))?;
 
         match k8_load_balancer_type {
             LoadBalancerType::ClusterIP => Ok((service.spec.cluster_ip.clone(), target_port)),
             LoadBalancerType::NodePort => {
-                let node_port = node_port
-                    .ok_or_else(|| K8InstallError::Other("Expecting a NodePort port".into()))?;
+                let node_port = node_port.ok_or_else(|| anyhow!("Expecting a NodePort port"))?;
 
                 let host_addr = if let Some(addr) = &self.config.proxy_addr {
                     debug!(?addr, "using proxy");
@@ -1102,9 +1092,7 @@ impl ClusterInstaller {
                                 .iter()
                                 .find(|a| a.r#type == "InternalIP")
                                 .ok_or_else(|| {
-                                    K8InstallError::Other(
-                                        "No nodes with ExternalIP or InternalIP set".into(),
-                                    )
+                                    anyhow!("No nodes with ExternalIP or InternalIP set",)
                                 })?
                                 .address
                         }
@@ -1127,7 +1115,7 @@ impl ClusterInstaller {
                     debug!(%ingress_host,"found lb address");
                     Ok((ingress_host.to_owned(), target_port))
                 } else {
-                    Err(K8InstallError::SCIngressNotValid)
+                    Err(K8InstallError::SCIngressNotValid.into())
                 }
             }
             LoadBalancerType::ExternalName => {
@@ -1136,7 +1124,7 @@ impl ClusterInstaller {
         }
     }
 
-    fn target_port_for_service(service: &K8Obj<ServiceSpec>) -> Result<u16, K8InstallError> {
+    fn target_port_for_service(service: &K8Obj<ServiceSpec>) -> Result<u16> {
         service
             .spec
             .ports
@@ -1147,16 +1135,12 @@ impl ClusterInstaller {
                 None => None,
             })
             .next()
-            .ok_or_else(|| K8InstallError::Other("target port should be there".into()))
+            .ok_or_else(|| anyhow!("target port should be there"))
     }
 
     /// Wait until all SPUs are ready and have ingress
     #[instrument(skip(self, admin))]
-    async fn wait_for_spu(
-        &self,
-        admin: &FluvioAdmin,
-        pb: &ProgressRenderer,
-    ) -> Result<bool, K8InstallError> {
+    async fn wait_for_spu(&self, admin: &FluvioAdmin, pb: &ProgressRenderer) -> Result<bool> {
         let expected_spu = self.config.spu_replicas as usize;
         let timeout_duration = Duration::from_secs(*MAX_PROVISION_TIME_SEC as u64);
         let time = SystemTime::now();
@@ -1200,7 +1184,7 @@ impl ClusterInstaller {
             }
         }
 
-        Err(K8InstallError::SPUTimeout)
+        Err(K8InstallError::SPUTimeout.into())
     }
 
     /// Install server-side TLS by uploading secrets to kubernetes
@@ -1209,7 +1193,7 @@ impl ClusterInstaller {
         &self,
         server_paths: &TlsPaths,
         client_paths: &TlsPaths,
-    ) -> Result<(), K8InstallError> {
+    ) -> Result<()> {
         let ca_cert = server_paths
             .ca_cert
             .to_str()
@@ -1296,9 +1280,9 @@ impl ClusterInstaller {
     }
 
     /// Updates the Fluvio configuration with the newly installed cluster info.
-    fn update_profile(&self, external_addr: &str) -> Result<(), K8InstallError> {
+    fn update_profile(&self, external_addr: &str) -> Result<()> {
         let pb = self.pb_factory.create()?;
-        pb.set_message(format!("Creating K8 profile for: {}", external_addr));
+        pb.set_message(format!("Creating K8 profile for: {external_addr}"));
 
         let profile_name = self.compute_profile_name()?;
         let mut config_file = ConfigFile::load_default_or_new()?;
@@ -1307,20 +1291,22 @@ impl ClusterInstaller {
             external_addr,
             &self.config.client_tls_policy,
         )?;
+        let config = config_file.mut_config().current_cluster_mut()?;
+        InstallationType::K8.save_to(config)?;
+        config_file.save()?;
+
         pb.println(InstallProgressMessage::ProfileSet.msg());
         pb.finish_and_clear();
         Ok(())
     }
 
     /// Determines a profile name from the name of the active Kubernetes context
-    fn compute_profile_name(&self) -> Result<String, K8InstallError> {
+    fn compute_profile_name(&self) -> Result<String> {
         let k8_config = K8Config::load()?;
 
         let kc_config = match k8_config {
             K8Config::Pod(_) => {
-                return Err(K8InstallError::Other(
-                    "Pod config is not valid here".to_owned(),
-                ));
+                return Err(anyhow!("Pod config is not valid here"));
             }
             K8Config::KubeConfig(config) => config,
         };
@@ -1328,16 +1314,16 @@ impl ClusterInstaller {
         kc_config
             .config
             .current_context()
-            .ok_or_else(|| K8InstallError::Other("No context fount".to_owned()))
+            .ok_or_else(|| anyhow!("No context fount"))
             .map(|ctx| ctx.name.to_owned())
     }
 
     /// Provisions a SPU group for the given cluster according to internal config
     #[instrument(skip(self, fluvio))]
-    async fn create_managed_spu_group(&self, fluvio: &Fluvio) -> Result<(), K8InstallError> {
+    async fn create_managed_spu_group(&self, fluvio: &Fluvio) -> Result<()> {
         let pb = self.pb_factory.create()?;
         let spg_name = self.config.group_name.clone();
-        pb.set_message(format!("📝 Checking for existing SPU Group: {}", spg_name));
+        pb.set_message(format!("📝 Checking for existing SPU Group: {spg_name}"));
         let admin = fluvio.admin().await;
         let lists = admin.all::<SpuGroupSpec>().await?;
         if lists.is_empty() {
@@ -1362,7 +1348,7 @@ impl ClusterInstaller {
                     spu_spec,
                 )
                 .await?;
-            pb.set_message(format!("🤖 Spu Group {} started", spg_name));
+            pb.set_message(format!("🤖 Spu Group {spg_name} started"));
         } else {
             pb.set_message("SPU Group Exists,skipping");
             // wait few seconds, this is hack to wait for spu to be terminated

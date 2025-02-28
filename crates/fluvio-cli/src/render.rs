@@ -11,8 +11,8 @@ pub enum ProgressRenderer {
 impl ProgressRenderer {
     pub fn println(&self, msg: &str) {
         match self {
-            ProgressRenderer::Std => println!("{}", msg),
-            ProgressRenderer::Indicatiff(pb) => pb.println(msg),
+            ProgressRenderer::Std => println!("{msg}"),
+            ProgressRenderer::Indicatiff(pb) => pb.suspend(|| println!("{msg}")),
         }
     }
 }

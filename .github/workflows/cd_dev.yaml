@@ -4,7 +4,7 @@ name:  CD_Dev
 permissions:
   contents: read
 
-concurrency: 
+concurrency:
   group: cd_dev
   cancel-in-progress: true
 
@@ -13,10 +13,10 @@ on:
 #    branches: [master]
 #  pull_request:
 #    branches: [master]
-  workflow_run:
-    workflows: [Publish]
-    branches: [master]
-    types: [completed]
+
+  repository_dispatch:
+    types: [ publish-success ]
+
   workflow_dispatch:
     inputs:
       alt_version:
@@ -29,9 +29,39 @@ env:
   K3D_VERSION: v5.4.1
 
 jobs:
+  setup:
+    name: Setup inputs
+    runs-on: ubuntu-latest
+    outputs:
+      pub_ref: ${{ steps.out.outputs.pub_ref }}
+      pub_sha: ${{ steps.out.outputs.pub_sha }}
+    steps:
+      - name: Default Info
+        run: |
+          echo event_name ${{ github.event_name }}
+          echo "pub_ref=${{ github.ref }}" >> $GITHUB_ENV
+          echo "pub_sha=${{ github.sha }}" >> $GITHUB_ENV
+      - name: Received ci-success event
+        if: github.event_name == 'repository_dispatch'
+        id: recv
+        run: |
+          echo REF ${{ github.event.client_payload.ref }}
+          echo SHA ${{ github.event.client_payload.sha }}
+          echo "pub_ref=${{ github.event.client_payload.ref }}" >> $GITHUB_ENV
+          echo "pub_sha=${{ github.event.client_payload.sha }}" >> $GITHUB_ENV
+      - name: Output Setup
+        # merge optional step output
+        id: out
+        run: |
+          echo REF ${{ env.pub_ref }}
+          echo SHA ${{ env.pub_sha }}
+          echo "pub_ref=${{ env.pub_ref }}" >> $GITHUB_OUTPUT
+          echo "pub_sha=${{ env.pub_sha }}" >> $GITHUB_OUTPUT
+
   # Perform E2E sanity checks
   verify_latest_releases:
-    name: Verify latest run ${{ matrix.run }} (${{ matrix.cluster_type }}) on (${{ matrix.os }}), 
+    name: Verify latest run ${{ matrix.run }} (${{ matrix.cluster_type }}) on (${{ matrix.os }})
+    needs: setup
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -43,26 +73,21 @@ jobs:
       SLEEP: 10
       TOPIC: foobar
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout ${{ needs.setup.outputs.pub_sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.pub_sha }}
       - name: Set up K3d for Ubuntu
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.cluster_type == 'k8' }}
         run: |
           curl -s https://raw.githubusercontent.com/rancher/k3d/main/install.sh | TAG=${{ env.K3D_VERSION }} bash
       - name: Set up K8 for ubuntu(kind)
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.cluster_type == 'k8' }}
         run: ./k8-util/cluster/reset-k3d.sh
-      - name: Install Docker for Mac
-        if: ${{ matrix.os == 'macos-12' }}
-        uses: docker-practice/actions-setup-docker@master
-      - name: Set up Kind for Mac
-        if: ${{ matrix.os == 'macos-12' }}
-        run: |
-          brew install kind
-          kind create cluster --config k8-util/cluster/kind.yaml
-      - name: Install Fluvio CLI
-        run: |
-          curl -fsS https://packages.fluvio.io/v1/install.sh | VERSION=latest bash
-          echo "$HOME/.fluvio/bin" >> $GITHUB_PATH
+      - name: Setup Fluvio
+        uses: infinyon/fluvio/.github/actions/setup-fluvio@master
+        with:
+          version: latest
       - name: Install Local Fluvio cluster
         timeout-minutes: 3
         if: ${{ matrix.cluster_type == 'local' }}
@@ -71,12 +96,8 @@ jobs:
         timeout-minutes: 3
         if: ${{ matrix.cluster_type == 'k8' }}
         run: |
-          if [[ ${{ matrix.os }} == 'macos-12' ]]; then
-              export PROXY="--proxy-addr  127.0.0.1"
-            else
-              export PROXY=""
-          fi
-          fluvio cluster start  --spu-storage-size 1 $PROXY
+          FLUVIO_IMAGE_TAG_STRATEGY=version-git \
+          fluvio cluster start --k8 --spu-storage-size 1
       - name: Run E2E Test
         timeout-minutes: 2
         run: |
@@ -88,15 +109,13 @@ jobs:
             date +"%Y-%m-%dT%H:%M:%S%z"
             echo foo | fluvio produce ${{ env.TOPIC }}
             fluvio consume ${{ env.TOPIC }} --start 0 -d | grep -F -w "foo"
-            # Delete the topic afterword but this looks to not work right now.
-            # fluvio topic delete "${{ env.TOPIC }}"
-
+            fluvio topic delete "${{ env.TOPIC }}"
       - name: Run diagnostics
         if: ${{ !success() }}
         timeout-minutes: 5
         run: fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: ${{ !success() }}
         with:
@@ -116,7 +135,7 @@ jobs:
   # Perform upgrade test from previous stable version to latest
   k8_cluster_upgrade:
     name: Kubernetes cluster upgrade test
-   # if: false
+    needs: setup
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -126,11 +145,14 @@ jobs:
     env:
       FLV_SOCKET_WAIT: 600
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout ${{ needs.setup.outputs.pub_sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.pub_sha }}
       - name: Setup K3d
         run: |
           curl -s https://raw.githubusercontent.com/rancher/k3d/main/install.sh | TAG=${{ env.K3D_VERSION }} bash
-          ./k8-util/cluster/reset-k3d.sh 
+          ./k8-util/cluster/reset-k3d.sh
       - name: Run upgrade test
         timeout-minutes: 10
         env:
@@ -141,9 +163,9 @@ jobs:
       - name: Run diagnostics
         if: ${{ !success() }}
         timeout-minutes: 5
-        run: ~/.fluvio/bin/fluvio cluster diagnostics --k8
+        run: ~/.fluvio/bin/fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: ${{ !success() }}
         with:
@@ -162,13 +184,17 @@ jobs:
   # Verify latest version of CLI
   installer_check:
     name: Installer check
+    needs: setup
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest]
         version: [latest]
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout ${{ needs.setup.outputs.pub_sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.pub_sha }}
       - name: Set the expected fluvio version
         run: |
           if [[ -z "${{ env.USE_VERSION }}" ]]; then
@@ -178,17 +204,15 @@ jobs:
           fi
           echo "EXPECTED_VERSION: $EXPECTED_VERSION"
 
-      - name: Curl Install - latest 
-        if: matrix.version == 'latest'
-        run: echo "VERSION=latest" | tee -a $GITHUB_ENV
-
-        # Utilizes the env var set in the previous step 
-      - name: Curl Install
-        run: curl -fsS https://packages.fluvio.io/v1/install.sh | bash | tee /tmp/installer.version
+      - name: Curl Install - latest
+        run: |
+          curl -fsS https://hub.infinyon.cloud/install/install.sh | \
+            FLUVIO_VERSION=${{ matrix.version }} bash | \
+            tee /tmp/installer.version
 
       - name: Verify installer output
         run: |
-            INSTALLER_VERSION=$(cat /tmp/installer.version | grep "Downloading Fluvio" | grep -v "channel" | awk '{print $5}')
+            INSTALLER_VERSION=$(cat /tmp/installer.version | grep "fluvio@" | awk '{print $4}' | cut -b 8-)
             if [ "$INSTALLER_VERSION" = "$EXPECTED_VERSION" ]; then
               echo "✅ Installer version check passed: $EXPECTED_VERSION";
             else
@@ -199,11 +223,10 @@ jobs:
             fi
 
   cli-platform-cross-version-test:
-    name: CLI (${{ matrix.cli_version }}) x Platform (${{ matrix.cluster_version }}) version test 
+    name: CLI (${{ matrix.cli_version }}) x Platform (${{ matrix.cluster_version }}) version test
+    needs: setup
     #if: false
     runs-on: ${{ matrix.os }}
-    env:
-      FLUVIO_BIN: ~/.fluvio/bin/fluvio
     strategy:
       fail-fast: false
       matrix:
@@ -211,37 +234,17 @@ jobs:
         cluster_version: [stable, latest]
         cli_version: [stable, latest]
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout ${{ needs.setup.outputs.pub_sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.pub_sha }}
       - name: Setup BATS
         uses: mig4/setup-bats@v1
         with:
-          bats-version: 1.2.1
-      - name: Setup K3d
-        run: curl -s https://raw.githubusercontent.com/rancher/k3d/main/install.sh | TAG=${{ env.K3D_VERSION }} bash
-      - name: Create K3d cluster
-        run: |
-          ./k8-util/cluster/reset-k3d.sh
-      - name: Setup bin path
-        run:  echo "~/.fluvio/bin" >> $GITHUB_PATH
-      - name: Install stable CLI and start Fluvio cluster
-        timeout-minutes: 10
-        run: |
-          curl -fsS https://packages.fluvio.io/v1/install.sh | VERSION=${{ matrix.cluster_version }} bash
-          fluvio cluster start
+          bats-version: 1.11.0
       - name: CLI ${{ matrix.cli_version }} x Cluster ${{ matrix.cluster_version }}
         run: |
-          make FLUVIO_BIN=~/.fluvio/bin/fluvio SKIP_SETUP=true CLI_VERSION=${{ matrix.cli_version }} CLUSTER_VERSION=${{ matrix.cluster_version }} cli-platform-cross-version-test
-      - name: Run diagnostics
-        if: ${{ !success() }}
-        timeout-minutes: 5
-        run: fluvio cluster diagnostics --k8
-      - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
-        timeout-minutes: 5
-        if: ${{ !success() }}
-        with:
-          name: cli-platform-cross-version-test
-          path: diagnostics*.gz
+          make CLI_VERSION=${{ matrix.cli_version }} CLUSTER_VERSION=${{ matrix.cluster_version }} cli-platform-cross-version-test
       - name: Slack Notification
         uses: 8398a7/action-slack@v3
         if: ${{ !success() }}

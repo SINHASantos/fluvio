@@ -2,32 +2,32 @@ use std::path::PathBuf;
 use clap::Parser;
 use anyhow::Result;
 
-use fluvio::FluvioConfig;
+use fluvio::FluvioClusterConfig;
 use fluvio_controlplane_metadata::smartmodule::{SmartModuleWasm, SmartModuleSpec, SmartModuleMetadata};
 use fluvio_extension_common::target::ClusterTarget;
 use fluvio::Fluvio;
 use fluvio_future::task::run_block_on;
 use cargo_builder::package::PackageInfo;
 
-use crate::build::PackageCmd;
-
-pub const DEFAULT_META_LOCATION: &str = "SmartModule.toml";
+use crate::cmd::PackageCmd;
+use crate::ENV_SMDK_NOWASI;
+use crate::SMARTMODULE_TOML;
 
 /// Load SmartModule into Fluvio cluster
 #[derive(Debug, Parser)]
 pub struct LoadCmd {
-    #[clap(long)]
+    #[arg(long)]
     name: Option<String>,
 
     /// Optional path to SmartModule package directory
-    #[clap(long)]
+    #[arg(long)]
     package_path: Option<PathBuf>,
 
     #[clap(flatten)]
     package: PackageCmd,
 
     /// Optional wasm file path
-    #[clap(long)]
+    #[arg(long)]
     wasm_file: Option<PathBuf>,
 
     #[clap(flatten)]
@@ -35,8 +35,12 @@ pub struct LoadCmd {
 
     /// Validate package config files, and connection to cluster.
     /// Skip SmartModule load to cluster
-    #[clap(long, action)]
+    #[arg(long)]
     dry_run: bool,
+
+    /// Build wasi target
+    #[arg(long, env = ENV_SMDK_NOWASI, hide_short_help = true)]
+    nowasi: bool,
 }
 impl LoadCmd {
     pub(crate) fn process(self) -> Result<()> {
@@ -51,7 +55,7 @@ impl LoadCmd {
         let package_info = PackageInfo::from_options(&opt)?;
 
         // load ./SmartModule.toml relative to the project root
-        let sm_toml = package_info.package_relative_path(DEFAULT_META_LOCATION);
+        let sm_toml = package_info.package_relative_path(SMARTMODULE_TOML);
         let pkg_metadata = SmartModuleMetadata::from_toml(sm_toml.as_path())?;
         println!("Found SmartModule package: {}", pkg_metadata.package.name);
 
@@ -64,7 +68,14 @@ impl LoadCmd {
         let sm_id = pkg_metadata.package.name.clone(); // pass anything, this should be overriden by SC
         let raw_bytes = match &self.wasm_file {
             Some(wasm_file) => crate::read_bytes_from_path(wasm_file)?,
-            None => crate::read_bytes_from_path(&package_info.target_wasm32_path()?)?,
+            None => {
+                let tgtpath = if self.nowasi {
+                    package_info.target_wasm32_path()?
+                } else {
+                    package_info.target_wasm32_wasi_path()?
+                };
+                crate::read_bytes_from_path(&tgtpath)?
+            }
         };
 
         let spec = SmartModuleSpec {
@@ -76,7 +87,7 @@ impl LoadCmd {
         let fluvio_config = self.target.clone().load()?;
 
         if let Err(e) = run_block_on(create(fluvio_config, spec, sm_id, self.dry_run)) {
-            eprintln!("{}", e);
+            eprintln!("{e}");
             std::process::exit(1);
         }
         Ok(())
@@ -84,7 +95,7 @@ impl LoadCmd {
 }
 
 async fn create(
-    config: FluvioConfig,
+    config: FluvioClusterConfig,
     spec: SmartModuleSpec,
     id: String,
     dry_run: bool,
@@ -95,7 +106,7 @@ async fn create(
     let admin = fluvio.admin().await;
 
     if !dry_run {
-        println!("Creating SmartModule: {}", id);
+        println!("Creating SmartModule: {id}");
         admin.create(id, false, spec).await?;
     } else {
         println!("Dry run mode: Skipping SmartModule create");

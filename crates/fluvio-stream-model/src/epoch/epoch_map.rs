@@ -67,10 +67,7 @@ impl<T> EpochCounter<T> {
         Self { epoch: 0, inner }
     }
 
-    pub fn new_with_epoch<E>(inner: T, epoch: E) -> Self
-    where
-        E: Into<i64>,
-    {
+    pub fn new_with_epoch(inner: T, epoch: impl Into<i64>) -> Self {
         Self {
             epoch: epoch.into(),
             inner,
@@ -188,10 +185,10 @@ mod old_map {
 
         /// remove existing value
         /// if successful, remove are added to history
-        pub fn remove<Q: ?Sized>(&mut self, k: &Q) -> Option<EpochCounter<V>>
+        pub fn remove<Q>(&mut self, k: &Q) -> Option<EpochCounter<V>>
         where
             K: Borrow<Q>,
-            Q: Hash + Eq,
+            Q: ?Sized + Hash + Eq,
             V: Clone,
         {
             if let Some((_, mut old_value)) = self.map.remove_entry(k) {
@@ -351,13 +348,17 @@ mod old_map {
 #[cfg(test)]
 mod test {
 
+    use std::fmt::Display;
+
+    use serde::{Serialize, Deserialize};
+
     use crate::core::{Spec, Status};
     use crate::store::DefaultMetadataObject;
 
     use super::EpochMap;
 
     // define test spec and status
-    #[derive(Debug, Default, Clone, PartialEq)]
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
     struct TestSpec {
         replica: u16,
     }
@@ -369,12 +370,18 @@ mod test {
         type Status = TestStatus;
     }
 
-    #[derive(Debug, Default, Clone, PartialEq)]
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
     struct TestStatus {
         up: bool,
     }
 
     impl Status for TestStatus {}
+
+    impl Display for TestStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
 
     type DefaultTest = DefaultMetadataObject<TestSpec>;
 
